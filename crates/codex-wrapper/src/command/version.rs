@@ -1,0 +1,36 @@
+use crate::Codex;
+use crate::command::CodexCommand;
+use crate::error::Result;
+use crate::exec::{self, CommandOutput};
+
+#[derive(Debug, Clone, Default)]
+pub struct VersionCommand;
+
+impl VersionCommand {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl CodexCommand for VersionCommand {
+    type Output = CommandOutput;
+
+    fn args(&self) -> Vec<String> {
+        vec!["--version".to_string()]
+    }
+
+    async fn execute(&self, codex: &Codex) -> Result<CommandOutput> {
+        exec::run_codex(codex, self.args()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_args() {
+        assert_eq!(VersionCommand::new().args(), vec!["--version"]);
+    }
+}
