@@ -1,15 +1,23 @@
+//! Domain types shared across commands: enums for CLI options, version parsing,
+//! and structured JSONL events.
+
+#[cfg(feature = "json")]
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+/// Sandbox policy for model-generated shell commands.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxMode {
+    /// Read-only filesystem access.
     ReadOnly,
+    /// Write access limited to the workspace directory (default).
     #[default]
     WorkspaceWrite,
+    /// Full filesystem access -- use with extreme caution.
     DangerFullAccess,
 }
 
@@ -23,13 +31,18 @@ impl SandboxMode {
     }
 }
 
+/// When the model should ask for human approval before executing commands.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalPolicy {
+    /// Only run trusted commands without asking.
     Untrusted,
+    /// Ask on failure (deprecated -- prefer `OnRequest` or `Never`).
     OnFailure,
+    /// The model decides when to ask (default).
     #[default]
     OnRequest,
+    /// Never ask for approval.
     Never,
 }
 
@@ -44,11 +57,15 @@ impl ApprovalPolicy {
     }
 }
 
+/// Color output mode for exec commands.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Color {
+    /// Always emit color codes.
     Always,
+    /// Never emit color codes.
     Never,
+    /// Auto-detect terminal support (default).
     #[default]
     Auto,
 }
@@ -63,6 +80,10 @@ impl Color {
     }
 }
 
+/// A single parsed JSONL event from `--json` output.
+///
+/// The `event_type` field corresponds to the `"type"` key in the JSON.
+/// All other fields are captured in `extra`.
 #[cfg(feature = "json")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsonLineEvent {
@@ -72,6 +93,9 @@ pub struct JsonLineEvent {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+/// Parsed semantic version of the Codex CLI (`major.minor.patch`).
+///
+/// Supports comparison and ordering for version-gating logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CliVersion {
     pub major: u32,

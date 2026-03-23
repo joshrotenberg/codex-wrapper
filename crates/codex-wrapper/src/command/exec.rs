@@ -1,9 +1,36 @@
 use crate::Codex;
 use crate::command::CodexCommand;
-use crate::error::{Error, Result};
+#[cfg(feature = "json")]
+use crate::error::Error;
+use crate::error::Result;
 use crate::exec::{self, CommandOutput};
-use crate::types::{ApprovalPolicy, Color, JsonLineEvent, SandboxMode};
+#[cfg(feature = "json")]
+use crate::types::JsonLineEvent;
+use crate::types::{ApprovalPolicy, Color, SandboxMode};
 
+/// Run Codex non-interactively (`codex exec <prompt>`).
+///
+/// This is the primary command for programmatic use. It supports the full
+/// range of exec flags: model selection, sandbox policy, approval policy,
+/// images, config overrides, feature flags, JSON output, and more.
+///
+/// # Example
+///
+/// ```no_run
+/// use codex_wrapper::{Codex, CodexCommand, ExecCommand, SandboxMode};
+///
+/// # async fn example() -> codex_wrapper::Result<()> {
+/// let codex = Codex::builder().build()?;
+/// let output = ExecCommand::new("fix the failing test")
+///     .model("o3")
+///     .sandbox(SandboxMode::WorkspaceWrite)
+///     .ephemeral()
+///     .execute(&codex)
+///     .await?;
+/// println!("{}", output.stdout);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ExecCommand {
     prompt: Option<String>,
@@ -22,6 +49,7 @@ pub struct ExecCommand {
     cd: Option<String>,
     skip_git_repo_check: bool,
     add_dirs: Vec<String>,
+    search: bool,
     ephemeral: bool,
     output_schema: Option<String>,
     color: Option<Color>,
@@ -32,6 +60,7 @@ pub struct ExecCommand {
 }
 
 impl ExecCommand {
+    /// Create a new exec command with the given prompt.
     #[must_use]
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
@@ -51,6 +80,7 @@ impl ExecCommand {
             cd: None,
             skip_git_repo_check: false,
             add_dirs: Vec::new(),
+            search: false,
             ephemeral: false,
             output_schema: None,
             color: None,
@@ -61,6 +91,7 @@ impl ExecCommand {
         }
     }
 
+    /// Read the prompt from stdin (`-`).
     #[must_use]
     pub fn from_stdin() -> Self {
         Self::new("-")
@@ -153,6 +184,13 @@ impl ExecCommand {
     #[must_use]
     pub fn add_dir(mut self, dir: impl Into<String>) -> Self {
         self.add_dirs.push(dir.into());
+        self
+    }
+
+    /// Enable live web search.
+    #[must_use]
+    pub fn search(mut self) -> Self {
+        self.search = true;
         self
     }
 
@@ -258,6 +296,9 @@ impl CodexCommand for ExecCommand {
             args.push("--skip-git-repo-check".into());
         }
         push_repeat(&mut args, "--add-dir", &self.add_dirs);
+        if self.search {
+            args.push("--search".into());
+        }
         if self.ephemeral {
             args.push("--ephemeral".into());
         }
@@ -291,6 +332,10 @@ impl CodexCommand for ExecCommand {
     }
 }
 
+/// Resume a previous non-interactive session (`codex exec resume`).
+///
+/// Use [`session_id`](ExecResumeCommand::session_id) to target a specific
+/// session, or [`last`](ExecResumeCommand::last) to pick the most recent.
 #[derive(Debug, Clone)]
 pub struct ExecResumeCommand {
     session_id: Option<String>,

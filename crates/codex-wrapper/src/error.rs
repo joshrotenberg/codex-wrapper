@@ -1,6 +1,8 @@
+//! Error types for `codex-wrapper`.
+
 use std::path::PathBuf;
 
-/// Errors returned by codex-wrapper operations.
+/// Errors returned by `codex-wrapper` operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The `codex` binary was not found in PATH.

@@ -1,3 +1,6 @@
+//! Process execution layer for spawning and communicating with the `codex`
+//! binary, including timeout and retry support.
+
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -6,12 +9,19 @@ use tracing::debug;
 use crate::Codex;
 use crate::error::{Error, Result};
 
-/// Raw output from a codex CLI invocation.
+/// Raw output from a Codex CLI invocation.
+///
+/// Contains captured stdout/stderr, the process exit code, and a convenience
+/// `success` flag.
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
+    /// Standard output as a UTF-8 string.
     pub stdout: String,
+    /// Standard error as a UTF-8 string.
     pub stderr: String,
+    /// Process exit code (`-1` if the process was killed by a signal).
     pub exit_code: i32,
+    /// `true` when the process exited with code 0.
     pub success: bool,
 }
 
