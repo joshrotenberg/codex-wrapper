@@ -97,30 +97,45 @@ impl ExecCommand {
         Self::new("-")
     }
 
+    /// Override a config key (`-c key=value`).
+    ///
+    /// May be called multiple times to set several keys.
     #[must_use]
     pub fn config(mut self, key_value: impl Into<String>) -> Self {
         self.config_overrides.push(key_value.into());
         self
     }
 
+    /// Enable an optional feature flag (`--enable <feature>`).
+    ///
+    /// May be called multiple times.
     #[must_use]
     pub fn enable(mut self, feature: impl Into<String>) -> Self {
         self.enabled_features.push(feature.into());
         self
     }
 
+    /// Disable an optional feature flag (`--disable <feature>`).
+    ///
+    /// May be called multiple times.
     #[must_use]
     pub fn disable(mut self, feature: impl Into<String>) -> Self {
         self.disabled_features.push(feature.into());
         self
     }
 
+    /// Attach an image to the prompt (`--image <path>`).
+    ///
+    /// May be called multiple times to attach several images.
     #[must_use]
     pub fn image(mut self, path: impl Into<String>) -> Self {
         self.images.push(path.into());
         self
     }
 
+    /// Set the model to use (`--model <model>`).
+    ///
+    /// Panics if `model` is an empty string.
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
         let model = model.into();
@@ -129,115 +144,146 @@ impl ExecCommand {
         self
     }
 
+    /// Use the OSS model tier (`--oss`).
     #[must_use]
     pub fn oss(mut self) -> Self {
         self.oss = true;
         self
     }
 
+    /// Use a local model provider (`--local-provider <provider>`).
     #[must_use]
     pub fn local_provider(mut self, provider: impl Into<String>) -> Self {
         self.local_provider = Some(provider.into());
         self
     }
 
+    /// Set the sandbox policy (`--sandbox <mode>`).
     #[must_use]
     pub fn sandbox(mut self, sandbox: SandboxMode) -> Self {
         self.sandbox = Some(sandbox);
         self
     }
 
+    /// Set the approval policy (`--ask-for-approval <policy>`).
     #[must_use]
     pub fn approval_policy(mut self, policy: ApprovalPolicy) -> Self {
         self.approval_policy = Some(policy);
         self
     }
 
+    /// Select a named configuration profile (`--profile <name>`).
     #[must_use]
     pub fn profile(mut self, profile: impl Into<String>) -> Self {
         self.profile = Some(profile.into());
         self
     }
 
+    /// Run in full-auto mode — no approval prompts (`--full-auto`).
     #[must_use]
     pub fn full_auto(mut self) -> Self {
         self.full_auto = true;
         self
     }
 
+    /// Bypass all approval prompts and sandbox restrictions.
+    ///
+    /// Passes `--dangerously-bypass-approvals-and-sandbox`. Use with caution.
     #[must_use]
     pub fn dangerously_bypass_approvals_and_sandbox(mut self) -> Self {
         self.dangerously_bypass_approvals_and_sandbox = true;
         self
     }
 
+    /// Change the working directory before running (`--cd <dir>`).
     #[must_use]
     pub fn cd(mut self, dir: impl Into<String>) -> Self {
         self.cd = Some(dir.into());
         self
     }
 
+    /// Skip the git repository check (`--skip-git-repo-check`).
     #[must_use]
     pub fn skip_git_repo_check(mut self) -> Self {
         self.skip_git_repo_check = true;
         self
     }
 
+    /// Add an extra directory to the context (`--add-dir <dir>`).
+    ///
+    /// May be called multiple times.
     #[must_use]
     pub fn add_dir(mut self, dir: impl Into<String>) -> Self {
         self.add_dirs.push(dir.into());
         self
     }
 
-    /// Enable live web search.
+    /// Enable live web search (`--search`).
     #[must_use]
     pub fn search(mut self) -> Self {
         self.search = true;
         self
     }
 
+    /// Run in ephemeral mode — no session is persisted (`--ephemeral`).
     #[must_use]
     pub fn ephemeral(mut self) -> Self {
         self.ephemeral = true;
         self
     }
 
+    /// Require output to conform to a JSON schema (`--output-schema <path>`).
     #[must_use]
     pub fn output_schema(mut self, path: impl Into<String>) -> Self {
         self.output_schema = Some(path.into());
         self
     }
 
+    /// Control terminal color output (`--color <mode>`).
     #[must_use]
     pub fn color(mut self, color: Color) -> Self {
         self.color = Some(color);
         self
     }
 
+    /// Show a progress cursor while the command runs (`--progress-cursor`).
     #[must_use]
     pub fn progress_cursor(mut self) -> Self {
         self.progress_cursor = true;
         self
     }
 
+    /// Emit JSON Lines output (`--json`).
+    ///
+    /// When set, stdout will contain one JSON object per line. Use
+    /// [`execute_json_lines`](ExecCommand::execute_json_lines) to parse the
+    /// events automatically (requires the `json` feature).
     #[must_use]
     pub fn json(mut self) -> Self {
         self.json = true;
         self
     }
 
+    /// Write the last assistant message to a file (`--output-last-message <path>`).
     #[must_use]
     pub fn output_last_message(mut self, path: impl Into<String>) -> Self {
         self.output_last_message = Some(path.into());
         self
     }
 
+    /// Override the retry policy for this command.
+    ///
+    /// Takes precedence over the client-level policy set on [`Codex`].
     #[must_use]
     pub fn retry(mut self, policy: crate::retry::RetryPolicy) -> Self {
         self.retry_policy = Some(policy);
         self
     }
 
+    /// Execute the command and parse the output as JSON Lines events.
+    ///
+    /// Automatically appends `--json` if not already set. Requires the `json`
+    /// feature.
     #[cfg(feature = "json")]
     pub async fn execute_json_lines(&self, codex: &Codex) -> Result<Vec<JsonLineEvent>> {
         let mut args = self.args();
@@ -359,6 +405,7 @@ pub struct ExecResumeCommand {
 }
 
 impl ExecResumeCommand {
+    /// Create a new resume command with no options set.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -381,30 +428,37 @@ impl ExecResumeCommand {
         }
     }
 
+    /// Resume a specific session by its ID.
     #[must_use]
     pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self
     }
 
+    /// Append an additional prompt to the resumed session.
     #[must_use]
     pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
         self.prompt = Some(prompt.into());
         self
     }
 
+    /// Resume the most recent session (`--last`).
     #[must_use]
     pub fn last(mut self) -> Self {
         self.last = true;
         self
     }
 
+    /// Resume all sessions (`--all`).
     #[must_use]
     pub fn all(mut self) -> Self {
         self.all = true;
         self
     }
 
+    /// Set the model to use (`--model <model>`).
+    ///
+    /// Panics if `model` is an empty string.
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
         let model = model.into();
@@ -413,66 +467,89 @@ impl ExecResumeCommand {
         self
     }
 
+    /// Attach an image to the prompt (`--image <path>`).
+    ///
+    /// May be called multiple times to attach several images.
     #[must_use]
     pub fn image(mut self, path: impl Into<String>) -> Self {
         self.images.push(path.into());
         self
     }
 
+    /// Emit JSON Lines output (`--json`).
     #[must_use]
     pub fn json(mut self) -> Self {
         self.json = true;
         self
     }
 
+    /// Write the last assistant message to a file (`--output-last-message <path>`).
     #[must_use]
     pub fn output_last_message(mut self, path: impl Into<String>) -> Self {
         self.output_last_message = Some(path.into());
         self
     }
 
+    /// Override a config key (`-c key=value`).
+    ///
+    /// May be called multiple times to set several keys.
     #[must_use]
     pub fn config(mut self, key_value: impl Into<String>) -> Self {
         self.config_overrides.push(key_value.into());
         self
     }
 
+    /// Enable an optional feature flag (`--enable <feature>`).
+    ///
+    /// May be called multiple times.
     #[must_use]
     pub fn enable(mut self, feature: impl Into<String>) -> Self {
         self.enabled_features.push(feature.into());
         self
     }
 
+    /// Disable an optional feature flag (`--disable <feature>`).
+    ///
+    /// May be called multiple times.
     #[must_use]
     pub fn disable(mut self, feature: impl Into<String>) -> Self {
         self.disabled_features.push(feature.into());
         self
     }
 
+    /// Run in full-auto mode — no approval prompts (`--full-auto`).
     #[must_use]
     pub fn full_auto(mut self) -> Self {
         self.full_auto = true;
         self
     }
 
+    /// Bypass all approval prompts and sandbox restrictions.
+    ///
+    /// Passes `--dangerously-bypass-approvals-and-sandbox`. Use with caution.
     #[must_use]
     pub fn dangerously_bypass_approvals_and_sandbox(mut self) -> Self {
         self.dangerously_bypass_approvals_and_sandbox = true;
         self
     }
 
+    /// Skip the git repository check (`--skip-git-repo-check`).
     #[must_use]
     pub fn skip_git_repo_check(mut self) -> Self {
         self.skip_git_repo_check = true;
         self
     }
 
+    /// Run in ephemeral mode — no session is persisted (`--ephemeral`).
     #[must_use]
     pub fn ephemeral(mut self) -> Self {
         self.ephemeral = true;
         self
     }
 
+    /// Override the retry policy for this command.
+    ///
+    /// Takes precedence over the client-level policy set on [`Codex`].
     #[must_use]
     pub fn retry(mut self, policy: crate::retry::RetryPolicy) -> Self {
         self.retry_policy = Some(policy);
