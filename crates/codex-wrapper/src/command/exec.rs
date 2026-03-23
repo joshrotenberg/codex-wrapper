@@ -123,7 +123,9 @@ impl ExecCommand {
 
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
+        let model = model.into();
+        assert!(!model.is_empty(), "model name must not be empty");
+        self.model = Some(model);
         self
     }
 
@@ -405,7 +407,9 @@ impl ExecResumeCommand {
 
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
+        let model = model.into();
+        assert!(!model.is_empty(), "model name must not be empty");
+        self.model = Some(model);
         self
     }
 
@@ -586,6 +590,18 @@ mod tests {
                 "fix the test",
             ]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "model name must not be empty")]
+    fn exec_model_empty_panics() {
+        let _ = ExecCommand::new("prompt").model("");
+    }
+
+    #[test]
+    #[should_panic(expected = "model name must not be empty")]
+    fn exec_resume_model_empty_panics() {
+        let _ = ExecResumeCommand::new().model("");
     }
 
     #[test]
