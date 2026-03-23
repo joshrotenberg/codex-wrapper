@@ -1,6 +1,8 @@
 use crate::Codex;
 use crate::command::CodexCommand;
-use crate::error::{Error, Result};
+#[cfg(feature = "json")]
+use crate::error::Error;
+use crate::error::Result;
 use crate::exec::{self, CommandOutput};
 
 #[derive(Debug, Clone, Default)]
