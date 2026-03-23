@@ -1,6 +1,7 @@
 //! Process execution layer for spawning and communicating with the `codex`
 //! binary, including timeout and retry support.
 
+use std::fmt;
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -13,7 +14,7 @@ use crate::error::{Error, Result};
 ///
 /// Contains captured stdout/stderr, the process exit code, and a convenience
 /// `success` flag.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CommandOutput {
     /// Standard output as a UTF-8 string.
     pub stdout: String,
@@ -23,6 +24,27 @@ pub struct CommandOutput {
     pub exit_code: i32,
     /// `true` when the process exited with code 0.
     pub success: bool,
+}
+
+const DEBUG_TRUNCATE_LEN: usize = 200;
+
+fn truncate_for_debug(s: &str) -> String {
+    if s.len() > DEBUG_TRUNCATE_LEN {
+        format!("{}... ({} bytes total)", &s[..DEBUG_TRUNCATE_LEN], s.len())
+    } else {
+        s.to_string()
+    }
+}
+
+impl fmt::Debug for CommandOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandOutput")
+            .field("stdout", &truncate_for_debug(&self.stdout))
+            .field("stderr", &truncate_for_debug(&self.stderr))
+            .field("exit_code", &self.exit_code)
+            .field("success", &self.success)
+            .finish()
+    }
 }
 
 /// Run a codex command with the given arguments.
@@ -167,4 +189,36 @@ async fn run_with_timeout(
         .map_err(|_| Error::Timeout {
             timeout_seconds: timeout.as_secs(),
         })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_output(stdout: &str, stderr: &str) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: 0,
+            success: true,
+        }
+    }
+
+    #[test]
+    fn debug_short_output_not_truncated() {
+        let output = make_output("hello", "world");
+        let debug = format!("{output:?}");
+        assert!(debug.contains("hello"));
+        assert!(debug.contains("world"));
+        assert!(!debug.contains("bytes total"));
+    }
+
+    #[test]
+    fn debug_long_output_truncated() {
+        let long = "x".repeat(300);
+        let output = make_output(&long, &long);
+        let debug = format!("{output:?}");
+        assert!(debug.contains("... (300 bytes total)"));
+        assert!(!debug.contains(&long));
+    }
 }
