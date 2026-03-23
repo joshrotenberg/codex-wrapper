@@ -2,6 +2,33 @@
 //!
 //! `codex-wrapper` mirrors the builder-oriented shape of `claude-wrapper`, but
 //! targets the current Codex CLI surface.
+//!
+//! # Quick Start
+//!
+//! ```no_run
+//! use codex_wrapper::{Codex, ExecCommand, SandboxMode, ApprovalPolicy};
+//!
+//! # async fn example() -> codex_wrapper::Result<()> {
+//! let codex = Codex::builder().build()?;
+//!
+//! // SandboxMode defaults to WorkspaceWrite; ApprovalPolicy defaults to OnRequest.
+//! // Both can be overridden per-command:
+//! let cmd = ExecCommand::new("fix the failing tests")
+//!     .sandbox_mode(SandboxMode::ReadOnly)
+//!     .approval_policy(ApprovalPolicy::Never);
+//!
+//! let output = cmd.execute(&codex).await?;
+//! println!("{}", output.stdout);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Defaults
+//!
+//! | Type | Default variant |
+//! |------|-----------------|
+//! | [`SandboxMode`] | [`SandboxMode::WorkspaceWrite`] |
+//! | [`ApprovalPolicy`] | [`ApprovalPolicy::OnRequest`] |
 
 pub mod command;
 pub mod error;
