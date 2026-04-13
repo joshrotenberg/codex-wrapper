@@ -7,9 +7,9 @@
 //! ```
 
 use codex_wrapper::{
-    ApplyCommand, Codex, CodexCommand, CompletionCommand, ExecCommand, FeaturesListCommand,
-    ForkCommand, LoginStatusCommand, McpListCommand, McpServerCommand, ResumeCommand,
-    ReviewCommand, SandboxCommand, SandboxPlatform, Shell, VersionCommand,
+    ApplyCommand, Codex, CodexCommand, CompletionCommand, ExecCommand, ExecResumeCommand,
+    FeaturesListCommand, ForkCommand, LoginStatusCommand, McpListCommand, McpServerCommand,
+    ResumeCommand, ReviewCommand, SandboxCommand, SandboxPlatform, Shell, VersionCommand,
 };
 
 fn codex() -> Codex {
@@ -188,6 +188,25 @@ async fn exec_simple() {
 async fn exec_json_lines() {
     let codex = codex();
     let events = ExecCommand::new("respond with just the word 'test'")
+        .ephemeral()
+        .execute_json_lines(&codex)
+        .await
+        .unwrap();
+    assert!(!events.is_empty(), "expected at least one JSONL event");
+
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"thread.started"),
+        "expected thread.started event, got: {types:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn exec_resume_json_lines() {
+    let codex = codex();
+    let events = ExecResumeCommand::new()
+        .last()
         .ephemeral()
         .execute_json_lines(&codex)
         .await
