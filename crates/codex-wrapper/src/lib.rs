@@ -142,6 +142,8 @@ pub mod exec;
 pub mod retry;
 #[cfg(feature = "json")]
 pub mod session;
+#[cfg(feature = "json")]
+pub mod streaming;
 pub mod types;
 pub mod version;
 
