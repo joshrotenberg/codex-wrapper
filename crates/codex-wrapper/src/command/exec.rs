@@ -280,6 +280,36 @@ impl ExecCommand {
         self
     }
 
+    /// Stream JSONL events from the command, invoking `handler` for each
+    /// parsed [`JsonLineEvent`] as it arrives.
+    ///
+    /// Automatically appends `--json` if not already set. Requires the `json`
+    /// feature.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use codex_wrapper::{Codex, ExecCommand, JsonLineEvent};
+    ///
+    /// # async fn example() -> codex_wrapper::Result<()> {
+    /// let codex = Codex::builder().build()?;
+    /// ExecCommand::new("what is 2+2?")
+    ///     .ephemeral()
+    ///     .stream(&codex, |event: JsonLineEvent| {
+    ///         println!("{}: {:?}", event.event_type, event.extra);
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "json")]
+    pub async fn stream<F>(&self, codex: &Codex, handler: F) -> Result<()>
+    where
+        F: FnMut(JsonLineEvent),
+    {
+        crate::streaming::stream_exec(codex, self, handler).await
+    }
+
     /// Execute the command and parse the output as JSON Lines events.
     ///
     /// Automatically appends `--json` if not already set. Requires the `json`
@@ -569,6 +599,19 @@ impl ExecResumeCommand {
 
         let output = exec::run_codex_with_retry(codex, args, self.retry_policy.as_ref()).await?;
         parse_json_lines(&output.stdout)
+    }
+
+    /// Stream JSONL events from the resume command, invoking `handler` for
+    /// each parsed [`JsonLineEvent`] as it arrives.
+    ///
+    /// Automatically appends `--json` if not already set. Requires the `json`
+    /// feature.
+    #[cfg(feature = "json")]
+    pub async fn stream<F>(&self, codex: &Codex, handler: F) -> Result<()>
+    where
+        F: FnMut(JsonLineEvent),
+    {
+        crate::streaming::stream_exec_resume(codex, self, handler).await
     }
 }
 
