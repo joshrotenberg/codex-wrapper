@@ -2,22 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.2](https://github.com/joshrotenberg/codex-wrapper/compare/v0.1.1...v0.1.2) - 2026-04-13
+## [0.1.2] - 2026-04-13
 
-### Added
+### Bug Fixes
 
-- add streaming support via callback (closes #20) ([#24](https://github.com/joshrotenberg/codex-wrapper/pull/24))
-- add execute_json_lines to ExecResumeCommand ([#19](https://github.com/joshrotenberg/codex-wrapper/pull/19))
-- add Session struct for multi-turn state management ([#25](https://github.com/joshrotenberg/codex-wrapper/pull/25))
+- Gate streaming tests behind cfg(unix) for Windows CI 
 
-### Fixed
+### Documentation
 
-- gate streaming tests behind cfg(unix) for Windows CI ([#27](https://github.com/joshrotenberg/codex-wrapper/pull/27))
+- *(command)* Add doc comments to RawCommand and VersionCommand 
+- *(exec)* Add doc comments to ExecCommand and ExecResumeCommand builder methods 
+- Consolidate README as primary project documentation 
 
-### Other
+### Features
 
-- *(exec)* add doc comments to ExecCommand and ExecResumeCommand builder methods ([#17](https://github.com/joshrotenberg/codex-wrapper/pull/17))
-- *(command)* add doc comments to RawCommand and VersionCommand ([#15](https://github.com/joshrotenberg/codex-wrapper/pull/15))
+- Add Session struct for multi-turn state management 
+- Add execute_json_lines to ExecResumeCommand 
+- Add streaming support via callback  
+
+### Miscellaneous
+
+- Update changelog 
+- Bump tokio from 1.50.0 to 1.51.0 in the tokio-ecosystem group 
+- Bump tokio from 1.51.0 to 1.51.1 in the tokio-ecosystem group 
+- Release v0.1.2 
 
 ## [0.1.1] - 2026-03-23
 
