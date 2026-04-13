@@ -555,6 +555,21 @@ impl ExecResumeCommand {
         self.retry_policy = Some(policy);
         self
     }
+
+    /// Execute the command and parse the output as JSON Lines events.
+    ///
+    /// Automatically appends `--json` if not already set. Requires the `json`
+    /// feature.
+    #[cfg(feature = "json")]
+    pub async fn execute_json_lines(&self, codex: &Codex) -> Result<Vec<JsonLineEvent>> {
+        let mut args = self.args();
+        if !self.json {
+            args.push("--json".into());
+        }
+
+        let output = exec::run_codex_with_retry(codex, args, self.retry_policy.as_ref()).await?;
+        parse_json_lines(&output.stdout)
+    }
 }
 
 impl Default for ExecResumeCommand {

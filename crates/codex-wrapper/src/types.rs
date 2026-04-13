@@ -93,6 +93,67 @@ pub struct JsonLineEvent {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+#[cfg(feature = "json")]
+impl JsonLineEvent {
+    /// Returns the `session_id` field, if present and a string.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.extra.get("session_id").and_then(|v| v.as_str())
+    }
+
+    /// Returns the `thread_id` field, if present and a string.
+    #[must_use]
+    pub fn thread_id(&self) -> Option<&str> {
+        self.extra.get("thread_id").and_then(|v| v.as_str())
+    }
+
+    /// Returns `true` when the event type is `"completed"`.
+    #[must_use]
+    pub fn is_completed(&self) -> bool {
+        self.event_type == "completed"
+    }
+
+    /// Returns the nested `result.text` field, if present and a string.
+    #[must_use]
+    pub fn result_text(&self) -> Option<&str> {
+        self.extra
+            .get("result")
+            .and_then(|v| v.get("text"))
+            .and_then(|v| v.as_str())
+    }
+
+    /// Returns the nested `result.cost` field in USD, if present and numeric.
+    #[must_use]
+    pub fn cost_usd(&self) -> Option<f64> {
+        self.extra
+            .get("result")
+            .and_then(|v| v.get("cost"))
+            .and_then(|v| v.as_f64())
+    }
+
+    /// Returns the `role` field, if present and a string.
+    #[must_use]
+    pub fn role(&self) -> Option<&str> {
+        self.extra.get("role").and_then(|v| v.as_str())
+    }
+
+    /// Extracts concatenated text from a `content` blocks array.
+    ///
+    /// Each block with `"type": "text"` contributes its `"text"` value.
+    /// Returns `None` if there is no `content` array or no text blocks.
+    #[must_use]
+    pub fn content_text(&self) -> Option<String> {
+        let blocks = self.extra.get("content").and_then(|v| v.as_array())?;
+        let text: String = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        if text.is_empty() { None } else { Some(text) }
+    }
+}
+
 /// Parsed semantic version of the Codex CLI (`major.minor.patch`).
 ///
 /// Supports comparison and ordering for version-gating logic.
@@ -188,5 +249,88 @@ mod tests {
     fn parses_plain_version_output() {
         let version = CliVersion::parse_version_output("0.116.0").unwrap();
         assert_eq!(version, CliVersion::new(0, 116, 0));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_line_event_session_and_thread_id() {
+        let event: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"message.created","session_id":"sess_abc","thread_id":"thread_123"}"#,
+        )
+        .unwrap();
+        assert_eq!(event.session_id(), Some("sess_abc"));
+        assert_eq!(event.thread_id(), Some("thread_123"));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_line_event_is_completed() {
+        let completed: JsonLineEvent = serde_json::from_str(r#"{"type":"completed"}"#).unwrap();
+        assert!(completed.is_completed());
+
+        let other: JsonLineEvent = serde_json::from_str(r#"{"type":"message.created"}"#).unwrap();
+        assert!(!other.is_completed());
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_line_event_result_text_and_cost() {
+        let event: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"completed","result":{"text":"hello world","cost":0.0042}}"#,
+        )
+        .unwrap();
+        assert_eq!(event.result_text(), Some("hello world"));
+        assert!((event.cost_usd().unwrap() - 0.0042).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_line_event_result_text_missing() {
+        let event: JsonLineEvent = serde_json::from_str(r#"{"type":"completed"}"#).unwrap();
+        assert_eq!(event.result_text(), None);
+        assert_eq!(event.cost_usd(), None);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_line_event_role() {
+        let event: JsonLineEvent =
+            serde_json::from_str(r#"{"type":"message.created","role":"assistant"}"#).unwrap();
+        assert_eq!(event.role(), Some("assistant"));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_line_event_content_text() {
+        let event: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"message.delta","content":[{"type":"text","text":"Hello "},{"type":"text","text":"world"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(event.content_text(), Some("Hello world".to_string()));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_line_event_content_text_skips_non_text_blocks() {
+        let event: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"message.delta","content":[{"type":"image","url":"x"},{"type":"text","text":"only this"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(event.content_text(), Some("only this".to_string()));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_line_event_content_text_none_when_empty() {
+        let event: JsonLineEvent =
+            serde_json::from_str(r#"{"type":"message.delta","content":[]}"#).unwrap();
+        assert_eq!(event.content_text(), None);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_line_event_content_text_none_when_missing() {
+        let event: JsonLineEvent = serde_json::from_str(r#"{"type":"message.delta"}"#).unwrap();
+        assert_eq!(event.content_text(), None);
     }
 }

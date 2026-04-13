@@ -140,6 +140,8 @@ pub mod command;
 pub mod error;
 pub mod exec;
 pub mod retry;
+#[cfg(feature = "json")]
+pub mod session;
 pub mod types;
 pub mod version;
 
@@ -167,6 +169,8 @@ pub use command::version::VersionCommand;
 pub use error::{Error, Result};
 pub use exec::CommandOutput;
 pub use retry::{BackoffStrategy, RetryPolicy};
+#[cfg(feature = "json")]
+pub use session::{Session, TurnRecord};
 pub use types::*;
 pub use version::{CliVersion, VersionParseError};
 
