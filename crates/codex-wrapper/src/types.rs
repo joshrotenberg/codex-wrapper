@@ -241,14 +241,14 @@ mod tests {
 
     #[test]
     fn parses_codex_version_output() {
-        let version = CliVersion::parse_version_output("codex-cli 0.116.0").unwrap();
-        assert_eq!(version, CliVersion::new(0, 116, 0));
+        let version = CliVersion::parse_version_output("codex-cli 0.145.0").unwrap();
+        assert_eq!(version, CliVersion::new(0, 145, 0));
     }
 
     #[test]
     fn parses_plain_version_output() {
-        let version = CliVersion::parse_version_output("0.116.0").unwrap();
-        assert_eq!(version, CliVersion::new(0, 116, 0));
+        let version = CliVersion::parse_version_output("0.145.0").unwrap();
+        assert_eq!(version, CliVersion::new(0, 145, 0));
     }
 
     #[cfg(feature = "json")]

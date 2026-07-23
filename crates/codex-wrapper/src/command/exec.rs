@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::exec::{self, CommandOutput};
 #[cfg(feature = "json")]
 use crate::types::JsonLineEvent;
-use crate::types::{ApprovalPolicy, Color, SandboxMode};
+use crate::types::{Color, SandboxMode};
 
 /// Run Codex non-interactively (`codex exec <prompt>`).
 ///
@@ -42,18 +42,19 @@ pub struct ExecCommand {
     oss: bool,
     local_provider: Option<String>,
     sandbox: Option<SandboxMode>,
-    approval_policy: Option<ApprovalPolicy>,
+    strict_config: bool,
+    dangerously_bypass_hook_trust: bool,
+    ignore_user_config: bool,
+    ignore_rules: bool,
     profile: Option<String>,
     full_auto: bool,
     dangerously_bypass_approvals_and_sandbox: bool,
     cd: Option<String>,
     skip_git_repo_check: bool,
     add_dirs: Vec<String>,
-    search: bool,
     ephemeral: bool,
     output_schema: Option<String>,
     color: Option<Color>,
-    progress_cursor: bool,
     json: bool,
     output_last_message: Option<String>,
     retry_policy: Option<crate::retry::RetryPolicy>,
@@ -73,18 +74,19 @@ impl ExecCommand {
             oss: false,
             local_provider: None,
             sandbox: None,
-            approval_policy: None,
+            strict_config: false,
+            dangerously_bypass_hook_trust: false,
+            ignore_user_config: false,
+            ignore_rules: false,
             profile: None,
             full_auto: false,
             dangerously_bypass_approvals_and_sandbox: false,
             cd: None,
             skip_git_repo_check: false,
             add_dirs: Vec::new(),
-            search: false,
             ephemeral: false,
             output_schema: None,
             color: None,
-            progress_cursor: false,
             json: false,
             output_last_message: None,
             retry_policy: None,
@@ -165,10 +167,33 @@ impl ExecCommand {
         self
     }
 
-    /// Set the approval policy (`--ask-for-approval <policy>`).
+    /// Error on unrecognized config keys (`--strict-config`).
     #[must_use]
-    pub fn approval_policy(mut self, policy: ApprovalPolicy) -> Self {
-        self.approval_policy = Some(policy);
+    pub fn strict_config(mut self) -> Self {
+        self.strict_config = true;
+        self
+    }
+
+    /// Bypass the hook trust prompt (`--dangerously-bypass-hook-trust`).
+    ///
+    /// Allows configured hooks to run without confirmation. Use with caution.
+    #[must_use]
+    pub fn dangerously_bypass_hook_trust(mut self) -> Self {
+        self.dangerously_bypass_hook_trust = true;
+        self
+    }
+
+    /// Ignore the user-level config file (`--ignore-user-config`).
+    #[must_use]
+    pub fn ignore_user_config(mut self) -> Self {
+        self.ignore_user_config = true;
+        self
+    }
+
+    /// Ignore project rules files (`--ignore-rules`).
+    #[must_use]
+    pub fn ignore_rules(mut self) -> Self {
+        self.ignore_rules = true;
         self
     }
 
@@ -180,6 +205,10 @@ impl ExecCommand {
     }
 
     /// Run in full-auto mode — no approval prompts (`--full-auto`).
+    ///
+    /// As of `codex-cli` 0.145.0 this flag is accepted but hidden from
+    /// `codex exec --help`. It still functions but is undocumented and may be
+    /// removed in a future CLI release.
     #[must_use]
     pub fn full_auto(mut self) -> Self {
         self.full_auto = true;
@@ -218,13 +247,6 @@ impl ExecCommand {
         self
     }
 
-    /// Enable live web search (`--search`).
-    #[must_use]
-    pub fn search(mut self) -> Self {
-        self.search = true;
-        self
-    }
-
     /// Run in ephemeral mode — no session is persisted (`--ephemeral`).
     #[must_use]
     pub fn ephemeral(mut self) -> Self {
@@ -243,13 +265,6 @@ impl ExecCommand {
     #[must_use]
     pub fn color(mut self, color: Color) -> Self {
         self.color = Some(color);
-        self
-    }
-
-    /// Show a progress cursor while the command runs (`--progress-cursor`).
-    #[must_use]
-    pub fn progress_cursor(mut self) -> Self {
-        self.progress_cursor = true;
         self
     }
 
@@ -352,9 +367,8 @@ impl CodexCommand for ExecCommand {
             args.push("--sandbox".into());
             args.push(sandbox.as_arg().into());
         }
-        if let Some(policy) = self.approval_policy {
-            args.push("--ask-for-approval".into());
-            args.push(policy.as_arg().into());
+        if self.strict_config {
+            args.push("--strict-config".into());
         }
         if let Some(profile) = &self.profile {
             args.push("--profile".into());
@@ -366,6 +380,9 @@ impl CodexCommand for ExecCommand {
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());
         }
+        if self.dangerously_bypass_hook_trust {
+            args.push("--dangerously-bypass-hook-trust".into());
+        }
         if let Some(cd) = &self.cd {
             args.push("--cd".into());
             args.push(cd.clone());
@@ -374,11 +391,14 @@ impl CodexCommand for ExecCommand {
             args.push("--skip-git-repo-check".into());
         }
         push_repeat(&mut args, "--add-dir", &self.add_dirs);
-        if self.search {
-            args.push("--search".into());
-        }
         if self.ephemeral {
             args.push("--ephemeral".into());
+        }
+        if self.ignore_user_config {
+            args.push("--ignore-user-config".into());
+        }
+        if self.ignore_rules {
+            args.push("--ignore-rules".into());
         }
         if let Some(output_schema) = &self.output_schema {
             args.push("--output-schema".into());
@@ -387,9 +407,6 @@ impl CodexCommand for ExecCommand {
         if let Some(color) = self.color {
             args.push("--color".into());
             args.push(color.as_arg().into());
-        }
-        if self.progress_cursor {
-            args.push("--progress-cursor".into());
         }
         if self.json {
             args.push("--json".into());
@@ -425,6 +442,8 @@ pub struct ExecResumeCommand {
     disabled_features: Vec<String>,
     images: Vec<String>,
     model: Option<String>,
+    strict_config: bool,
+    dangerously_bypass_hook_trust: bool,
     full_auto: bool,
     dangerously_bypass_approvals_and_sandbox: bool,
     skip_git_repo_check: bool,
@@ -448,6 +467,8 @@ impl ExecResumeCommand {
             disabled_features: Vec::new(),
             images: Vec::new(),
             model: None,
+            strict_config: false,
+            dangerously_bypass_hook_trust: false,
             full_auto: false,
             dangerously_bypass_approvals_and_sandbox: false,
             skip_git_repo_check: false,
@@ -547,6 +568,22 @@ impl ExecResumeCommand {
         self
     }
 
+    /// Error on unrecognized config keys (`--strict-config`).
+    #[must_use]
+    pub fn strict_config(mut self) -> Self {
+        self.strict_config = true;
+        self
+    }
+
+    /// Bypass the hook trust prompt (`--dangerously-bypass-hook-trust`).
+    ///
+    /// Allows configured hooks to run without confirmation. Use with caution.
+    #[must_use]
+    pub fn dangerously_bypass_hook_trust(mut self) -> Self {
+        self.dangerously_bypass_hook_trust = true;
+        self
+    }
+
     /// Run in full-auto mode — no approval prompts (`--full-auto`).
     #[must_use]
     pub fn full_auto(mut self) -> Self {
@@ -640,11 +677,17 @@ impl CodexCommand for ExecResumeCommand {
             args.push("--model".into());
             args.push(model.clone());
         }
+        if self.strict_config {
+            args.push("--strict-config".into());
+        }
         if self.full_auto {
             args.push("--full-auto".into());
         }
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());
+        }
+        if self.dangerously_bypass_hook_trust {
+            args.push("--dangerously-bypass-hook-trust".into());
         }
         if self.skip_git_repo_check {
             args.push("--skip-git-repo-check".into());
@@ -703,9 +746,11 @@ mod tests {
         let args = ExecCommand::new("fix the test")
             .model("gpt-5")
             .sandbox(SandboxMode::WorkspaceWrite)
-            .approval_policy(ApprovalPolicy::OnRequest)
+            .strict_config()
             .skip_git_repo_check()
             .ephemeral()
+            .ignore_user_config()
+            .ignore_rules()
             .json()
             .args();
 
@@ -717,12 +762,31 @@ mod tests {
                 "gpt-5",
                 "--sandbox",
                 "workspace-write",
-                "--ask-for-approval",
-                "on-request",
+                "--strict-config",
                 "--skip-git-repo-check",
                 "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
                 "--json",
                 "fix the test",
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_args_hook_trust() {
+        let args = ExecCommand::new("go")
+            .dangerously_bypass_approvals_and_sandbox()
+            .dangerously_bypass_hook_trust()
+            .args();
+
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+                "go",
             ]
         );
     }
@@ -752,6 +816,26 @@ mod tests {
             args,
             vec![
                 "exec", "resume", "--last", "--model", "gpt-5", "--json", "continue",
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_resume_new_flags() {
+        let args = ExecResumeCommand::new()
+            .last()
+            .strict_config()
+            .dangerously_bypass_hook_trust()
+            .args();
+
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "resume",
+                "--last",
+                "--strict-config",
+                "--dangerously-bypass-hook-trust",
             ]
         );
     }

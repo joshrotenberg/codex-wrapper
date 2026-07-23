@@ -145,11 +145,11 @@ mod tests {
     fn display_version_mismatch() {
         let err = Error::VersionMismatch {
             found: crate::version::CliVersion::new(0, 100, 0),
-            minimum: crate::version::CliVersion::new(0, 116, 0),
+            minimum: crate::version::CliVersion::new(0, 145, 0),
         };
         assert_eq!(
             err.to_string(),
-            "CLI version 0.100.0 does not meet minimum requirement 0.116.0"
+            "CLI version 0.100.0 does not meet minimum requirement 0.145.0"
         );
     }
 }
