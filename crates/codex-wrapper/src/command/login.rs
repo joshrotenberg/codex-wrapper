@@ -9,6 +9,7 @@ pub struct LoginCommand {
     enabled_features: Vec<String>,
     disabled_features: Vec<String>,
     with_api_key: bool,
+    with_access_token: bool,
     device_auth: bool,
 }
 
@@ -42,6 +43,13 @@ impl LoginCommand {
         self
     }
 
+    /// Read an access token from stdin (`--with-access-token`).
+    #[must_use]
+    pub fn with_access_token(mut self) -> Self {
+        self.with_access_token = true;
+        self
+    }
+
     #[must_use]
     pub fn device_auth(mut self) -> Self {
         self.device_auth = true;
@@ -62,6 +70,9 @@ impl CodexCommand for LoginCommand {
         );
         if self.with_api_key {
             args.push("--with-api-key".into());
+        }
+        if self.with_access_token {
+            args.push("--with-access-token".into());
         }
         if self.device_auth {
             args.push("--device-auth".into());
@@ -176,6 +187,14 @@ mod tests {
         assert_eq!(
             LoginCommand::new().with_api_key().args(),
             vec!["login", "--with-api-key"]
+        );
+    }
+
+    #[test]
+    fn login_with_access_token_args() {
+        assert_eq!(
+            LoginCommand::new().with_access_token().args(),
+            vec!["login", "--with-access-token"]
         );
     }
 

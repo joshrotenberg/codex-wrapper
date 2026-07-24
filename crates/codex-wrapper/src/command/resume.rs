@@ -26,6 +26,12 @@ pub struct ResumeCommand {
     approval_policy: Option<ApprovalPolicy>,
     full_auto: bool,
     dangerously_bypass_approvals_and_sandbox: bool,
+    dangerously_bypass_hook_trust: bool,
+    strict_config: bool,
+    no_alt_screen: bool,
+    include_non_interactive: bool,
+    remote: Option<String>,
+    remote_auth_token_env: Option<String>,
     cd: Option<String>,
     search: bool,
     add_dirs: Vec<String>,
@@ -51,6 +57,12 @@ impl ResumeCommand {
             approval_policy: None,
             full_auto: false,
             dangerously_bypass_approvals_and_sandbox: false,
+            dangerously_bypass_hook_trust: false,
+            strict_config: false,
+            no_alt_screen: false,
+            include_non_interactive: false,
+            remote: None,
+            remote_auth_token_env: None,
             cd: None,
             search: false,
             add_dirs: Vec::new(),
@@ -157,6 +169,50 @@ impl ResumeCommand {
         self
     }
 
+    /// Bypass the hook trust prompt (`--dangerously-bypass-hook-trust`).
+    #[must_use]
+    pub fn dangerously_bypass_hook_trust(mut self) -> Self {
+        self.dangerously_bypass_hook_trust = true;
+        self
+    }
+
+    /// Error on unrecognized config keys (`--strict-config`).
+    #[must_use]
+    pub fn strict_config(mut self) -> Self {
+        self.strict_config = true;
+        self
+    }
+
+    /// Do not use the terminal alternate screen (`--no-alt-screen`).
+    #[must_use]
+    pub fn no_alt_screen(mut self) -> Self {
+        self.no_alt_screen = true;
+        self
+    }
+
+    /// Include non-interactive sessions in the picker
+    /// (`--include-non-interactive`).
+    #[must_use]
+    pub fn include_non_interactive(mut self) -> Self {
+        self.include_non_interactive = true;
+        self
+    }
+
+    /// Connect the TUI to a remote app server endpoint (`--remote <ADDR>`).
+    #[must_use]
+    pub fn remote(mut self, addr: impl Into<String>) -> Self {
+        self.remote = Some(addr.into());
+        self
+    }
+
+    /// Env var holding the bearer token for the remote app server
+    /// (`--remote-auth-token-env <ENV_VAR>`).
+    #[must_use]
+    pub fn remote_auth_token_env(mut self, env_var: impl Into<String>) -> Self {
+        self.remote_auth_token_env = Some(env_var.into());
+        self
+    }
+
     #[must_use]
     pub fn cd(mut self, dir: impl Into<String>) -> Self {
         self.cd = Some(dir.into());
@@ -240,6 +296,26 @@ impl CodexCommand for ResumeCommand {
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());
         }
+        if self.dangerously_bypass_hook_trust {
+            args.push("--dangerously-bypass-hook-trust".into());
+        }
+        if self.strict_config {
+            args.push("--strict-config".into());
+        }
+        if self.no_alt_screen {
+            args.push("--no-alt-screen".into());
+        }
+        if self.include_non_interactive {
+            args.push("--include-non-interactive".into());
+        }
+        if let Some(remote) = &self.remote {
+            args.push("--remote".into());
+            args.push(remote.clone());
+        }
+        if let Some(env_var) = &self.remote_auth_token_env {
+            args.push("--remote-auth-token-env".into());
+            args.push(env_var.clone());
+        }
         if let Some(cd) = &self.cd {
             args.push("--cd".into());
             args.push(cd.clone());
@@ -297,6 +373,29 @@ mod tests {
                 "workspace-write",
                 "--search",
                 "abc-123"
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_new_flags_args() {
+        let args = ResumeCommand::new()
+            .last()
+            .strict_config()
+            .include_non_interactive()
+            .no_alt_screen()
+            .remote("ws://host:9000")
+            .args();
+        assert_eq!(
+            args,
+            vec![
+                "resume",
+                "--last",
+                "--strict-config",
+                "--no-alt-screen",
+                "--include-non-interactive",
+                "--remote",
+                "ws://host:9000",
             ]
         );
     }
