@@ -182,7 +182,7 @@ pub use command::plugin::{
 pub use command::raw::RawCommand;
 pub use command::resume::ResumeCommand;
 pub use command::review::ReviewCommand;
-pub use command::sandbox::{SandboxCommand, SandboxPlatform};
+pub use command::sandbox::SandboxCommand;
 pub use command::session_mgmt::{ArchiveCommand, DeleteCommand, UnarchiveCommand};
 pub use command::update::UpdateCommand;
 pub use command::version::VersionCommand;

@@ -322,10 +322,13 @@ McpRemoveCommand::new("old-server").execute(&codex).await?;
 
 Run commands inside the Codex sandbox:
 
-```rust
-use codex_wrapper::{SandboxCommand, SandboxPlatform};
+The platform is auto-detected (Seatbelt on macOS, and so on); as of
+`codex-cli` 0.145.0 the old `<macos|linux|windows>` positional was removed.
 
-let output = SandboxCommand::new(SandboxPlatform::MacOs, "ls")
+```rust
+use codex_wrapper::SandboxCommand;
+
+let output = SandboxCommand::new("ls")
     .arg("-la")
     .execute(&codex)
     .await?;
@@ -436,13 +439,13 @@ let output = RawCommand::new("cloud")
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `json` | Yes | JSONL output parsing via `serde_json` -- enables `execute_json_lines()`, `stream()`, `Session`, `JsonLineEvent` and typed accessors |
+| `json` | Yes | JSONL output parsing via `serde_json` -- enables `execute_json_lines()`, `execute_json()`, `stream()`, `Session`, `QueryResult`, `JsonLineEvent` and typed accessors |
 
 To disable default features:
 
 ```toml
 [dependencies]
-codex-wrapper = { version = "0.1", default-features = false }
+codex-wrapper = { version = "0.2", default-features = false }
 ```
 
 ## Testing
