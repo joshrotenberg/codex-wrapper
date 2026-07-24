@@ -18,6 +18,8 @@ pub struct ReviewCommand {
     commit: Option<String>,
     model: Option<String>,
     title: Option<String>,
+    strict_config: bool,
+    dangerously_bypass_hook_trust: bool,
     full_auto: bool,
     dangerously_bypass_approvals_and_sandbox: bool,
     skip_git_repo_check: bool,
@@ -40,6 +42,8 @@ impl ReviewCommand {
             commit: None,
             model: None,
             title: None,
+            strict_config: false,
+            dangerously_bypass_hook_trust: false,
             full_auto: false,
             dangerously_bypass_approvals_and_sandbox: false,
             skip_git_repo_check: false,
@@ -101,6 +105,22 @@ impl ReviewCommand {
     #[must_use]
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
+        self
+    }
+
+    /// Error on unrecognized config keys (`--strict-config`).
+    #[must_use]
+    pub fn strict_config(mut self) -> Self {
+        self.strict_config = true;
+        self
+    }
+
+    /// Bypass the hook trust prompt (`--dangerously-bypass-hook-trust`).
+    ///
+    /// Allows configured hooks to run without confirmation. Use with caution.
+    #[must_use]
+    pub fn dangerously_bypass_hook_trust(mut self) -> Self {
+        self.dangerously_bypass_hook_trust = true;
         self
     }
 
@@ -210,11 +230,17 @@ impl CodexCommand for ReviewCommand {
             args.push("--title".into());
             args.push(title.clone());
         }
+        if self.strict_config {
+            args.push("--strict-config".into());
+        }
         if self.full_auto {
             args.push("--full-auto".into());
         }
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());
+        }
+        if self.dangerously_bypass_hook_trust {
+            args.push("--dangerously-bypass-hook-trust".into());
         }
         if self.skip_git_repo_check {
             args.push("--skip-git-repo-check".into());
@@ -263,6 +289,26 @@ mod tests {
                 "gpt-5",
                 "--json",
                 "focus on correctness",
+            ]
+        );
+    }
+
+    #[test]
+    fn review_new_flags() {
+        let args = ReviewCommand::new()
+            .uncommitted()
+            .strict_config()
+            .dangerously_bypass_hook_trust()
+            .args();
+
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "review",
+                "--uncommitted",
+                "--strict-config",
+                "--dangerously-bypass-hook-trust",
             ]
         );
     }

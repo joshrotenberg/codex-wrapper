@@ -105,7 +105,6 @@ Full coverage of `codex exec` options:
 let output = ExecCommand::new("fix the failing tests")
     .model("o3")
     .sandbox(SandboxMode::WorkspaceWrite)
-    .approval_policy(ApprovalPolicy::Never)
     .skip_git_repo_check()
     .ephemeral()
     .json()
@@ -119,18 +118,19 @@ All ExecCommand options:
 |--------|----------|-------------|
 | `model()` | `--model` | Model to use |
 | `sandbox()` | `--sandbox` | Sandbox policy |
-| `approval_policy()` | `--ask-for-approval` | Approval policy |
+| `strict_config()` | `--strict-config` | Error on unknown config keys |
 | `profile()` | `--profile` | Config profile |
-| `full_auto()` | `--full-auto` | Auto sandbox + approval |
+| `full_auto()` | `--full-auto` | Auto sandbox + approval (hidden in 0.145.0) |
 | `dangerously_bypass_approvals_and_sandbox()` | `--dangerously-bypass-approvals-and-sandbox` | Skip all safety |
+| `dangerously_bypass_hook_trust()` | `--dangerously-bypass-hook-trust` | Skip the hook trust prompt |
 | `cd()` | `--cd` | Working directory |
 | `skip_git_repo_check()` | `--skip-git-repo-check` | Run outside git repo |
 | `add_dir()` | `--add-dir` | Additional writable dirs |
-| `search()` | `--search` | Enable web search |
+| `ignore_user_config()` | `--ignore-user-config` | Ignore user-level config |
+| `ignore_rules()` | `--ignore-rules` | Ignore project rules files |
 | `ephemeral()` | `--ephemeral` | Don't persist session |
 | `output_schema()` | `--output-schema` | JSON Schema for response |
 | `color()` | `--color` | Color output mode |
-| `progress_cursor()` | `--progress-cursor` | Cursor-based progress |
 | `json()` | `--json` | JSONL event output |
 | `output_last_message()` | `--output-last-message` | Write last message to file |
 | `image()` | `--image` | Attach image(s) |

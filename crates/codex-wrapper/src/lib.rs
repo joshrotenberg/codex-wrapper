@@ -39,8 +39,7 @@
 //! `execute(&codex)`.
 //!
 //! ```no_run
-//! use codex_wrapper::{Codex, CodexCommand, ExecCommand, ApprovalPolicy, RetryPolicy};
-//! use std::time::Duration;
+//! use codex_wrapper::{Codex, CodexCommand, ExecCommand, RetryPolicy};
 //!
 //! # async fn example() -> codex_wrapper::Result<()> {
 //! // Configure once, reuse across commands
@@ -53,7 +52,7 @@
 //! // Each command is a separate builder
 //! let output = ExecCommand::new("fix the failing tests")
 //!     .model("o3")
-//!     .approval_policy(ApprovalPolicy::Never)
+//!     .dangerously_bypass_approvals_and_sandbox()
 //!     .skip_git_repo_check()
 //!     .ephemeral()
 //!     .execute(&codex)
