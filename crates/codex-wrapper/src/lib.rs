@@ -109,6 +109,13 @@
 //! | [`UnarchiveCommand`] | `codex unarchive` |
 //! | [`DoctorCommand`] | `codex doctor` |
 //! | [`UpdateCommand`] | `codex update` |
+//! | [`PluginAddCommand`] | `codex plugin add` |
+//! | [`PluginListCommand`] | `codex plugin list` |
+//! | [`PluginRemoveCommand`] | `codex plugin remove` |
+//! | [`PluginMarketplaceAddCommand`] | `codex plugin marketplace add` |
+//! | [`PluginMarketplaceListCommand`] | `codex plugin marketplace list` |
+//! | [`PluginMarketplaceUpgradeCommand`] | `codex plugin marketplace upgrade` |
+//! | [`PluginMarketplaceRemoveCommand`] | `codex plugin marketplace remove` |
 //! | [`FeaturesListCommand`] | `codex features list` |
 //! | [`FeaturesEnableCommand`] | `codex features enable` |
 //! | [`FeaturesDisableCommand`] | `codex features disable` |
@@ -168,6 +175,10 @@ pub use command::mcp::{
     McpRemoveCommand,
 };
 pub use command::mcp_server::McpServerCommand;
+pub use command::plugin::{
+    PluginAddCommand, PluginListCommand, PluginMarketplaceAddCommand, PluginMarketplaceListCommand,
+    PluginMarketplaceRemoveCommand, PluginMarketplaceUpgradeCommand, PluginRemoveCommand,
+};
 pub use command::raw::RawCommand;
 pub use command::resume::ResumeCommand;
 pub use command::review::ReviewCommand;
