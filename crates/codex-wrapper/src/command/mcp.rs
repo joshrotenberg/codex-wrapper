@@ -131,6 +131,8 @@ enum McpAddTransport {
     Http {
         url: String,
         bearer_token_env_var: Option<String>,
+        oauth_client_id: Option<String>,
+        oauth_resource: Option<String>,
     },
 }
 
@@ -169,8 +171,31 @@ impl McpAddCommand {
             transport: McpAddTransport::Http {
                 url: url.into(),
                 bearer_token_env_var: None,
+                oauth_client_id: None,
+                oauth_resource: None,
             },
         }
+    }
+
+    /// Override a config key (`-c key=value`). May be called multiple times.
+    #[must_use]
+    pub fn config(mut self, key_value: impl Into<String>) -> Self {
+        self.config_overrides.push(key_value.into());
+        self
+    }
+
+    /// Enable an optional feature flag (`--enable <feature>`).
+    #[must_use]
+    pub fn enable(mut self, feature: impl Into<String>) -> Self {
+        self.enabled_features.push(feature.into());
+        self
+    }
+
+    /// Disable an optional feature flag (`--disable <feature>`).
+    #[must_use]
+    pub fn disable(mut self, feature: impl Into<String>) -> Self {
+        self.disabled_features.push(feature.into());
+        self
     }
 
     #[must_use]
@@ -197,6 +222,31 @@ impl McpAddCommand {
         } = &mut self.transport
         {
             *bearer_token_env_var = Some(env_var.into());
+        }
+        self
+    }
+
+    /// OAuth client id for an HTTP MCP server (`--oauth-client-id`).
+    ///
+    /// No-op on stdio transports.
+    #[must_use]
+    pub fn oauth_client_id(mut self, client_id: impl Into<String>) -> Self {
+        if let McpAddTransport::Http {
+            oauth_client_id, ..
+        } = &mut self.transport
+        {
+            *oauth_client_id = Some(client_id.into());
+        }
+        self
+    }
+
+    /// OAuth resource for an HTTP MCP server (`--oauth-resource`).
+    ///
+    /// No-op on stdio transports.
+    #[must_use]
+    pub fn oauth_resource(mut self, resource: impl Into<String>) -> Self {
+        if let McpAddTransport::Http { oauth_resource, .. } = &mut self.transport {
+            *oauth_resource = Some(resource.into());
         }
         self
     }
@@ -230,12 +280,22 @@ impl CodexCommand for McpAddCommand {
             McpAddTransport::Http {
                 url,
                 bearer_token_env_var,
+                oauth_client_id,
+                oauth_resource,
             } => {
                 args.push("--url".into());
                 args.push(url.clone());
                 if let Some(env_var) = bearer_token_env_var {
                     args.push("--bearer-token-env-var".into());
                     args.push(env_var.clone());
+                }
+                if let Some(client_id) = oauth_client_id {
+                    args.push("--oauth-client-id".into());
+                    args.push(client_id.clone());
+                }
+                if let Some(resource) = oauth_resource {
+                    args.push("--oauth-resource".into());
+                    args.push(resource.clone());
                 }
             }
         }
@@ -407,5 +467,42 @@ mod tests {
                 "TOKEN",
             ]
         );
+    }
+
+    #[test]
+    fn mcp_http_add_oauth_and_config_args() {
+        let args = McpAddCommand::http("server", "https://example.com/mcp")
+            .config("foo=bar")
+            .enable("beta")
+            .oauth_client_id("client-123")
+            .oauth_resource("https://api.example.com")
+            .args();
+        assert_eq!(
+            args,
+            vec![
+                "mcp",
+                "add",
+                "-c",
+                "foo=bar",
+                "--enable",
+                "beta",
+                "server",
+                "--url",
+                "https://example.com/mcp",
+                "--oauth-client-id",
+                "client-123",
+                "--oauth-resource",
+                "https://api.example.com",
+            ]
+        );
+    }
+
+    #[test]
+    fn mcp_stdio_add_oauth_is_noop() {
+        // OAuth options only apply to HTTP transports.
+        let args = McpAddCommand::stdio("server", "uvx")
+            .oauth_client_id("ignored")
+            .args();
+        assert_eq!(args, vec!["mcp", "add", "server", "--", "uvx"]);
     }
 }
