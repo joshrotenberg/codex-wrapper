@@ -7,9 +7,11 @@
 //! ```
 
 use codex_wrapper::{
-    ApplyCommand, Codex, CodexCommand, CompletionCommand, ExecCommand, ExecResumeCommand,
-    FeaturesListCommand, ForkCommand, LoginStatusCommand, McpListCommand, McpServerCommand,
-    ResumeCommand, ReviewCommand, SandboxCommand, SandboxPlatform, Shell, VersionCommand,
+    ApplyCommand, ArchiveCommand, Codex, CodexCommand, CompletionCommand, DeleteCommand,
+    DoctorCommand, ExecCommand, ExecResumeCommand, FeaturesListCommand, ForkCommand,
+    LoginStatusCommand, McpListCommand, McpServerCommand, PluginListCommand,
+    PluginMarketplaceListCommand, ResumeCommand, ReviewCommand, SandboxCommand, Shell,
+    UnarchiveCommand, VersionCommand,
 };
 
 fn codex() -> Codex {
@@ -154,7 +156,7 @@ async fn mcp_list_json() {
 #[ignore]
 async fn sandbox_echo() {
     let codex = codex();
-    let output = SandboxCommand::new(SandboxPlatform::MacOs, "echo")
+    let output = SandboxCommand::new("echo")
         .arg("sandbox-test")
         .execute(&codex)
         .await
@@ -198,6 +200,23 @@ async fn exec_json_lines() {
     assert!(
         types.contains(&"thread.started"),
         "expected thread.started event, got: {types:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn exec_query_result() {
+    let codex = codex();
+    let result = ExecCommand::new("respond with just the word 'pong'")
+        .ephemeral()
+        .execute_json(&codex)
+        .await
+        .unwrap();
+    // The completed event should populate the typed result and a thread id.
+    assert!(!result.events.is_empty(), "expected a non-empty event stream");
+    assert!(
+        result.thread_id.is_some(),
+        "expected a thread_id from the stream"
     );
 }
 
@@ -273,6 +292,82 @@ async fn apply_bogus_task_fails() {
     let codex = codex();
     let result = ApplyCommand::new("not-a-real-task").execute(&codex).await;
     assert!(result.is_err(), "applying a bogus task should fail");
+}
+
+// ---------------------------------------------------------------------------
+// Doctor
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn doctor_json() {
+    let codex = codex();
+    let output = DoctorCommand::new().json().execute(&codex).await.unwrap();
+    assert!(output.success);
+    let value: serde_json::Value =
+        serde_json::from_str(&output.stdout).expect("doctor --json should emit valid JSON");
+    assert!(
+        value.get("codexVersion").is_some(),
+        "expected codexVersion field, got: {value}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Plugin
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn plugin_list() {
+    let codex = codex();
+    let output = PluginListCommand::new().execute(&codex).await.unwrap();
+    assert!(output.success);
+}
+
+#[tokio::test]
+#[ignore]
+async fn plugin_marketplace_list() {
+    let codex = codex();
+    let output = PluginMarketplaceListCommand::new()
+        .execute(&codex)
+        .await
+        .unwrap();
+    assert!(output.success);
+}
+
+// ---------------------------------------------------------------------------
+// Session lifecycle (bogus session ids should fail, not panic)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn archive_bogus_session_fails() {
+    let codex = codex();
+    let result = ArchiveCommand::new("00000000-0000-0000-0000-000000000000")
+        .execute(&codex)
+        .await;
+    assert!(result.is_err(), "archiving a bogus session should fail");
+}
+
+#[tokio::test]
+#[ignore]
+async fn unarchive_bogus_session_fails() {
+    let codex = codex();
+    let result = UnarchiveCommand::new("00000000-0000-0000-0000-000000000000")
+        .execute(&codex)
+        .await;
+    assert!(result.is_err(), "unarchiving a bogus session should fail");
+}
+
+#[tokio::test]
+#[ignore]
+async fn delete_bogus_session_fails() {
+    let codex = codex();
+    let result = DeleteCommand::new("00000000-0000-0000-0000-000000000000")
+        .force()
+        .execute(&codex)
+        .await;
+    assert!(result.is_err(), "deleting a bogus session should fail");
 }
 
 // ---------------------------------------------------------------------------

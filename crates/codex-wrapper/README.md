@@ -233,10 +233,12 @@ McpRemoveCommand::new("old-server").execute(&codex).await?;
 
 ## Sandbox Execution
 
-Run commands inside the Codex sandbox:
+Run commands inside the Codex sandbox. The platform is auto-detected
+(Seatbelt on macOS, and so on); the `<macos|linux|windows>` positional was
+removed in `codex-cli` 0.145.0.
 
 ```rust
-let output = SandboxCommand::new(SandboxPlatform::MacOs, "ls")
+let output = SandboxCommand::new("ls")
     .arg("-la")
     .execute(&codex)
     .await?;
