@@ -154,6 +154,64 @@ impl JsonLineEvent {
     }
 }
 
+/// A typed summary of a completed `codex exec` run, assembled from the JSONL
+/// event stream.
+///
+/// This mirrors the shape of `claude-wrapper`'s `QueryResult` so a downstream
+/// abstraction can treat both wrappers uniformly. The full parsed event stream
+/// is retained in [`events`](QueryResult::events) as an escape hatch for fields
+/// not surfaced here.
+#[cfg(feature = "json")]
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    /// Final assistant text from the terminal `completed` event.
+    ///
+    /// Empty if no `completed` event carried a `result.text` value.
+    pub result: String,
+    /// The `session_id` captured from the event stream, if any.
+    pub session_id: Option<String>,
+    /// The `thread_id` captured from the event stream, if any.
+    ///
+    /// This is Codex's native identifier for resuming a conversation.
+    pub thread_id: Option<String>,
+    /// Total cost in USD from the `completed` event, if reported.
+    pub cost_usd: Option<f64>,
+    /// The full parsed event stream this result was assembled from.
+    pub events: Vec<JsonLineEvent>,
+}
+
+#[cfg(feature = "json")]
+impl QueryResult {
+    /// Assemble a [`QueryResult`] from a parsed JSONL event stream.
+    ///
+    /// `result` and `cost_usd` are taken from the last `completed` event;
+    /// `session_id` and `thread_id` are the first occurrences in the stream.
+    #[must_use]
+    pub fn from_events(events: Vec<JsonLineEvent>) -> Self {
+        let completed = events.iter().rev().find(|e| e.is_completed());
+        let result = completed
+            .and_then(JsonLineEvent::result_text)
+            .unwrap_or_default()
+            .to_string();
+        let cost_usd = completed.and_then(JsonLineEvent::cost_usd);
+        let session_id = events
+            .iter()
+            .find_map(JsonLineEvent::session_id)
+            .map(str::to_string);
+        let thread_id = events
+            .iter()
+            .find_map(JsonLineEvent::thread_id)
+            .map(str::to_string);
+        Self {
+            result,
+            session_id,
+            thread_id,
+            cost_usd,
+            events,
+        }
+    }
+}
+
 /// Parsed semantic version of the Codex CLI (`major.minor.patch`).
 ///
 /// Supports comparison and ordering for version-gating logic.
@@ -332,5 +390,37 @@ mod tests {
     fn json_line_event_content_text_none_when_missing() {
         let event: JsonLineEvent = serde_json::from_str(r#"{"type":"message.delta"}"#).unwrap();
         assert_eq!(event.content_text(), None);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn query_result_from_events() {
+        let events: Vec<JsonLineEvent> = vec![
+            serde_json::from_str(
+                r#"{"type":"thread.started","session_id":"sess_1","thread_id":"thread_1"}"#,
+            )
+            .unwrap(),
+            serde_json::from_str(r#"{"type":"message.created","role":"assistant"}"#).unwrap(),
+            serde_json::from_str(r#"{"type":"completed","result":{"text":"done","cost":0.02}}"#)
+                .unwrap(),
+        ];
+        let result = QueryResult::from_events(events);
+        assert_eq!(result.result, "done");
+        assert_eq!(result.session_id.as_deref(), Some("sess_1"));
+        assert_eq!(result.thread_id.as_deref(), Some("thread_1"));
+        assert_eq!(result.cost_usd, Some(0.02));
+        assert_eq!(result.events.len(), 3);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn query_result_from_events_no_completed() {
+        let events: Vec<JsonLineEvent> =
+            vec![serde_json::from_str(r#"{"type":"message.created"}"#).unwrap()];
+        let result = QueryResult::from_events(events);
+        assert_eq!(result.result, "");
+        assert_eq!(result.cost_usd, None);
+        assert!(result.session_id.is_none());
+        assert!(result.thread_id.is_none());
     }
 }

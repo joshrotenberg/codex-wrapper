@@ -3,7 +3,12 @@
 use std::path::PathBuf;
 
 /// Errors returned by `codex-wrapper` operations.
+///
+/// This enum is `#[non_exhaustive]`: match arms must include a `_` catch-all so
+/// new variants can be added without a breaking change. This mirrors
+/// `claude-wrapper`'s `Error` for cross-crate consistency.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The `codex` binary was not found in PATH.
     #[error("codex binary not found in PATH")]

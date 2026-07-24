@@ -145,10 +145,32 @@ let output = ExecCommand::new("fix the failing tests")
 | `local_provider()` | `--local-provider` | Specify lmstudio/ollama |
 | `retry()` | *(client-side)* | Per-command retry policy |
 
+## Typed Result
+
+Use `execute_json()` for a typed `QueryResult` summarizing the run, assembled
+from the JSONL event stream. This mirrors `claude-wrapper`'s `QueryResult` so a
+downstream abstraction can treat both wrappers uniformly:
+
+```rust
+use codex_wrapper::ExecCommand;
+
+let result = ExecCommand::new("what is 2+2?")
+    .ephemeral()
+    .execute_json(&codex)
+    .await?;
+
+println!("{}", result.result);
+println!("thread: {:?}", result.thread_id);
+println!("cost: {:?}", result.cost_usd);
+```
+
+`QueryResult` fields: `result`, `session_id`, `thread_id`, `cost_usd`, and the
+full `events` stream as an escape hatch.
+
 ## JSONL Output Parsing
 
-Use `execute_json_lines()` to parse structured events from `--json` mode.
-Available on both `ExecCommand` and `ExecResumeCommand`:
+Use `execute_json_lines()` to parse the raw structured events from `--json`
+mode. Available on both `ExecCommand` and `ExecResumeCommand`:
 
 ```rust
 use codex_wrapper::ExecCommand;

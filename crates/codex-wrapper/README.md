@@ -140,9 +140,26 @@ All ExecCommand options:
 | `local_provider()` | `--local-provider` | Specify lmstudio/ollama |
 | `retry()` | *(client-side)* | Per-command retry policy |
 
+## Typed Result
+
+Use `execute_json()` for a typed `QueryResult` summarizing the run (final
+`result` text, `session_id`, `thread_id`, `cost_usd`, and the full `events`
+stream). It mirrors `claude-wrapper`'s `QueryResult` so a downstream abstraction
+can treat both wrappers uniformly:
+
+```rust
+let result = ExecCommand::new("what is 2+2?")
+    .ephemeral()
+    .execute_json(&codex)
+    .await?;
+
+println!("{}", result.result);
+```
+
 ## JSONL Output Parsing
 
-Use `execute_json_lines()` to parse structured events from `--json` mode:
+Use `execute_json_lines()` to parse the raw structured events from `--json`
+mode:
 
 ```rust
 let events = ExecCommand::new("what is 2+2?")
@@ -311,7 +328,7 @@ let output = ExecCommand::new("flaky task")
 Optional Cargo features (enabled by default):
 
 - `json` -- JSONL output parsing via `serde_json` (`execute_json_lines()`,
-  `execute_json()`, `JsonLineEvent`)
+  `execute_json()`, `QueryResult`, `JsonLineEvent`)
 
 ## Testing
 
