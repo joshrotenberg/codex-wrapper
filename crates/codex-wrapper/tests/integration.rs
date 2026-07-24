@@ -213,7 +213,10 @@ async fn exec_query_result() {
         .await
         .unwrap();
     // The completed event should populate the typed result and a thread id.
-    assert!(!result.events.is_empty(), "expected a non-empty event stream");
+    assert!(
+        !result.events.is_empty(),
+        "expected a non-empty event stream"
+    );
     assert!(
         result.thread_id.is_some(),
         "expected a thread_id from the stream"
