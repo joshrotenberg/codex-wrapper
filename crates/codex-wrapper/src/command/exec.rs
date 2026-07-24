@@ -4,15 +4,15 @@ use crate::command::CodexCommand;
 use crate::error::Error;
 use crate::error::Result;
 use crate::exec::{self, CommandOutput};
-#[cfg(feature = "json")]
-use crate::types::JsonLineEvent;
 use crate::types::{Color, SandboxMode};
+#[cfg(feature = "json")]
+use crate::types::{JsonLineEvent, QueryResult};
 
 /// Run Codex non-interactively (`codex exec <prompt>`).
 ///
 /// This is the primary command for programmatic use. It supports the full
-/// range of exec flags: model selection, sandbox policy, approval policy,
-/// images, config overrides, feature flags, JSON output, and more.
+/// range of exec flags: model selection, sandbox policy, images, config
+/// overrides, feature flags, JSON output, and more.
 ///
 /// # Example
 ///
@@ -339,6 +339,17 @@ impl ExecCommand {
         let output = exec::run_codex_with_retry(codex, args, self.retry_policy.as_ref()).await?;
         parse_json_lines(&output.stdout)
     }
+
+    /// Execute the command and return a typed [`QueryResult`].
+    ///
+    /// Assembles the final result text, ids, and cost from the JSONL event
+    /// stream. Use [`execute_json_lines`](ExecCommand::execute_json_lines) for
+    /// the raw event stream. Requires the `json` feature.
+    #[cfg(feature = "json")]
+    pub async fn execute_json(&self, codex: &Codex) -> Result<QueryResult> {
+        let events = self.execute_json_lines(codex).await?;
+        Ok(QueryResult::from_events(events))
+    }
 }
 
 impl CodexCommand for ExecCommand {
@@ -636,6 +647,16 @@ impl ExecResumeCommand {
 
         let output = exec::run_codex_with_retry(codex, args, self.retry_policy.as_ref()).await?;
         parse_json_lines(&output.stdout)
+    }
+
+    /// Execute the resume command and return a typed [`QueryResult`].
+    ///
+    /// Assembles the final result text, ids, and cost from the JSONL event
+    /// stream. Requires the `json` feature.
+    #[cfg(feature = "json")]
+    pub async fn execute_json(&self, codex: &Codex) -> Result<QueryResult> {
+        let events = self.execute_json_lines(codex).await?;
+        Ok(QueryResult::from_events(events))
     }
 
     /// Stream JSONL events from the resume command, invoking `handler` for
