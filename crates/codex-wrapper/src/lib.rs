@@ -104,6 +104,9 @@
 //! | [`CompletionCommand`] | `codex completion` |
 //! | [`SandboxCommand`] | `codex sandbox` |
 //! | [`ApplyCommand`] | `codex apply` |
+//! | [`ArchiveCommand`] | `codex archive` |
+//! | [`DeleteCommand`] | `codex delete` |
+//! | [`UnarchiveCommand`] | `codex unarchive` |
 //! | [`FeaturesListCommand`] | `codex features list` |
 //! | [`FeaturesEnableCommand`] | `codex features enable` |
 //! | [`FeaturesDisableCommand`] | `codex features disable` |
@@ -166,6 +169,7 @@ pub use command::raw::RawCommand;
 pub use command::resume::ResumeCommand;
 pub use command::review::ReviewCommand;
 pub use command::sandbox::{SandboxCommand, SandboxPlatform};
+pub use command::session_mgmt::{ArchiveCommand, DeleteCommand, UnarchiveCommand};
 pub use command::version::VersionCommand;
 pub use error::{Error, Result};
 pub use exec::CommandOutput;
