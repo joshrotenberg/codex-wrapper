@@ -16,6 +16,7 @@ pub mod raw;
 pub mod resume;
 pub mod review;
 pub mod sandbox;
+pub mod session_mgmt;
 pub mod version;
 
 use std::future::Future;

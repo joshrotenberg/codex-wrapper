@@ -96,6 +96,9 @@ Each CLI subcommand is a separate builder:
 | `McpServerCommand` | `codex mcp-server` | Start Codex as MCP server |
 | `SandboxCommand` | `codex sandbox` | Run command in sandbox |
 | `ApplyCommand` | `codex apply` | Apply agent diff |
+| `ArchiveCommand` | `codex archive` | Archive a saved session |
+| `DeleteCommand` | `codex delete` | Permanently delete a session |
+| `UnarchiveCommand` | `codex unarchive` | Restore an archived session |
 | `CompletionCommand` | `codex completion` | Generate shell completions |
 | `FeaturesListCommand` | `codex features list` | List feature flags |
 | `FeaturesEnableCommand` | `codex features enable` | Enable a feature |
