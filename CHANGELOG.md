@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0](https://github.com/joshrotenberg/codex-wrapper/compare/v0.1.2...v0.2.0) - 2026-07-24
+
+### Added
+
+- close exec-adjacent flag drift on fork, resume, mcp add, login ([#49](https://github.com/joshrotenberg/codex-wrapper/pull/49))
+- add plugin command group ([#48](https://github.com/joshrotenberg/codex-wrapper/pull/48))
+- add doctor and update commands ([#46](https://github.com/joshrotenberg/codex-wrapper/pull/46))
+- add archive/delete/unarchive session-lifecycle commands ([#45](https://github.com/joshrotenberg/codex-wrapper/pull/45))
+- add typed QueryResult and make Error non_exhaustive for trait parity ([#44](https://github.com/joshrotenberg/codex-wrapper/pull/44))
+
+### Fixed
+
+- correct sandbox command for codex-cli 0.145.0, add real integration tests ([#50](https://github.com/joshrotenberg/codex-wrapper/pull/50))
+- catch codex exec family up to codex-cli 0.145.0 ([#42](https://github.com/joshrotenberg/codex-wrapper/pull/42))
+
 ## [0.1.2](https://github.com/joshrotenberg/codex-wrapper/compare/v0.1.1...v0.1.2) - 2026-04-13
 
 ### Added
