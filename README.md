@@ -101,6 +101,13 @@ Each CLI subcommand is a separate builder:
 | `UnarchiveCommand` | `codex unarchive` | Restore an archived session |
 | `DoctorCommand` | `codex doctor` | Diagnose local install health |
 | `UpdateCommand` | `codex update` | Update Codex to the latest version |
+| `PluginAddCommand` | `codex plugin add` | Install a plugin |
+| `PluginListCommand` | `codex plugin list` | List available plugins |
+| `PluginRemoveCommand` | `codex plugin remove` | Remove an installed plugin |
+| `PluginMarketplaceAddCommand` | `codex plugin marketplace add` | Add a marketplace source |
+| `PluginMarketplaceListCommand` | `codex plugin marketplace list` | List marketplace sources |
+| `PluginMarketplaceUpgradeCommand` | `codex plugin marketplace upgrade` | Refresh Git marketplaces |
+| `PluginMarketplaceRemoveCommand` | `codex plugin marketplace remove` | Remove a marketplace source |
 | `CompletionCommand` | `codex completion` | Generate shell completions |
 | `FeaturesListCommand` | `codex features list` | List feature flags |
 | `FeaturesEnableCommand` | `codex features enable` | Enable a feature |

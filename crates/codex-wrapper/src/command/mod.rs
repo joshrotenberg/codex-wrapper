@@ -13,6 +13,7 @@ pub mod fork;
 pub mod login;
 pub mod mcp;
 pub mod mcp_server;
+pub mod plugin;
 pub mod raw;
 pub mod resume;
 pub mod review;
