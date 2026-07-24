@@ -93,6 +93,8 @@ Each CLI subcommand is a separate builder. Available commands:
 | `ArchiveCommand` | `codex archive` | Archive a saved session |
 | `DeleteCommand` | `codex delete` | Permanently delete a session |
 | `UnarchiveCommand` | `codex unarchive` | Restore an archived session |
+| `DoctorCommand` | `codex doctor` | Diagnose local install health |
+| `UpdateCommand` | `codex update` | Update Codex to the latest version |
 | `CompletionCommand` | `codex completion` | Generate shell completions |
 | `FeaturesListCommand` | `codex features list` | List feature flags |
 | `FeaturesEnableCommand` | `codex features enable` | Enable a feature |

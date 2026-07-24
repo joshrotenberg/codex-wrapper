@@ -6,6 +6,7 @@
 
 pub mod apply;
 pub mod completion;
+pub mod doctor;
 pub mod exec;
 pub mod features;
 pub mod fork;
@@ -17,6 +18,7 @@ pub mod resume;
 pub mod review;
 pub mod sandbox;
 pub mod session_mgmt;
+pub mod update;
 pub mod version;
 
 use std::future::Future;

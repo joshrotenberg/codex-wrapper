@@ -107,6 +107,8 @@
 //! | [`ArchiveCommand`] | `codex archive` |
 //! | [`DeleteCommand`] | `codex delete` |
 //! | [`UnarchiveCommand`] | `codex unarchive` |
+//! | [`DoctorCommand`] | `codex doctor` |
+//! | [`UpdateCommand`] | `codex update` |
 //! | [`FeaturesListCommand`] | `codex features list` |
 //! | [`FeaturesEnableCommand`] | `codex features enable` |
 //! | [`FeaturesDisableCommand`] | `codex features disable` |
@@ -156,6 +158,7 @@ use std::time::Duration;
 pub use command::CodexCommand;
 pub use command::apply::ApplyCommand;
 pub use command::completion::{CompletionCommand, Shell};
+pub use command::doctor::DoctorCommand;
 pub use command::exec::{ExecCommand, ExecResumeCommand};
 pub use command::features::{FeaturesDisableCommand, FeaturesEnableCommand, FeaturesListCommand};
 pub use command::fork::ForkCommand;
@@ -170,6 +173,7 @@ pub use command::resume::ResumeCommand;
 pub use command::review::ReviewCommand;
 pub use command::sandbox::{SandboxCommand, SandboxPlatform};
 pub use command::session_mgmt::{ArchiveCommand, DeleteCommand, UnarchiveCommand};
+pub use command::update::UpdateCommand;
 pub use command::version::VersionCommand;
 pub use error::{Error, Result};
 pub use exec::CommandOutput;
