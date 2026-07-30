@@ -542,6 +542,9 @@ pub struct ExecResumeCommand {
     model: Option<String>,
     strict_config: bool,
     dangerously_bypass_hook_trust: bool,
+    ignore_user_config: bool,
+    ignore_rules: bool,
+    output_schema: Option<String>,
     full_auto: bool,
     dangerously_bypass_approvals_and_sandbox: bool,
     skip_git_repo_check: bool,
@@ -569,6 +572,9 @@ impl ExecResumeCommand {
             model: None,
             strict_config: false,
             dangerously_bypass_hook_trust: false,
+            ignore_user_config: false,
+            ignore_rules: false,
+            output_schema: None,
             full_auto: false,
             dangerously_bypass_approvals_and_sandbox: false,
             skip_git_repo_check: false,
@@ -719,6 +725,27 @@ impl ExecResumeCommand {
         self
     }
 
+    /// Ignore the user-level config file (`--ignore-user-config`).
+    #[must_use]
+    pub fn ignore_user_config(mut self) -> Self {
+        self.ignore_user_config = true;
+        self
+    }
+
+    /// Ignore project rules files (`--ignore-rules`).
+    #[must_use]
+    pub fn ignore_rules(mut self) -> Self {
+        self.ignore_rules = true;
+        self
+    }
+
+    /// Require output to conform to a JSON schema (`--output-schema <path>`).
+    #[must_use]
+    pub fn output_schema(mut self, path: impl Into<String>) -> Self {
+        self.output_schema = Some(path.into());
+        self
+    }
+
     /// Run in full-auto mode, emitted as `-c sandbox_mode="workspace-write"`.
     ///
     /// `--full-auto` is deprecated upstream; `codex-cli` 0.145.0 hides it and
@@ -850,6 +877,16 @@ impl CodexCommand for ExecResumeCommand {
         }
         if self.ephemeral {
             args.push("--ephemeral".into());
+        }
+        if self.ignore_user_config {
+            args.push("--ignore-user-config".into());
+        }
+        if self.ignore_rules {
+            args.push("--ignore-rules".into());
+        }
+        if let Some(output_schema) = &self.output_schema {
+            args.push("--output-schema".into());
+            args.push(output_schema.clone());
         }
         if self.json {
             args.push("--json".into());
@@ -1120,6 +1157,30 @@ mod tests {
                 "-c",
                 "web_search=\"cached\"",
                 "--last"
+            ]
+        );
+    }
+
+    /// #65: these three were listed in #41 P1 but never landed on
+    /// `ExecResumeCommand`.
+    #[test]
+    fn exec_resume_ignore_and_output_schema_args() {
+        let args = ExecResumeCommand::new()
+            .last()
+            .ignore_user_config()
+            .ignore_rules()
+            .output_schema("/tmp/schema.json")
+            .args();
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "resume",
+                "--last",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--output-schema",
+                "/tmp/schema.json"
             ]
         );
     }
