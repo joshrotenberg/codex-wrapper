@@ -28,6 +28,9 @@ pub struct ReviewCommand {
     dangerously_bypass_approvals_and_sandbox: bool,
     skip_git_repo_check: bool,
     ephemeral: bool,
+    ignore_user_config: bool,
+    ignore_rules: bool,
+    output_schema: Option<String>,
     json: bool,
     output_last_message: Option<String>,
     retry_policy: Option<crate::retry::RetryPolicy>,
@@ -54,6 +57,9 @@ impl ReviewCommand {
             dangerously_bypass_approvals_and_sandbox: false,
             skip_git_repo_check: false,
             ephemeral: false,
+            ignore_user_config: false,
+            ignore_rules: false,
+            output_schema: None,
             json: false,
             output_last_message: None,
             retry_policy: None,
@@ -196,6 +202,27 @@ impl ReviewCommand {
         self
     }
 
+    /// Ignore the user-level config file (`--ignore-user-config`).
+    #[must_use]
+    pub fn ignore_user_config(mut self) -> Self {
+        self.ignore_user_config = true;
+        self
+    }
+
+    /// Ignore project rules files (`--ignore-rules`).
+    #[must_use]
+    pub fn ignore_rules(mut self) -> Self {
+        self.ignore_rules = true;
+        self
+    }
+
+    /// Require output to conform to a JSON schema (`--output-schema <path>`).
+    #[must_use]
+    pub fn output_schema(mut self, path: impl Into<String>) -> Self {
+        self.output_schema = Some(path.into());
+        self
+    }
+
     #[must_use]
     pub fn json(mut self) -> Self {
         self.json = true;
@@ -303,6 +330,16 @@ impl CodexCommand for ReviewCommand {
         if self.ephemeral {
             args.push("--ephemeral".into());
         }
+        if self.ignore_user_config {
+            args.push("--ignore-user-config".into());
+        }
+        if self.ignore_rules {
+            args.push("--ignore-rules".into());
+        }
+        if let Some(output_schema) = &self.output_schema {
+            args.push("--output-schema".into());
+            args.push(output_schema.clone());
+        }
         if self.json {
             args.push("--json".into());
         }
@@ -406,5 +443,29 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|a| a == "--full-auto"));
+    }
+
+    /// #65: these three were listed in #41 P1 but never landed on
+    /// `ReviewCommand`.
+    #[test]
+    fn review_ignore_and_output_schema_args() {
+        let args = ReviewCommand::new()
+            .uncommitted()
+            .ignore_user_config()
+            .ignore_rules()
+            .output_schema("/tmp/schema.json")
+            .args();
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "review",
+                "--uncommitted",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--output-schema",
+                "/tmp/schema.json"
+            ]
+        );
     }
 }
