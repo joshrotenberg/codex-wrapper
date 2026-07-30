@@ -327,7 +327,7 @@ impl QueryResult {
 /// Parsed semantic version of the Codex CLI (`major.minor.patch`).
 ///
 /// Supports comparison and ordering for version-gating logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliVersion {
     pub major: u32,
     pub minor: u32,
@@ -354,6 +354,82 @@ impl CliVersion {
     #[must_use]
     pub fn satisfies_minimum(&self, minimum: &CliVersion) -> bool {
         self >= minimum
+    }
+
+    /// Classify this version against a tested-against range.
+    ///
+    /// ```
+    /// use codex_wrapper::{CliVersion, CliVersionStatus};
+    ///
+    /// let min = CliVersion::new(0, 145, 0);
+    /// let max = CliVersion::new(0, 146, 0);
+    ///
+    /// assert!(CliVersion::new(0, 145, 3).status_within(&min, &max).is_tested());
+    /// assert!(!CliVersion::new(0, 200, 0).status_within(&min, &max).is_tested());
+    /// ```
+    #[must_use]
+    pub fn status_within(&self, min: &CliVersion, max: &CliVersion) -> CliVersionStatus {
+        if self < min {
+            CliVersionStatus::OlderThanMinimum {
+                found: *self,
+                minimum: *min,
+            }
+        } else if self > max {
+            CliVersionStatus::NewerUntested {
+                found: *self,
+                tested_max: *max,
+            }
+        } else {
+            CliVersionStatus::Tested
+        }
+    }
+}
+
+/// Classification of an installed CLI version against a tested range.
+///
+/// Returned by [`CliVersion::status_within`] and
+/// [`Codex::cli_version_status`](crate::Codex::cli_version_status). Mirrors
+/// `claude-wrapper`'s enum of the same name so a downstream abstraction can
+/// treat both wrappers uniformly.
+///
+/// There is deliberately no `Unparseable` variant: unparseable output is an
+/// error from [`Codex::cli_version`](crate::Codex::cli_version), not a status,
+/// and modeling it twice would fork this shape away from the sibling crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CliVersionStatus {
+    /// Within the tested-against range.
+    Tested,
+    /// Newer than the highest tested version.
+    ///
+    /// The wrapper should still generally work; semantics may have drifted.
+    NewerUntested {
+        /// The installed CLI version.
+        found: CliVersion,
+        /// Highest version this wrapper is tested against.
+        tested_max: CliVersion,
+    },
+    /// Older than the lowest tested version.
+    ///
+    /// Incorrect behavior is likely rather than merely possible: the arguments
+    /// this wrapper emits target the newer CLI, and older releases reject some
+    /// of them outright.
+    OlderThanMinimum {
+        /// The installed CLI version.
+        found: CliVersion,
+        /// Lowest version this wrapper is tested against.
+        minimum: CliVersion,
+    },
+}
+
+impl CliVersionStatus {
+    /// True only for [`Tested`](Self::Tested).
+    ///
+    /// For callers branching on "should I run?" without matching every
+    /// variant.
+    #[must_use]
+    pub fn is_tested(self) -> bool {
+        matches!(self, Self::Tested)
     }
 }
 

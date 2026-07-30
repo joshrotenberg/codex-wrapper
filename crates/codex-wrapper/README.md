@@ -1,6 +1,6 @@
 # codex-wrapper
 
-A type-safe Codex CLI wrapper for Rust
+A type-safe Codex CLI wrapper for Rust.
 
 [![Crates.io](https://img.shields.io/crates/v/codex-wrapper.svg)](https://crates.io/crates/codex-wrapper)
 [![Documentation](https://docs.rs/codex-wrapper/badge.svg)](https://docs.rs/codex-wrapper)
@@ -9,8 +9,9 @@ A type-safe Codex CLI wrapper for Rust
 
 ## Overview
 
-`codex-wrapper` provides a type-safe builder-pattern interface for invoking the
-`codex` CLI programmatically. It follows the same design philosophy as
+`codex-wrapper` provides a builder-pattern interface for invoking the
+[Codex CLI](https://github.com/openai/codex) programmatically. It follows
+the same design philosophy as
 [`claude-wrapper`](https://crates.io/crates/claude-wrapper) and
 [`docker-wrapper`](https://crates.io/crates/docker-wrapper): each CLI
 subcommand is a builder struct that produces typed output.
@@ -20,6 +21,9 @@ subcommand is a builder struct that produces typed output.
 ```bash
 cargo add codex-wrapper
 ```
+
+Requires the `codex` CLI to be installed and available in `PATH` (or
+configured via `Codex::builder().binary()`).
 
 ## Quick Start
 
@@ -51,6 +55,8 @@ timeout, retry policy). Command builders hold per-invocation options and call
 Configure once, reuse across commands:
 
 ```rust
+use codex_wrapper::{Codex, RetryPolicy};
+
 let codex = Codex::builder()
     .env("OPENAI_API_KEY", "sk-...")
     .timeout_secs(300)
@@ -69,7 +75,7 @@ Options:
 
 ### Command Builders
 
-Each CLI subcommand is a separate builder. Available commands:
+Each CLI subcommand is a separate builder:
 
 | Command | CLI Equivalent | Description |
 |---------|---------------|-------------|
@@ -109,11 +115,13 @@ Each CLI subcommand is a separate builder. Available commands:
 | `VersionCommand` | `codex --version` | Get CLI version |
 | `RawCommand` | *(any)* | Escape hatch for arbitrary args |
 
-## ExecCommand: The Workhorse
+## ExecCommand
 
 Full coverage of `codex exec` options:
 
 ```rust
+use codex_wrapper::{ExecCommand, SandboxMode};
+
 let output = ExecCommand::new("fix the failing tests")
     .model("o3")
     .sandbox(SandboxMode::WorkspaceWrite)
@@ -124,8 +132,6 @@ let output = ExecCommand::new("fix the failing tests")
     .await?;
 ```
 
-All ExecCommand options:
-
 | Method | CLI Flag | Description |
 |--------|----------|-------------|
 | `model()` | `--model` | Model to use |
@@ -135,13 +141,12 @@ All ExecCommand options:
 | `full_auto()` | `--sandbox workspace-write` | Deprecated shim; `sandbox()` wins |
 | `approval_policy()` | `-c approval_policy=` | When the model asks for approval |
 | `search()` / `search_mode()` | `-c web_search=` | Web search mode |
-| `dangerously_bypass_approvals_and_sandbox()` | `--dangerously-bypass-approvals-and-sandbox` | Skip all safety |
-| `dangerously_bypass_hook_trust()` | `--dangerously-bypass-hook-trust` | Skip the hook trust prompt |
 | `cd()` | `--cd` | Working directory |
 | `skip_git_repo_check()` | `--skip-git-repo-check` | Run outside git repo |
 | `add_dir()` | `--add-dir` | Additional writable dirs |
 | `ignore_user_config()` | `--ignore-user-config` | Ignore user-level config |
 | `ignore_rules()` | `--ignore-rules` | Ignore project rules files |
+| `dangerously_bypass_hook_trust()` | `--dangerously-bypass-hook-trust` | Skip the hook trust prompt |
 | `ephemeral()` | `--ephemeral` | Don't persist session |
 | `output_schema()` | `--output-schema` | JSON Schema for response |
 | `color()` | `--color` | Color output mode |
@@ -156,26 +161,34 @@ All ExecCommand options:
 
 ## Typed Result
 
-Use `execute_json()` for a typed `QueryResult` summarizing the run (final
-`result` text, `session_id`, `thread_id`, `cost_usd`, and the full `events`
-stream). It mirrors `claude-wrapper`'s `QueryResult` so a downstream abstraction
-can treat both wrappers uniformly:
+Use `execute_json()` for a typed `QueryResult` summarizing the run, assembled
+from the JSONL event stream. This mirrors `claude-wrapper`'s `QueryResult` so a
+downstream abstraction can treat both wrappers uniformly:
 
 ```rust
+use codex_wrapper::ExecCommand;
+
 let result = ExecCommand::new("what is 2+2?")
     .ephemeral()
     .execute_json(&codex)
     .await?;
 
 println!("{}", result.result);
+println!("thread: {:?}", result.thread_id);
+println!("cost: {:?}", result.cost_usd);
 ```
+
+`QueryResult` fields: `result`, `session_id`, `thread_id`, `cost_usd`, and the
+full `events` stream as an escape hatch.
 
 ## JSONL Output Parsing
 
 Use `execute_json_lines()` to parse the raw structured events from `--json`
-mode:
+mode. Available on both `ExecCommand` and `ExecResumeCommand`:
 
 ```rust
+use codex_wrapper::ExecCommand;
+
 let events = ExecCommand::new("what is 2+2?")
     .ephemeral()
     .execute_json_lines(&codex)
@@ -186,12 +199,84 @@ for event in &events {
 }
 ```
 
-Event types include `thread.started`, `turn.started`, `item.completed`,
-`turn.completed`, and more.
+### Typed Accessors
+
+`JsonLineEvent` provides convenience methods for common fields:
+
+```rust
+for event in &events {
+    if let Some(id) = event.thread_id() {
+        println!("thread: {id}");
+    }
+    if event.is_completed() {
+        println!("result: {:?}", event.result_text());
+        println!("cost: {:?}", event.cost_usd());
+    }
+    if let Some(text) = event.content_text() {
+        println!("content: {text}");
+    }
+}
+```
+
+Available accessors: `session_id()`, `thread_id()`, `is_completed()`,
+`result_text()`, `cost_usd()`, `role()`, `content_text()`.
+
+## Streaming
+
+Stream JSONL events via a callback as they arrive, instead of buffering
+all output:
+
+```rust
+use codex_wrapper::{Codex, ExecCommand, JsonLineEvent};
+
+let codex = Codex::builder().build()?;
+
+ExecCommand::new("explain this codebase")
+    .ephemeral()
+    .stream(&codex, |event: JsonLineEvent| {
+        println!("{}: {:?}", event.event_type, event.extra);
+    })
+    .await?;
+```
+
+Also available on `ExecResumeCommand::stream()`. The child process's stderr
+is drained concurrently; timeout handling mirrors the buffered exec path.
+
+## Multi-Turn Sessions
+
+`Session` manages conversation state across turns automatically. The first
+call dispatches via `ExecCommand`; subsequent calls use `ExecResumeCommand`
+with the captured `thread_id`:
+
+```rust
+use std::sync::Arc;
+use codex_wrapper::{Codex, Session};
+
+let codex = Arc::new(Codex::builder().build()?);
+let mut session = Session::new(codex);
+
+let events = session.send("create a hello world program").await?;
+println!("turn 1: {} events", events.len());
+
+let events = session.send("now add error handling").await?;
+println!("turn 2: {} events, thread_id={:?}", events.len(), session.id());
+```
+
+You can also resume an existing session by thread ID:
+
+```rust
+let mut session = Session::resume(codex, "thread_abc123");
+let events = session.send("continue where we left off").await?;
+```
+
+The `thread_id` is preserved even on error paths, as long as at least one
+event carried it.
 
 ## Code Review
 
 ```rust
+use codex_wrapper::ReviewCommand;
+
 // Review uncommitted changes
 let output = ReviewCommand::new()
     .uncommitted()
@@ -210,6 +295,8 @@ let output = ReviewCommand::new()
 ## MCP Server Management
 
 ```rust
+use codex_wrapper::{McpListCommand, McpAddCommand, McpRemoveCommand};
+
 // List servers
 let output = McpListCommand::new().execute(&codex).await?;
 
@@ -235,20 +322,25 @@ McpRemoveCommand::new("old-server").execute(&codex).await?;
 
 ## Sandbox Execution
 
-Run commands inside the Codex sandbox. The platform is auto-detected
-(Seatbelt on macOS, and so on); the `<macos|linux|windows>` positional was
-removed in `codex-cli` 0.145.0.
+Run commands inside the Codex sandbox:
+
+The platform is auto-detected (Seatbelt on macOS, and so on); as of
+`codex-cli` 0.145.0 the old `<macos|linux|windows>` positional was removed.
 
 ```rust
+use codex_wrapper::SandboxCommand;
+
 let output = SandboxCommand::new("ls")
     .arg("-la")
     .execute(&codex)
     .await?;
 ```
 
-## Session Management
+## Session Resume and Fork
 
 ```rust
+use codex_wrapper::{ResumeCommand, ForkCommand};
+
 // Resume the most recent interactive session
 ResumeCommand::new()
     .last()
@@ -267,6 +359,8 @@ ForkCommand::new()
 ## Shell Completions
 
 ```rust
+use codex_wrapper::{CompletionCommand, Shell};
+
 let output = CompletionCommand::new()
     .shell(Shell::Zsh)
     .execute(&codex)
@@ -277,6 +371,8 @@ std::fs::write("_codex", &output.stdout)?;
 ## Feature Flags
 
 ```rust
+use codex_wrapper::{FeaturesListCommand, FeaturesEnableCommand, FeaturesDisableCommand};
+
 // List all feature flags
 FeaturesListCommand::new().execute(&codex).await?;
 
@@ -285,23 +381,48 @@ FeaturesEnableCommand::new("web-search").execute(&codex).await?;
 FeaturesDisableCommand::new("web-search").execute(&codex).await?;
 ```
 
-## Escape Hatch: RawCommand
+## CLI Version
 
-For subcommands or flags not yet covered by typed builders:
+This wrapper is tested against a declared range of `codex-cli` versions. Both
+ends of the range run the flag-contract check in CI, so the range reflects what
+is actually verified rather than what is hoped.
 
 ```rust
-let output = RawCommand::new("cloud")
-    .arg("--json")
-    .execute(&codex)
-    .await?;
+use codex_wrapper::{CliVersionStatus, TESTED_CLI_VERSION_MIN, TESTED_CLI_VERSION_MAX};
+
+// Report, do not fail. Warns via `tracing` when outside the range.
+match codex.cli_version_status().await? {
+    CliVersionStatus::Tested => {}
+    CliVersionStatus::NewerUntested { found, tested_max } => {
+        eprintln!("codex {found} is newer than tested ({tested_max})");
+    }
+    CliVersionStatus::OlderThanMinimum { found, minimum } => {
+        eprintln!("codex {found} is older than tested ({minimum})");
+    }
+}
 ```
+
+Most CLI releases break nothing, so this reports by default rather than
+refusing to run. When you do want a hard gate:
+
+```rust
+// Returns Error::UntestedCliVersion when outside the range.
+let version = codex.ensure_tested_cli_version().await?;
+```
+
+This is a method rather than a builder option because `build()` is synchronous
+and never spawns the binary.
+
+Override the range with `CodexBuilder::tested_cli_version_range(min, max)` if
+you have validated a different one yourself. `check_version(&minimum)` remains
+available for a plain minimum-version gate.
 
 ## Error Handling
 
 All commands return `Result<T>`, with errors typed via `thiserror`:
 
 ```rust
-use codex_wrapper::Error;
+use codex_wrapper::{ExecCommand, Error};
 
 match ExecCommand::new("test").execute(&codex).await {
     Ok(output) => println!("{}", output.stdout),
@@ -319,7 +440,7 @@ match ExecCommand::new("test").execute(&codex).await {
 Configure automatic retries for transient failures:
 
 ```rust
-use codex_wrapper::RetryPolicy;
+use codex_wrapper::{Codex, ExecCommand, RetryPolicy};
 use std::time::Duration;
 
 let policy = RetryPolicy::new()
@@ -339,12 +460,31 @@ let output = ExecCommand::new("flaky task")
     .await?;
 ```
 
-## Features
+## Escape Hatch: RawCommand
 
-Optional Cargo features (enabled by default):
+For subcommands or flags not yet covered by typed builders:
 
-- `json` -- JSONL output parsing via `serde_json` (`execute_json_lines()`,
-  `execute_json()`, `QueryResult`, `JsonLineEvent`)
+```rust
+use codex_wrapper::RawCommand;
+
+let output = RawCommand::new("cloud")
+    .arg("--json")
+    .execute(&codex)
+    .await?;
+```
+
+## Cargo Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `json` | Yes | JSONL output parsing via `serde_json` -- enables `execute_json_lines()`, `execute_json()`, `stream()`, `Session`, `QueryResult`, `JsonLineEvent` and typed accessors |
+
+To disable default features:
+
+```toml
+[dependencies]
+codex-wrapper = { version = "0.2", default-features = false }
+```
 
 ## Testing
 
@@ -352,6 +492,11 @@ Optional Cargo features (enabled by default):
 cargo test --lib --all-features           # Unit tests (no CLI required)
 cargo test --test integration -- --ignored # Integration tests (requires codex in PATH)
 ```
+
+## CI and Release
+
+GitHub Actions workflows handle CI (Linux, macOS, Windows), dependency
+audits, changelog automation, and `release-plz`-driven crates.io releases.
 
 ## License
 
