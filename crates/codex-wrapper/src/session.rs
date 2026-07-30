@@ -481,6 +481,10 @@ mod tests {
     }
 
     /// Build a session backed by the fake-codex script the streaming tests use.
+    ///
+    /// Unix-only: the fake CLI is a bash script, matching how
+    /// [`crate::streaming`] gates its own tests.
+    #[cfg(unix)]
     fn streaming_session() -> Session {
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -582,6 +586,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn stream_delivers_events_and_records_the_turn() {
         let mut session = streaming_session();
         let mut seen = Vec::new();
@@ -601,6 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn streaming_turns_accumulate_like_buffered_ones() {
         let mut session = streaming_session();
         session.stream("first", |_| {}).await.unwrap();
