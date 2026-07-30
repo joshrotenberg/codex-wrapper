@@ -221,8 +221,8 @@ mod tests {
             "expected thread.started, got: {types:?}"
         );
         assert!(
-            types.contains(&"completed"),
-            "expected completed, got: {types:?}"
+            types.contains(&"turn.completed"),
+            "expected turn.completed, got: {types:?}"
         );
     }
 

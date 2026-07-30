@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::Codex;
 use crate::command::exec::{ExecCommand, ExecResumeCommand};
 use crate::error::{Error, Result};
-use crate::types::{JsonLineEvent, QueryResult};
+use crate::types::{JsonLineEvent, QueryResult, TokenUsage};
 
 /// A record of a single turn within a session.
 #[derive(Debug, Clone)]
@@ -37,8 +37,8 @@ pub struct TurnRecord {
     /// The typed result for this turn, assembled from its JSONL events.
     ///
     /// Holding the assembled [`QueryResult`] rather than the raw event vector
-    /// is what lets a session report cost: `cost_usd` lives on the terminal
-    /// `completed` event and is otherwise discarded.
+    /// is what lets a session report usage: token counts live on the terminal
+    /// `turn.completed` event and are otherwise discarded.
     pub result: QueryResult,
 }
 
@@ -49,10 +49,10 @@ impl TurnRecord {
         &self.result.events
     }
 
-    /// Cost in USD for this turn, if the CLI reported one.
+    /// Token counts for this turn, if the CLI reported them.
     #[must_use]
-    pub fn cost_usd(&self) -> Option<f64> {
-        self.result.cost_usd
+    pub fn usage(&self) -> Option<TokenUsage> {
+        self.result.usage
     }
 }
 
@@ -258,8 +258,8 @@ impl Session {
     /// `thread_id` is taken from what arrived. This mirrors the buffered
     /// path's recovery, which re-parses stdout for the same reason. No turn is
     /// recorded on failure: an incomplete stream has no terminal `completed`
-    /// event, so its cost would be missing and would silently undercount
-    /// [`total_cost`](Self::total_cost).
+    /// event, so its usage would be missing and would silently undercount
+    /// [`total_tokens`](Self::total_tokens).
     fn finish_stream(
         &mut self,
         collected: Vec<JsonLineEvent>,
@@ -298,26 +298,32 @@ impl Session {
         self.history.last().map(|turn| &turn.result)
     }
 
-    /// Sum of the per-turn costs the CLI reported, in USD.
+    /// Sum of the per-turn token totals the CLI reported.
     ///
-    /// Turns where no cost was reported contribute nothing. The CLI does not
-    /// always report `cost_usd`, so a total of `0.0` can mean either "nothing
-    /// was spent" or "nothing was reported". Pair this with
-    /// [`turns_missing_cost`](Self::turns_missing_cost) to tell those apart.
-    #[must_use]
-    pub fn total_cost(&self) -> f64 {
-        self.history.iter().filter_map(TurnRecord::cost_usd).sum()
-    }
-
-    /// How many completed turns reported no cost.
+    /// Turns that reported no usage contribute nothing, so a total of `0` can
+    /// mean either "nothing was used" or "nothing was reported". Pair this
+    /// with [`turns_missing_usage`](Self::turns_missing_usage) to tell those
+    /// apart.
     ///
-    /// Non-zero means [`total_cost`](Self::total_cost) is an undercount rather
-    /// than a full accounting.
+    /// There is no cost equivalent: the CLI reports tokens, not money. See
+    /// [`TokenUsage`].
     #[must_use]
-    pub fn turns_missing_cost(&self) -> usize {
+    pub fn total_tokens(&self) -> u64 {
         self.history
             .iter()
-            .filter(|turn| turn.cost_usd().is_none())
+            .filter_map(|turn| turn.usage().and_then(|u| u.total()))
+            .sum()
+    }
+
+    /// How many completed turns reported no usable token total.
+    ///
+    /// Non-zero means [`total_tokens`](Self::total_tokens) is an undercount
+    /// rather than a full accounting.
+    #[must_use]
+    pub fn turns_missing_usage(&self) -> usize {
+        self.history
+            .iter()
+            .filter(|turn| turn.usage().and_then(|u| u.total()).is_none())
             .count()
     }
 
@@ -504,85 +510,86 @@ mod tests {
             .collect()
     }
 
+    /// Build a completed turn reporting `total` tokens.
+    fn completed(total: u64) -> Vec<JsonLineEvent> {
+        turn(&[&format!(
+            r#"{{"type":"turn.completed","usage":{{"total_tokens":{total}}}}}"#
+        )])
+    }
+
     #[test]
-    fn record_turn_captures_cost_and_thread_id() {
+    fn record_turn_captures_usage_and_thread_id() {
         let mut session = Session::new(test_codex());
         session.record_turn(turn(&[
             r#"{"type":"thread.started","thread_id":"thread_1"}"#,
-            r#"{"type":"completed","result":{"text":"hi","cost":0.25}}"#,
+            r#"{"type":"item.completed","item":{"item_type":"agent_message","text":"hi"}}"#,
+            r#"{"type":"turn.completed","usage":{"total_tokens":42}}"#,
         ]));
 
         assert_eq!(session.id(), Some("thread_1"));
         assert_eq!(session.total_turns(), 1);
-        assert_eq!(session.last_result().unwrap().cost_usd, Some(0.25));
         assert_eq!(session.last_result().unwrap().result, "hi");
-        assert!((session.total_cost() - 0.25).abs() < f64::EPSILON);
-        assert_eq!(session.turns_missing_cost(), 0);
+        assert_eq!(session.total_tokens(), 42);
+        assert_eq!(session.turns_missing_usage(), 0);
     }
 
     #[test]
-    fn total_cost_sums_across_turns() {
+    fn total_tokens_sums_across_turns() {
         let mut session = Session::new(test_codex());
-        for cost in ["0.10", "0.20", "0.30"] {
-            session.record_turn(turn(&[&format!(
-                r#"{{"type":"completed","result":{{"text":"x","cost":{cost}}}}}"#
-            )]));
+        for total in [10, 20, 30] {
+            session.record_turn(completed(total));
         }
         assert_eq!(session.total_turns(), 3);
-        assert!((session.total_cost() - 0.60).abs() < 1e-9);
-        assert_eq!(session.turns_missing_cost(), 0);
+        assert_eq!(session.total_tokens(), 60);
+        assert_eq!(session.turns_missing_usage(), 0);
     }
 
-    /// The CLI does not always report cost. A total that silently skipped
+    /// The CLI does not always report usage. A total that silently skipped
     /// those turns would look authoritative while undercounting, so the count
     /// of unreported turns is exposed alongside it.
     #[test]
-    fn unreported_cost_is_counted_not_hidden() {
+    fn unreported_usage_is_counted_not_hidden() {
         let mut session = Session::new(test_codex());
-        session.record_turn(turn(&[
-            r#"{"type":"completed","result":{"text":"x","cost":0.4}}"#,
-        ]));
-        session.record_turn(turn(&[r#"{"type":"completed","result":{"text":"y"}}"#]));
+        session.record_turn(completed(40));
+        session.record_turn(turn(&[r#"{"type":"turn.completed"}"#]));
 
-        assert!((session.total_cost() - 0.4).abs() < f64::EPSILON);
-        assert_eq!(session.turns_missing_cost(), 1);
+        assert_eq!(session.total_tokens(), 40);
+        assert_eq!(session.turns_missing_usage(), 1);
         assert_eq!(session.total_turns(), 2);
     }
 
     #[test]
-    fn zero_cost_and_unreported_cost_are_distinguishable() {
+    fn zero_usage_and_unreported_usage_are_distinguishable() {
         let mut reported = Session::new(test_codex());
-        reported.record_turn(turn(&[
-            r#"{"type":"completed","result":{"text":"x","cost":0.0}}"#,
-        ]));
+        reported.record_turn(completed(0));
 
         let mut unreported = Session::new(test_codex());
-        unreported.record_turn(turn(&[r#"{"type":"completed","result":{"text":"x"}}"#]));
+        unreported.record_turn(turn(&[r#"{"type":"turn.completed"}"#]));
 
-        assert_eq!(reported.total_cost(), unreported.total_cost());
-        assert_eq!(reported.turns_missing_cost(), 0);
-        assert_eq!(unreported.turns_missing_cost(), 1);
+        assert_eq!(reported.total_tokens(), unreported.total_tokens());
+        assert_eq!(reported.turns_missing_usage(), 0);
+        assert_eq!(unreported.turns_missing_usage(), 1);
     }
 
     #[test]
-    fn turn_record_exposes_events_and_cost() {
+    fn turn_record_exposes_events_and_usage() {
         let mut session = Session::new(test_codex());
         session.record_turn(turn(&[
-            r#"{"type":"message.created"}"#,
-            r#"{"type":"completed","result":{"text":"x","cost":0.5}}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"turn.completed","usage":{"total_tokens":5}}"#,
         ]));
 
         let record = &session.history()[0];
         assert_eq!(record.events().len(), 2);
-        assert_eq!(record.cost_usd(), Some(0.5));
+        assert_eq!(record.usage().unwrap().total(), Some(5));
     }
 
     #[test]
     fn last_result_is_none_before_any_turn() {
         let session = Session::new(test_codex());
         assert!(session.last_result().is_none());
-        assert_eq!(session.total_cost(), 0.0);
-        assert_eq!(session.turns_missing_cost(), 0);
+        assert_eq!(session.total_tokens(), 0);
+        assert_eq!(session.turns_missing_usage(), 0);
     }
 
     #[tokio::test]
@@ -596,13 +603,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(seen.contains(&"completed".to_string()), "saw: {seen:?}");
+        assert!(
+            seen.contains(&"turn.completed".to_string()),
+            "saw: {seen:?}"
+        );
         assert_eq!(events.len(), seen.len(), "handler and return value agree");
 
         // The streaming path must leave the same state a buffered turn would.
         assert_eq!(session.total_turns(), 1);
         assert_eq!(session.id(), Some("thread_test"));
-        assert!((session.total_cost() - 0.001).abs() < f64::EPSILON);
+        assert_eq!(session.total_tokens(), 165);
+        assert_eq!(session.last_result().unwrap().result, "hello");
     }
 
     #[tokio::test]
@@ -614,7 +625,7 @@ mod tests {
         session.stream("second", |_| {}).await.unwrap();
 
         assert_eq!(session.total_turns(), 2);
-        assert!((session.total_cost() - 0.002).abs() < 1e-9);
-        assert_eq!(session.turns_missing_cost(), 0);
+        assert_eq!(session.total_tokens(), 330);
+        assert_eq!(session.turns_missing_usage(), 0);
     }
 }

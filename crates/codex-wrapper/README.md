@@ -175,11 +175,15 @@ let result = ExecCommand::new("what is 2+2?")
 
 println!("{}", result.result);
 println!("thread: {:?}", result.thread_id);
-println!("cost: {:?}", result.cost_usd);
+println!("tokens: {:?}", result.usage.and_then(|u| u.total()));
 ```
 
-`QueryResult` fields: `result`, `session_id`, `thread_id`, `cost_usd`, and the
+`QueryResult` fields: `result`, `session_id`, `thread_id`, `usage`, and the
 full `events` stream as an escape hatch.
+
+The CLI reports **token counts, not money**. There is no cost field to read.
+Converting tokens to dollars needs a per-model price table the CLI does not
+provide, so this crate does not guess at one.
 
 ## JSONL Output Parsing
 
@@ -208,18 +212,23 @@ for event in &events {
     if let Some(id) = event.thread_id() {
         println!("thread: {id}");
     }
-    if event.is_completed() {
-        println!("result: {:?}", event.result_text());
-        println!("cost: {:?}", event.cost_usd());
+    if event.is_turn_completed() {
+        println!("tokens: {:?}", event.usage().and_then(|u| u.total()));
     }
-    if let Some(text) = event.content_text() {
-        println!("content: {text}");
+    if let Some(text) = event.agent_message_text() {
+        println!("assistant: {text}");
     }
 }
 ```
 
-Available accessors: `session_id()`, `thread_id()`, `is_completed()`,
-`result_text()`, `cost_usd()`, `role()`, `content_text()`.
+Available accessors: `session_id()`, `thread_id()`, `is_turn_completed()`,
+`is_turn_failed()`, `usage()`, `agent_message_text()`, `role()`,
+`content_text()`.
+
+The event vocabulary is `thread.started`, `turn.started`, `turn.completed`,
+`turn.failed`, `item.started`, `item.updated`, `item.completed`. See the
+schema notes in the `types` module docs for which parts of the payload layout
+are verified against the CLI and which are assumed.
 
 ## Streaming
 
@@ -272,7 +281,7 @@ let events = session.send("continue where we left off").await?;
 The `thread_id` is preserved even on error paths, as long as at least one
 event carried it.
 
-### Cost
+### Token usage
 
 Each turn records a typed `QueryResult`, so cost accumulates across the
 session:
@@ -281,21 +290,21 @@ session:
 session.send("first").await?;
 session.send("second").await?;
 
-println!("{} turns, ${:.4}", session.total_turns(), session.total_cost());
+println!("{} turns, {} tokens", session.total_turns(), session.total_tokens());
 
 if let Some(result) = session.last_result() {
-    println!("last turn: {:?}", result.cost_usd);
+    println!("last turn: {:?}", result.usage);
 }
 ```
 
-The CLI does not always report a cost. `total_cost()` sums what was reported,
-so a total of `0.0` can mean either "nothing was spent" or "nothing was
-reported". `turns_missing_cost()` tells those apart:
+The CLI does not always report usage. `total_tokens()` sums what was reported,
+so a total of `0` can mean either "nothing was used" or "nothing was
+reported". `turns_missing_usage()` tells those apart:
 
 ```rust
-if session.turns_missing_cost() > 0 {
-    eprintln!("cost is an undercount: {} turns reported none",
-              session.turns_missing_cost());
+if session.turns_missing_usage() > 0 {
+    eprintln!("token total is an undercount: {} turns reported none",
+              session.turns_missing_usage());
 }
 ```
 
