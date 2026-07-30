@@ -4,9 +4,42 @@ use crate::command::CodexCommand;
 use crate::error::Error;
 use crate::error::Result;
 use crate::exec::{self, CommandOutput};
-use crate::types::{Color, SandboxMode};
+use crate::types::{ApprovalPolicyConfig, Color, SandboxMode, WebSearchMode};
 #[cfg(feature = "json")]
 use crate::types::{JsonLineEvent, QueryResult};
+
+/// Push the typed config-key overrides shared by the exec-family builders.
+///
+/// `codex-cli` 0.145.0 removed `--ask-for-approval` and `--search` from the
+/// exec family; both settings moved to `-c` config keys. These are pushed
+/// before any caller-supplied [`config`](ExecCommand::config) strings because
+/// `-c` is last-wins, so a raw override still beats the typed setter.
+pub(crate) fn push_typed_config(
+    args: &mut Vec<String>,
+    approval_policy: Option<ApprovalPolicyConfig>,
+    web_search: Option<WebSearchMode>,
+) {
+    if let Some(policy) = approval_policy {
+        args.push("-c".into());
+        args.push(format!("approval_policy=\"{}\"", policy.as_config_value()));
+    }
+    if let Some(mode) = web_search {
+        args.push("-c".into());
+        args.push(format!("web_search=\"{}\"", mode.as_config_value()));
+    }
+}
+
+/// Resolve the sandbox mode, folding in the deprecated `full_auto` shim.
+///
+/// `--full-auto` is hidden on the exec family (and rejected outright by `fork`
+/// and `resume`); the CLI's own advice is `--sandbox workspace-write`. An
+/// explicit `sandbox()` call is more specific and wins.
+pub(crate) fn effective_sandbox(
+    sandbox: Option<SandboxMode>,
+    full_auto: bool,
+) -> Option<SandboxMode> {
+    sandbox.or(full_auto.then_some(SandboxMode::WorkspaceWrite))
+}
 
 /// Run Codex non-interactively (`codex exec <prompt>`).
 ///
@@ -34,6 +67,8 @@ use crate::types::{JsonLineEvent, QueryResult};
 #[derive(Debug, Clone)]
 pub struct ExecCommand {
     prompt: Option<String>,
+    approval_policy: Option<ApprovalPolicyConfig>,
+    web_search: Option<WebSearchMode>,
     config_overrides: Vec<String>,
     enabled_features: Vec<String>,
     disabled_features: Vec<String>,
@@ -66,6 +101,8 @@ impl ExecCommand {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: Some(prompt.into()),
+            approval_policy: None,
+            web_search: None,
             config_overrides: Vec::new(),
             enabled_features: Vec::new(),
             disabled_features: Vec::new(),
@@ -101,10 +138,54 @@ impl ExecCommand {
 
     /// Override a config key (`-c key=value`).
     ///
-    /// May be called multiple times to set several keys.
+    /// May be called multiple times to set several keys. Because `-c` is
+    /// last-wins, a key set here overrides the same key set by
+    /// [`approval_policy`](Self::approval_policy) or
+    /// [`search_mode`](Self::search_mode).
     #[must_use]
     pub fn config(mut self, key_value: impl Into<String>) -> Self {
         self.config_overrides.push(key_value.into());
+        self
+    }
+
+    /// Set when the model asks for approval (`-c approval_policy="<value>"`).
+    ///
+    /// `codex-cli` 0.145.0 removed `--ask-for-approval` from `codex exec`; the
+    /// config key is the supported equivalent. Accepts an
+    /// [`ApprovalPolicy`](crate::ApprovalPolicy) directly, or an
+    /// [`ApprovalPolicyConfig`] for the two values the flag never took.
+    ///
+    /// ```
+    /// use codex_wrapper::{ApprovalPolicyConfig, CodexCommand, ExecCommand};
+    ///
+    /// let args = ExecCommand::new("hi")
+    ///     .approval_policy(ApprovalPolicyConfig::Never)
+    ///     .args();
+    /// assert!(args.windows(2).any(|w| w == ["-c", "approval_policy=\"never\""]));
+    /// ```
+    #[must_use]
+    pub fn approval_policy(mut self, policy: impl Into<ApprovalPolicyConfig>) -> Self {
+        self.approval_policy = Some(policy.into());
+        self
+    }
+
+    /// Enable live web search.
+    ///
+    /// Shorthand for `search_mode(WebSearchMode::Live)`, which is what the
+    /// removed `--search` flag meant.
+    #[must_use]
+    pub fn search(self) -> Self {
+        self.search_mode(WebSearchMode::Live)
+    }
+
+    /// Set the web search mode (`-c web_search="<value>"`).
+    ///
+    /// `codex-cli` 0.145.0 removed `--search` from `codex exec`; the config
+    /// key is the supported equivalent, and it is an enum rather than the
+    /// flag's boolean.
+    #[must_use]
+    pub fn search_mode(mut self, mode: WebSearchMode) -> Self {
+        self.web_search = Some(mode);
         self
     }
 
@@ -204,11 +285,17 @@ impl ExecCommand {
         self
     }
 
-    /// Run in full-auto mode — no approval prompts (`--full-auto`).
+    /// Run in full-auto mode, emitted as `--sandbox workspace-write`.
     ///
-    /// As of `codex-cli` 0.145.0 this flag is accepted but hidden from
-    /// `codex exec --help`. It still functions but is undocumented and may be
-    /// removed in a future CLI release.
+    /// `--full-auto` is deprecated upstream. `codex-cli` 0.145.0 hides it from
+    /// `codex exec --help` and warns when it is used:
+    ///
+    /// ```text
+    /// warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.
+    /// ```
+    ///
+    /// This method emits the replacement the CLI names. An explicit
+    /// [`sandbox`](Self::sandbox) call is more specific and wins over it.
     #[must_use]
     pub fn full_auto(mut self) -> Self {
         self.full_auto = true;
@@ -358,6 +445,7 @@ impl CodexCommand for ExecCommand {
     fn args(&self) -> Vec<String> {
         let mut args = vec!["exec".to_string()];
 
+        push_typed_config(&mut args, self.approval_policy, self.web_search);
         push_repeat(&mut args, "-c", &self.config_overrides);
         push_repeat(&mut args, "--enable", &self.enabled_features);
         push_repeat(&mut args, "--disable", &self.disabled_features);
@@ -374,7 +462,7 @@ impl CodexCommand for ExecCommand {
             args.push("--local-provider".into());
             args.push(local_provider.clone());
         }
-        if let Some(sandbox) = self.sandbox {
+        if let Some(sandbox) = effective_sandbox(self.sandbox, self.full_auto) {
             args.push("--sandbox".into());
             args.push(sandbox.as_arg().into());
         }
@@ -384,9 +472,6 @@ impl CodexCommand for ExecCommand {
         if let Some(profile) = &self.profile {
             args.push("--profile".into());
             args.push(profile.clone());
-        }
-        if self.full_auto {
-            args.push("--full-auto".into());
         }
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());
@@ -448,6 +533,8 @@ pub struct ExecResumeCommand {
     prompt: Option<String>,
     last: bool,
     all: bool,
+    approval_policy: Option<ApprovalPolicyConfig>,
+    web_search: Option<WebSearchMode>,
     config_overrides: Vec<String>,
     enabled_features: Vec<String>,
     disabled_features: Vec<String>,
@@ -473,6 +560,8 @@ impl ExecResumeCommand {
             prompt: None,
             last: false,
             all: false,
+            approval_policy: None,
+            web_search: None,
             config_overrides: Vec::new(),
             enabled_features: Vec::new(),
             disabled_features: Vec::new(),
@@ -554,10 +643,45 @@ impl ExecResumeCommand {
 
     /// Override a config key (`-c key=value`).
     ///
-    /// May be called multiple times to set several keys.
+    /// May be called multiple times to set several keys. Because `-c` is
+    /// last-wins, a key set here overrides the same key set by
+    /// [`approval_policy`](Self::approval_policy),
+    /// [`search_mode`](Self::search_mode), or [`full_auto`](Self::full_auto).
     #[must_use]
     pub fn config(mut self, key_value: impl Into<String>) -> Self {
         self.config_overrides.push(key_value.into());
+        self
+    }
+
+    /// Set when the model asks for approval (`-c approval_policy="<value>"`).
+    ///
+    /// `codex-cli` 0.145.0 removed `--ask-for-approval` from the exec family;
+    /// the config key is the supported equivalent. Accepts an
+    /// [`ApprovalPolicy`](crate::ApprovalPolicy) directly, or an
+    /// [`ApprovalPolicyConfig`] for the two values the flag never took.
+    #[must_use]
+    pub fn approval_policy(mut self, policy: impl Into<ApprovalPolicyConfig>) -> Self {
+        self.approval_policy = Some(policy.into());
+        self
+    }
+
+    /// Enable live web search.
+    ///
+    /// Shorthand for `search_mode(WebSearchMode::Live)`, which is what the
+    /// removed `--search` flag meant.
+    #[must_use]
+    pub fn search(self) -> Self {
+        self.search_mode(WebSearchMode::Live)
+    }
+
+    /// Set the web search mode (`-c web_search="<value>"`).
+    ///
+    /// `codex-cli` 0.145.0 removed `--search` from the exec family; the config
+    /// key is the supported equivalent, and it is an enum rather than the
+    /// flag's boolean.
+    #[must_use]
+    pub fn search_mode(mut self, mode: WebSearchMode) -> Self {
+        self.web_search = Some(mode);
         self
     }
 
@@ -595,7 +719,11 @@ impl ExecResumeCommand {
         self
     }
 
-    /// Run in full-auto mode — no approval prompts (`--full-auto`).
+    /// Run in full-auto mode, emitted as `-c sandbox_mode="workspace-write"`.
+    ///
+    /// `--full-auto` is deprecated upstream; `codex-cli` 0.145.0 hides it and
+    /// warns to use `--sandbox workspace-write` instead. `codex exec resume`
+    /// has no `--sandbox` flag, so this sets the equivalent config key.
     #[must_use]
     pub fn full_auto(mut self) -> Self {
         self.full_auto = true;
@@ -684,6 +812,16 @@ impl CodexCommand for ExecResumeCommand {
 
     fn args(&self) -> Vec<String> {
         let mut args = vec!["exec".into(), "resume".into()];
+        push_typed_config(&mut args, self.approval_policy, self.web_search);
+        // `exec resume` has no `--sandbox` flag, so the `--full-auto`
+        // replacement has to go through the config key.
+        if self.full_auto {
+            args.push("-c".into());
+            args.push(format!(
+                "sandbox_mode=\"{}\"",
+                SandboxMode::WorkspaceWrite.as_arg()
+            ));
+        }
         push_repeat(&mut args, "-c", &self.config_overrides);
         push_repeat(&mut args, "--enable", &self.enabled_features);
         push_repeat(&mut args, "--disable", &self.disabled_features);
@@ -700,9 +838,6 @@ impl CodexCommand for ExecResumeCommand {
         }
         if self.strict_config {
             args.push("--strict-config".into());
-        }
-        if self.full_auto {
-            args.push("--full-auto".into());
         }
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());
@@ -761,6 +896,7 @@ fn parse_json_lines(stdout: &str) -> Result<Vec<JsonLineEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ApprovalPolicy;
 
     #[test]
     fn exec_args() {
@@ -857,6 +993,133 @@ mod tests {
                 "--last",
                 "--strict-config",
                 "--dangerously-bypass-hook-trust",
+            ]
+        );
+    }
+
+    /// #53: `--ask-for-approval` and `--search` were removed from `codex exec`
+    /// in codex-cli 0.145.0; the settings live on as config keys.
+    #[test]
+    fn exec_approval_and_search_emit_config_keys() {
+        let args = ExecCommand::new("hi")
+            .approval_policy(ApprovalPolicy::Never)
+            .search()
+            .args();
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "-c",
+                "approval_policy=\"never\"",
+                "-c",
+                "web_search=\"live\"",
+                "hi"
+            ]
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--ask-for-approval" || a == "--search")
+        );
+    }
+
+    /// `granular` and `on-failure` are accepted by the config key but not by
+    /// the flag, which is why `ApprovalPolicyConfig` exists.
+    #[test]
+    fn exec_approval_accepts_config_only_values() {
+        let args = ExecCommand::new("hi")
+            .approval_policy(ApprovalPolicyConfig::Granular)
+            .args();
+        assert_eq!(
+            args,
+            vec!["exec", "-c", "approval_policy=\"granular\"", "hi"]
+        );
+    }
+
+    #[test]
+    fn exec_search_mode_variants() {
+        for (mode, expected) in [
+            (WebSearchMode::Disabled, "disabled"),
+            (WebSearchMode::Cached, "cached"),
+            (WebSearchMode::Indexed, "indexed"),
+            (WebSearchMode::Live, "live"),
+        ] {
+            let args = ExecCommand::new("hi").search_mode(mode).args();
+            assert_eq!(args[2], format!("web_search=\"{expected}\""));
+        }
+    }
+
+    /// `-c` is last-wins, so a raw override has to be emitted after the typed
+    /// setters for it to take effect.
+    #[test]
+    fn exec_raw_config_is_emitted_after_typed_config() {
+        let args = ExecCommand::new("hi")
+            .approval_policy(ApprovalPolicy::Never)
+            .config("approval_policy=\"untrusted\"")
+            .args();
+        let typed = args
+            .iter()
+            .position(|a| a == "approval_policy=\"never\"")
+            .unwrap();
+        let raw = args
+            .iter()
+            .position(|a| a == "approval_policy=\"untrusted\"")
+            .unwrap();
+        assert!(typed < raw, "raw override must win: {args:?}");
+    }
+
+    /// #55: `--full-auto` is hidden and deprecated on the exec family.
+    #[test]
+    fn exec_full_auto_emits_sandbox_workspace_write() {
+        let args = ExecCommand::new("hi").full_auto().args();
+        assert_eq!(args, vec!["exec", "--sandbox", "workspace-write", "hi"]);
+        assert!(!args.iter().any(|a| a == "--full-auto"));
+    }
+
+    #[test]
+    fn exec_explicit_sandbox_wins_over_full_auto() {
+        let args = ExecCommand::new("hi")
+            .full_auto()
+            .sandbox(SandboxMode::ReadOnly)
+            .args();
+        assert_eq!(args, vec!["exec", "--sandbox", "read-only", "hi"]);
+    }
+
+    /// `codex exec resume` has no `--sandbox` flag, so the replacement goes
+    /// through the config key instead.
+    #[test]
+    fn exec_resume_full_auto_emits_sandbox_config_key() {
+        let args = ExecResumeCommand::new().last().full_auto().args();
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "resume",
+                "-c",
+                "sandbox_mode=\"workspace-write\"",
+                "--last"
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "--full-auto"));
+    }
+
+    #[test]
+    fn exec_resume_approval_and_search_emit_config_keys() {
+        let args = ExecResumeCommand::new()
+            .last()
+            .approval_policy(ApprovalPolicyConfig::OnFailure)
+            .search_mode(WebSearchMode::Cached)
+            .args();
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "resume",
+                "-c",
+                "approval_policy=\"on-failure\"",
+                "-c",
+                "web_search=\"cached\"",
+                "--last"
             ]
         );
     }
