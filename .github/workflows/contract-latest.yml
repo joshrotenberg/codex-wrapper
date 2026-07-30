@@ -1,0 +1,44 @@
+name: CLI contract (latest)
+
+# The blocking `contract` job in ci.yml pins the CLI version this wrapper is
+# tested against, so it only reports drift when someone bumps the pin. This
+# runs the same checks against whatever the CLI has released since, so upstream
+# removing a flag shows up here rather than in a user's bug report.
+#
+# It is deliberately not a PR gate: an upstream release must not turn every
+# open PR red.
+
+on:
+  schedule:
+    # Mondays, 08:00 UTC.
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contract-latest:
+    name: Check against codex@latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: "contract"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install codex CLI
+        run: npm install -g @openai/codex@latest
+
+      - name: Record CLI version
+        run: codex --version
+
+      - name: Check emitted flags against the CLI
+        run: cargo test --test contract --all-features -- --ignored

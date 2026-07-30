@@ -100,3 +100,36 @@ jobs:
       - name: Build docs
         run: cargo doc --no-deps --all-features
 
+
+  contract:
+    name: CLI contract (codex ${{ matrix.codex }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The CLI version this wrapper is tested against. Bump deliberately,
+        # with the drift the bump surfaces fixed in the same change.
+        codex: ["0.145.0"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: "contract"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install codex CLI
+        run: npm install -g @openai/codex@${{ matrix.codex }}
+
+      - name: Record CLI version
+        run: codex --version
+
+      # No auth is configured here, and none is needed: every check reads
+      # `--help` or fails during config load, before the CLI contacts anything.
+      - name: Check emitted flags against the CLI
+        run: cargo test --test contract --all-features -- --ignored
