@@ -3,6 +3,7 @@
 /// Wraps the top-level `codex resume` command (distinct from `codex exec resume`).
 use crate::Codex;
 use crate::command::CodexCommand;
+use crate::command::exec::effective_sandbox;
 use crate::error::Result;
 use crate::exec::{self, CommandOutput};
 use crate::types::{ApprovalPolicy, SandboxMode};
@@ -157,6 +158,12 @@ impl ResumeCommand {
         self
     }
 
+    /// Run in full-auto mode, emitted as `--sandbox workspace-write`.
+    ///
+    /// `codex resume` rejects `--full-auto` outright in `codex-cli` 0.145.0
+    /// ("unexpected argument"), so this emits the replacement the CLI names
+    /// for the exec family. An explicit [`sandbox`](Self::sandbox) call is
+    /// more specific and wins over it.
     #[must_use]
     pub fn full_auto(mut self) -> Self {
         self.full_auto = true;
@@ -282,16 +289,13 @@ impl CodexCommand for ResumeCommand {
             args.push("--profile".into());
             args.push(profile.clone());
         }
-        if let Some(sandbox) = self.sandbox {
+        if let Some(sandbox) = effective_sandbox(self.sandbox, self.full_auto) {
             args.push("--sandbox".into());
             args.push(sandbox.as_arg().into());
         }
         if let Some(policy) = self.approval_policy {
             args.push("--ask-for-approval".into());
             args.push(policy.as_arg().into());
-        }
-        if self.full_auto {
-            args.push("--full-auto".into());
         }
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());
@@ -397,6 +401,30 @@ mod tests {
                 "--remote",
                 "ws://host:9000",
             ]
+        );
+    }
+
+    /// `codex resume` rejects `--full-auto` outright. See #55.
+    #[test]
+    fn resume_full_auto_emits_sandbox_workspace_write() {
+        let args = ResumeCommand::new().last().full_auto().args();
+        assert_eq!(
+            args,
+            vec!["resume", "--last", "--sandbox", "workspace-write"]
+        );
+        assert!(!args.iter().any(|a| a == "--full-auto"));
+    }
+
+    #[test]
+    fn resume_explicit_sandbox_wins_over_full_auto() {
+        let args = ResumeCommand::new()
+            .last()
+            .full_auto()
+            .sandbox(SandboxMode::DangerFullAccess)
+            .args();
+        assert_eq!(
+            args,
+            vec!["resume", "--last", "--sandbox", "danger-full-access"]
         );
     }
 }

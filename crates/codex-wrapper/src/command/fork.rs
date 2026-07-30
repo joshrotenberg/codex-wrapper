@@ -3,6 +3,7 @@
 /// Wraps `codex fork [session-id] [prompt]`.
 use crate::Codex;
 use crate::command::CodexCommand;
+use crate::command::exec::effective_sandbox;
 use crate::error::Result;
 use crate::exec::{self, CommandOutput};
 use crate::types::{ApprovalPolicy, SandboxMode};
@@ -155,6 +156,12 @@ impl ForkCommand {
         self
     }
 
+    /// Run in full-auto mode, emitted as `--sandbox workspace-write`.
+    ///
+    /// `codex fork` rejects `--full-auto` outright in `codex-cli` 0.145.0
+    /// ("unexpected argument"), so this emits the replacement the CLI names
+    /// for the exec family. An explicit [`sandbox`](Self::sandbox) call is
+    /// more specific and wins over it.
     #[must_use]
     pub fn full_auto(mut self) -> Self {
         self.full_auto = true;
@@ -272,16 +279,13 @@ impl CodexCommand for ForkCommand {
             args.push("--profile".into());
             args.push(profile.clone());
         }
-        if let Some(sandbox) = self.sandbox {
+        if let Some(sandbox) = effective_sandbox(self.sandbox, self.full_auto) {
             args.push("--sandbox".into());
             args.push(sandbox.as_arg().into());
         }
         if let Some(policy) = self.approval_policy {
             args.push("--ask-for-approval".into());
             args.push(policy.as_arg().into());
-        }
-        if self.full_auto {
-            args.push("--full-auto".into());
         }
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());
@@ -358,7 +362,33 @@ mod tests {
             .full_auto()
             .search()
             .args();
-        assert_eq!(args, vec!["fork", "--full-auto", "--search", "abc-123"]);
+        assert_eq!(
+            args,
+            vec![
+                "fork",
+                "--sandbox",
+                "workspace-write",
+                "--search",
+                "abc-123"
+            ]
+        );
+    }
+
+    /// `codex fork` rejects `--full-auto` outright, so it must never be
+    /// emitted. See #55.
+    #[test]
+    fn fork_full_auto_never_emits_the_flag() {
+        let args = ForkCommand::new().full_auto().args();
+        assert!(!args.iter().any(|a| a == "--full-auto"));
+    }
+
+    #[test]
+    fn fork_explicit_sandbox_wins_over_full_auto() {
+        let args = ForkCommand::new()
+            .full_auto()
+            .sandbox(SandboxMode::ReadOnly)
+            .args();
+        assert_eq!(args, vec!["fork", "--sandbox", "read-only"]);
     }
 
     #[test]

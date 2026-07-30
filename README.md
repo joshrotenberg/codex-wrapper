@@ -138,7 +138,9 @@ let output = ExecCommand::new("fix the failing tests")
 | `sandbox()` | `--sandbox` | Sandbox policy |
 | `strict_config()` | `--strict-config` | Error on unknown config keys |
 | `profile()` | `--profile` | Config profile |
-| `full_auto()` | `--full-auto` | Auto sandbox + approval (hidden in 0.145.0) |
+| `full_auto()` | `--sandbox workspace-write` | Deprecated shim; `sandbox()` wins |
+| `approval_policy()` | `-c approval_policy=` | When the model asks for approval |
+| `search()` / `search_mode()` | `-c web_search=` | Web search mode |
 | `cd()` | `--cd` | Working directory |
 | `skip_git_repo_check()` | `--skip-git-repo-check` | Run outside git repo |
 | `add_dir()` | `--add-dir` | Additional writable dirs |
