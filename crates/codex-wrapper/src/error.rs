@@ -52,6 +52,19 @@ pub enum Error {
         found: crate::version::CliVersion,
         minimum: crate::version::CliVersion,
     },
+
+    /// The installed CLI is outside the wrapper's tested-against range.
+    ///
+    /// Only returned by
+    /// [`Codex::ensure_tested_cli_version`](crate::Codex::ensure_tested_cli_version).
+    /// The default path reports drift as a
+    /// [`CliVersionStatus`](crate::CliVersionStatus) rather than an error.
+    #[error("CLI version {found} is outside the tested range {tested_min}..={tested_max}")]
+    UntestedCliVersion {
+        found: crate::version::CliVersion,
+        tested_min: crate::version::CliVersion,
+        tested_max: crate::version::CliVersion,
+    },
 }
 
 impl From<std::io::Error> for Error {
