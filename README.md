@@ -272,6 +272,50 @@ let events = session.send("continue where we left off").await?;
 The `thread_id` is preserved even on error paths, as long as at least one
 event carried it.
 
+### Cost
+
+Each turn records a typed `QueryResult`, so cost accumulates across the
+session:
+
+```rust
+session.send("first").await?;
+session.send("second").await?;
+
+println!("{} turns, ${:.4}", session.total_turns(), session.total_cost());
+
+if let Some(result) = session.last_result() {
+    println!("last turn: {:?}", result.cost_usd);
+}
+```
+
+The CLI does not always report a cost. `total_cost()` sums what was reported,
+so a total of `0.0` can mean either "nothing was spent" or "nothing was
+reported". `turns_missing_cost()` tells those apart:
+
+```rust
+if session.turns_missing_cost() > 0 {
+    eprintln!("cost is an undercount: {} turns reported none",
+              session.turns_missing_cost());
+}
+```
+
+### Streaming turns
+
+`stream()` is the streaming equivalent of `send()`. Events reach the handler as
+the CLI emits them, and the session still captures `thread_id`, history, and
+cost, so a streaming turn and a buffered turn leave identical state:
+
+```rust
+session.stream("summarize this repo", |event| {
+    println!("{}", event.event_type);
+}).await?;
+
+assert_eq!(session.total_turns(), 1);
+```
+
+`stream_execute()` and `stream_execute_resume()` take a fully configured
+command, mirroring `execute()` and `execute_resume()`.
+
 ## Code Review
 
 ```rust
