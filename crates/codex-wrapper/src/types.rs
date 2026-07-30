@@ -32,13 +32,16 @@ impl SandboxMode {
 }
 
 /// When the model should ask for human approval before executing commands.
+///
+/// These are the values accepted by the `--ask-for-approval` flag on
+/// [`ForkCommand`](crate::ForkCommand) and [`ResumeCommand`](crate::ResumeCommand).
+/// The exec family sets the same setting through the `approval_policy` config
+/// key, which accepts a larger value set -- see [`ApprovalPolicyConfig`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalPolicy {
     /// Only run trusted commands without asking.
     Untrusted,
-    /// Ask on failure (deprecated -- prefer `OnRequest` or `Never`).
-    OnFailure,
     /// The model decides when to ask (default).
     #[default]
     OnRequest,
@@ -50,9 +53,118 @@ impl ApprovalPolicy {
     pub(crate) fn as_arg(self) -> &'static str {
         match self {
             Self::Untrusted => "untrusted",
-            Self::OnFailure => "on-failure",
             Self::OnRequest => "on-request",
             Self::Never => "never",
+        }
+    }
+}
+
+/// Approval policy values accepted by the `approval_policy` config key.
+///
+/// `codex-cli` 0.145.0 removed `--ask-for-approval` from the exec family; the
+/// config key is the supported equivalent. It accepts two values the flag does
+/// not ([`OnFailure`](Self::OnFailure) and [`Granular`](Self::Granular)), which
+/// is why this is a separate type from [`ApprovalPolicy`] rather than an alias.
+/// The three shared values convert implicitly:
+///
+/// ```
+/// use codex_wrapper::{ApprovalPolicy, ApprovalPolicyConfig};
+///
+/// let config: ApprovalPolicyConfig = ApprovalPolicy::Never.into();
+/// assert_eq!(config, ApprovalPolicyConfig::Never);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalPolicyConfig {
+    /// Only run trusted commands without asking.
+    Untrusted,
+    /// Ask after a command fails.
+    ///
+    /// Not accepted by `--ask-for-approval`, so it has no [`ApprovalPolicy`]
+    /// counterpart.
+    OnFailure,
+    /// The model decides when to ask (default).
+    #[default]
+    OnRequest,
+    /// Ask per-operation rather than per-command.
+    ///
+    /// Not accepted by `--ask-for-approval`, so it has no [`ApprovalPolicy`]
+    /// counterpart.
+    Granular,
+    /// Never ask for approval.
+    Never,
+}
+
+impl ApprovalPolicyConfig {
+    pub(crate) fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Untrusted => "untrusted",
+            Self::OnFailure => "on-failure",
+            Self::OnRequest => "on-request",
+            Self::Granular => "granular",
+            Self::Never => "never",
+        }
+    }
+}
+
+impl From<ApprovalPolicy> for ApprovalPolicyConfig {
+    fn from(policy: ApprovalPolicy) -> Self {
+        match policy {
+            ApprovalPolicy::Untrusted => Self::Untrusted,
+            ApprovalPolicy::OnRequest => Self::OnRequest,
+            ApprovalPolicy::Never => Self::Never,
+        }
+    }
+}
+
+impl TryFrom<ApprovalPolicyConfig> for ApprovalPolicy {
+    type Error = ApprovalPolicyConfig;
+
+    /// Narrow to the flag-accepted subset.
+    ///
+    /// Returns the original value as the error for
+    /// [`OnFailure`](ApprovalPolicyConfig::OnFailure) and
+    /// [`Granular`](ApprovalPolicyConfig::Granular), which `--ask-for-approval`
+    /// rejects.
+    fn try_from(config: ApprovalPolicyConfig) -> std::result::Result<Self, Self::Error> {
+        match config {
+            ApprovalPolicyConfig::Untrusted => Ok(Self::Untrusted),
+            ApprovalPolicyConfig::OnRequest => Ok(Self::OnRequest),
+            ApprovalPolicyConfig::Never => Ok(Self::Never),
+            other => Err(other),
+        }
+    }
+}
+
+/// Web search mode, set through the `web_search` config key.
+///
+/// `codex-cli` 0.145.0 removed `--search` from the exec family. The config key
+/// replacing it is an enum rather than the flag's boolean;
+/// [`Live`](Self::Live) is what `--search` meant.
+///
+/// `--search` is still a valid flag on [`ForkCommand`](crate::ForkCommand) and
+/// [`ResumeCommand`](crate::ResumeCommand), which keep their boolean setters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebSearchMode {
+    /// No web search.
+    #[default]
+    Disabled,
+    /// Serve results from cache only.
+    Cached,
+    /// Search a prebuilt index.
+    Indexed,
+    /// Live web search. The `--search` flag's former behavior.
+    Live,
+}
+
+impl WebSearchMode {
+    pub(crate) fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Cached => "cached",
+            Self::Indexed => "indexed",
+            Self::Live => "live",
         }
     }
 }
