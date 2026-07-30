@@ -192,7 +192,9 @@ pub use retry::{BackoffStrategy, RetryPolicy};
 #[cfg(feature = "json")]
 pub use session::{Session, TurnRecord};
 pub use types::*;
-pub use version::{CliVersion, VersionParseError};
+pub use version::{
+    CliVersion, CliVersionStatus, TESTED_CLI_VERSION_MAX, TESTED_CLI_VERSION_MIN, VersionParseError,
+};
 
 /// Shared Codex CLI client configuration.
 ///
@@ -219,6 +221,7 @@ pub struct Codex {
     pub(crate) global_args: Vec<String>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) retry_policy: Option<RetryPolicy>,
+    pub(crate) tested_cli_version_range: (CliVersion, CliVersion),
 }
 
 impl Codex {
@@ -272,6 +275,79 @@ impl Codex {
             })
         }
     }
+
+    /// The tested-against CLI version range this client reports on.
+    ///
+    /// Defaults to [`TESTED_CLI_VERSION_MIN`] and [`TESTED_CLI_VERSION_MAX`];
+    /// override with [`CodexBuilder::tested_cli_version_range`].
+    #[must_use]
+    pub fn tested_cli_version_range(&self) -> (CliVersion, CliVersion) {
+        self.tested_cli_version_range
+    }
+
+    /// Classify the installed CLI against the tested-against range.
+    ///
+    /// Emits a `tracing::warn!` when outside the range, and returns the typed
+    /// status either way. This reports; it does not fail. Most CLI releases
+    /// break nothing, so refusing to run against an unrecognized version is
+    /// worse than saying so. Use
+    /// [`ensure_tested_cli_version`](Self::ensure_tested_cli_version) when you
+    /// do want a hard gate.
+    ///
+    /// Intended for one-shot use at startup rather than before every command:
+    /// it spawns `codex --version`.
+    pub async fn cli_version_status(&self) -> Result<CliVersionStatus> {
+        let (min, max) = self.tested_cli_version_range;
+        let status = self.cli_version().await?.status_within(&min, &max);
+        warn_on_drift(&status);
+        Ok(status)
+    }
+
+    /// Like [`cli_version_status`](Self::cli_version_status), but returns
+    /// [`Error::UntestedCliVersion`] when the installed CLI is outside the
+    /// tested range.
+    ///
+    /// This is the opt-in hard gate. It is a method rather than a
+    /// [`CodexBuilder`] option because [`CodexBuilder::build`] is synchronous
+    /// and never spawns the binary; enforcing a version there would mean
+    /// running a subprocess inside a constructor.
+    pub async fn ensure_tested_cli_version(&self) -> Result<CliVersion> {
+        let (min, max) = self.tested_cli_version_range;
+        let found = self.cli_version().await?;
+        match found.status_within(&min, &max) {
+            CliVersionStatus::Tested => Ok(found),
+            status => {
+                warn_on_drift(&status);
+                Err(Error::UntestedCliVersion {
+                    found,
+                    tested_min: min,
+                    tested_max: max,
+                })
+            }
+        }
+    }
+}
+
+fn warn_on_drift(status: &CliVersionStatus) {
+    match status {
+        CliVersionStatus::Tested => {}
+        CliVersionStatus::NewerUntested { found, tested_max } => {
+            tracing::warn!(
+                found = %found,
+                tested_max = %tested_max,
+                "codex CLI is newer than this wrapper's tested-against range; \
+                 semantics may have drifted"
+            );
+        }
+        CliVersionStatus::OlderThanMinimum { found, minimum } => {
+            tracing::warn!(
+                found = %found,
+                minimum = %minimum,
+                "codex CLI is older than this wrapper's tested-against range; \
+                 some emitted arguments are likely to be rejected"
+            );
+        }
+    }
 }
 
 /// Builder for creating a [`Codex`] client.
@@ -286,9 +362,21 @@ pub struct CodexBuilder {
     global_args: Vec<String>,
     timeout: Option<Duration>,
     retry_policy: Option<RetryPolicy>,
+    tested_cli_version_range: Option<(CliVersion, CliVersion)>,
 }
 
 impl CodexBuilder {
+    /// Override the tested-against CLI version range.
+    ///
+    /// Defaults to the range this crate declares and verifies in CI. Set this
+    /// only when you have validated a different range yourself; widening it
+    /// does not make the wrapper work against versions it was not tested on.
+    #[must_use]
+    pub fn tested_cli_version_range(mut self, min: CliVersion, max: CliVersion) -> Self {
+        self.tested_cli_version_range = Some((min, max));
+        self
+    }
+
     /// Set an explicit path to the `codex` binary (skips `PATH` lookup).
     #[must_use]
     pub fn binary(mut self, path: impl Into<PathBuf>) -> Self {
@@ -391,6 +479,10 @@ impl CodexBuilder {
             global_args: self.global_args,
             timeout: self.timeout,
             retry_policy: self.retry_policy,
+            tested_cli_version_range: self.tested_cli_version_range.unwrap_or((
+                version::TESTED_CLI_VERSION_MIN,
+                version::TESTED_CLI_VERSION_MAX,
+            )),
         })
     }
 }
@@ -433,6 +525,43 @@ mod tests {
                 "--disable",
                 "bar"
             ]
+        );
+    }
+
+    #[test]
+    fn client_defaults_to_the_crate_tested_range() {
+        let codex = Codex::builder().binary("/bin/echo").build().unwrap();
+        assert_eq!(
+            codex.tested_cli_version_range(),
+            (
+                version::TESTED_CLI_VERSION_MIN,
+                version::TESTED_CLI_VERSION_MAX
+            )
+        );
+    }
+
+    #[test]
+    fn builder_can_override_the_tested_range() {
+        let min = CliVersion::new(1, 0, 0);
+        let max = CliVersion::new(2, 0, 0);
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .tested_cli_version_range(min, max)
+            .build()
+            .unwrap();
+        assert_eq!(codex.tested_cli_version_range(), (min, max));
+    }
+
+    #[test]
+    fn untested_version_error_names_both_bounds() {
+        let err = Error::UntestedCliVersion {
+            found: CliVersion::new(0, 200, 0),
+            tested_min: CliVersion::new(0, 145, 0),
+            tested_max: CliVersion::new(0, 146, 0),
+        };
+        assert_eq!(
+            err.to_string(),
+            "CLI version 0.200.0 is outside the tested range 0.145.0..=0.146.0"
         );
     }
 }

@@ -425,6 +425,42 @@ FeaturesEnableCommand::new("web-search").execute(&codex).await?;
 FeaturesDisableCommand::new("web-search").execute(&codex).await?;
 ```
 
+## CLI Version
+
+This wrapper is tested against a declared range of `codex-cli` versions. Both
+ends of the range run the flag-contract check in CI, so the range reflects what
+is actually verified rather than what is hoped.
+
+```rust
+use codex_wrapper::{CliVersionStatus, TESTED_CLI_VERSION_MIN, TESTED_CLI_VERSION_MAX};
+
+// Report, do not fail. Warns via `tracing` when outside the range.
+match codex.cli_version_status().await? {
+    CliVersionStatus::Tested => {}
+    CliVersionStatus::NewerUntested { found, tested_max } => {
+        eprintln!("codex {found} is newer than tested ({tested_max})");
+    }
+    CliVersionStatus::OlderThanMinimum { found, minimum } => {
+        eprintln!("codex {found} is older than tested ({minimum})");
+    }
+}
+```
+
+Most CLI releases break nothing, so this reports by default rather than
+refusing to run. When you do want a hard gate:
+
+```rust
+// Returns Error::UntestedCliVersion when outside the range.
+let version = codex.ensure_tested_cli_version().await?;
+```
+
+This is a method rather than a builder option because `build()` is synchronous
+and never spawns the binary.
+
+Override the range with `CodexBuilder::tested_cli_version_range(min, max)` if
+you have validated a different one yourself. `check_version(&minimum)` remains
+available for a plain minimum-version gate.
+
 ## Error Handling
 
 All commands return `Result<T>`, with errors typed via `thiserror`:
