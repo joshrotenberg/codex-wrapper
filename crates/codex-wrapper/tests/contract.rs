@@ -568,3 +568,42 @@ fn harness_refuses_to_probe_free_form_config_keys() {
         "harness probed a free-form config key instead of refusing"
     );
 }
+
+/// `codex review` and `codex exec review` are the same command reached two
+/// ways, but the top-level path accepts a strict subset of the flags. #56
+/// decided to wrap only `codex exec review` on that basis, chiefly because
+/// top-level `codex review` has no `--json` and so could not support typed
+/// output.
+///
+/// If the top-level path ever gains a flag `codex exec review` lacks, that
+/// reasoning no longer holds and the decision needs revisiting. This is the
+/// reverse-direction check the rest of this suite does not do, applied to the
+/// one place a documented decision depends on it.
+#[test]
+#[ignore]
+fn top_level_review_remains_a_subset_of_exec_review() {
+    let top_level = help_flags(&["review".to_string()]);
+    let exec_review = help_flags(&["exec".to_string(), "review".to_string()]);
+
+    let only_on_top_level: Vec<&String> = top_level.difference(&exec_review).collect();
+    assert!(
+        only_on_top_level.is_empty(),
+        "`codex review` ({}) now accepts flags `codex exec review` does not: {:?}\n\n\
+         #56 chose to wrap only `codex exec review` because the top-level path was a \
+         strict subset. Re-evaluate that decision, and update the rationale on \
+         `ReviewCommand`.",
+        cli_version(),
+        only_on_top_level
+    );
+
+    // Guard the premise too: if the sets became identical, the "strict subset"
+    // rationale in ReviewCommand's docs would be wrong even though the
+    // assertion above still passes.
+    assert!(
+        exec_review.difference(&top_level).next().is_some(),
+        "`codex review` and `codex exec review` now accept the same flags ({}); \
+         the rationale on `ReviewCommand` says the top-level path is strictly \
+         narrower and needs updating",
+        cli_version()
+    );
+}

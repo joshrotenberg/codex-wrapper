@@ -9,6 +9,40 @@ use crate::exec::{self, CommandOutput};
 use crate::types::JsonLineEvent;
 use crate::types::{ApprovalPolicyConfig, SandboxMode, WebSearchMode};
 
+/// Run a code review non-interactively (`codex exec review`).
+///
+/// # Why not `codex review`
+///
+/// `codex-cli` exposes review at two paths, `codex review` and
+/// `codex exec review`. They are the same command: same `[PROMPT]` positional,
+/// same non-interactive behavior, and a byte-identical error when no review
+/// scope is given.
+///
+/// They are not equally capable. As of 0.145.0, top-level `codex review`
+/// accepts a strict subset of the flags, missing ten that `codex exec review`
+/// has:
+///
+/// ```text
+/// --dangerously-bypass-approvals-and-sandbox   --json
+/// --dangerously-bypass-hook-trust              --output-schema <FILE>
+/// --ephemeral                                  --skip-git-repo-check
+/// --ignore-rules                               -m, --model <MODEL>
+/// --ignore-user-config                         -o, --output-last-message <FILE>
+/// ```
+///
+/// Nothing is available on `codex review` that is not also on
+/// `codex exec review`, and the missing flags are rejected outright rather
+/// than silently ignored.
+///
+/// `--json` is the decisive one: [`execute_json_lines`](Self::execute_json_lines)
+/// and [`execute_json`](Self::execute_json) both depend on it, so a builder
+/// targeting the top-level path could not offer typed output at all. This
+/// wrapper therefore targets `codex exec review` only. Use
+/// [`RawCommand`](crate::RawCommand) if you need the literal `codex review`
+/// invocation.
+///
+/// `tests/contract.rs` asserts the subset relationship still holds, so if the
+/// two surfaces ever diverge the other way, CI reports it.
 #[derive(Debug, Clone)]
 pub struct ReviewCommand {
     prompt: Option<String>,
