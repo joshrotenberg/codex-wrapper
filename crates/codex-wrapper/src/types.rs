@@ -10,27 +10,32 @@
 //! rediscovering the bug.
 //!
 //! **Verified** against `codex-cli` 0.145.0, from the compiled serde tag list
-//! and a live run:
+//! and live runs of both `codex exec --json` and `codex exec review --json`:
 //!
 //! - The event vocabulary is `thread.started`, `turn.started`, `turn.completed`,
 //!   `turn.failed`, `item.started`, `item.updated`, `item.completed`. There is
-//!   no bare `completed`.
+//!   no bare `completed`. Review emits the same vocabulary as exec.
 //! - `thread.started` carries `thread_id`.
-//! - A completed turn reports token counts, never a monetary cost. The
-//!   `TokenUsage` fields are `input_tokens`, `cached_input_tokens`,
-//!   `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`,
-//!   `total_tokens`.
+//! - A completed turn reports token counts, never a monetary cost. The `usage`
+//!   object carries `input_tokens`, `cached_input_tokens`,
+//!   `cache_write_input_tokens`, `output_tokens`, and
+//!   `reasoning_output_tokens`. It does **not** carry `total_tokens`, so
+//!   [`TokenUsage::total`] reaches a total through its input plus output
+//!   fallback on every real run.
+//! - Assistant text arrives as an `item.completed` event whose `item` has a
+//!   `type` of `agent_message` and its text in a `text` field. A review's
+//!   diff-reading steps arrive as `command_execution` items on the same event.
+//! - A review's `turn.completed` reports a usage object of all zeros.
 //!
-//! **Assumed**, reconstructed from binary string tables rather than a live
-//! successful run:
+//! **Assumed**, still: nothing load-bearing.
+//! [`JsonLineEvent::agent_message_text`] also accepts an `item_type`
+//! discriminator and a `content` block array, neither of which has been seen
+//! in real output. That tolerance stays because the failure mode when this
+//! parser guesses wrong is an empty result rather than an error, which is how
+//! #73 went unnoticed.
 //!
-//! - Assistant text arrives as an `item.completed` event whose `item` has an
-//!   `agent_message` discriminator.
-//! - That the discriminator is `item_type` and the text is a `text` field.
-//!   [`JsonLineEvent::agent_message_text`] accepts `type` and a `content`
-//!   block array as alternatives rather than committing to one.
-//!
-//! To confirm, capture a real run and check `result` is non-empty:
+//! To re-confirm after a CLI upgrade, capture a run and check `result` is
+//! non-empty:
 //!
 //! ```sh
 //! codex exec --json --ephemeral --skip-git-repo-check "reply with: ok" > turn.jsonl
@@ -279,14 +284,12 @@ impl JsonLineEvent {
     ///
     /// Returns `None` for any other event or item type.
     ///
-    /// The item layout here is **assumed**, not verified against a live run;
-    /// see the ASSUMPTIONS block on [`QueryResult`]. Both `item_type` and
-    /// `type` are accepted as the discriminator, and the text is read from
-    /// either a `text` field or a `content` block array, because which of
-    /// those the CLI emits has not been confirmed. Tolerating both is
-    /// deliberate: the previous parser assumed one exact shape and silently
-    /// yielded empty results when it was wrong, which is the bug this
-    /// replaces.
+    /// Real output uses a `type` discriminator and a `text` field; see the
+    /// schema block at the top of this module. An `item_type` discriminator
+    /// and a `content` block array are also accepted, neither of them
+    /// observed. Tolerating the unobserved shapes is deliberate: the previous
+    /// parser committed to one exact layout and silently yielded empty results
+    /// when it was wrong, which is the bug this replaces.
     #[must_use]
     pub fn agent_message_text(&self) -> Option<String> {
         if self.event_type != "item.completed" {
@@ -421,8 +424,9 @@ impl QueryResult {
 /// so this crate does not attempt it: a hardcoded table would go stale
 /// silently, which is the same class of bug as #73.
 ///
-/// Every field is optional. An observed `turn.completed` carried only three of
-/// the six, so absence is normal rather than exceptional.
+/// Every field is optional, and absence is normal rather than exceptional:
+/// observed runs carry five of the six and never `total_tokens`, which is why
+/// [`TokenUsage::total`] falls back to input plus output.
 #[cfg(feature = "json")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -436,7 +440,7 @@ pub struct TokenUsage {
     pub output_tokens: Option<u64>,
     /// Output tokens spent on reasoning.
     pub reasoning_output_tokens: Option<u64>,
-    /// Total tokens as reported by the CLI.
+    /// Total tokens, if the CLI ever reports one. Observed runs do not.
     pub total_tokens: Option<u64>,
 }
 
@@ -704,25 +708,27 @@ mod tests {
         assert_eq!(TokenUsage::default().total(), None);
     }
 
+    /// The shape a real run emits: `type` on the item, text in `text`.
     #[test]
     fn agent_message_text_from_item_completed() {
         let event: JsonLineEvent = serde_json::from_str(
-            r#"{"type":"item.completed","item":{"item_type":"agent_message","text":"hello"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello"}}"#,
         )
         .unwrap();
         assert_eq!(event.agent_message_text().as_deref(), Some("hello"));
     }
 
-    /// The item layout is assumed rather than verified, so the accessor
-    /// tolerates the plausible variants instead of committing to one and
-    /// silently returning nothing when wrong. See #73.
+    /// `item_type` and content blocks are not shapes the CLI has been seen to
+    /// emit. The accessor still tolerates them, because the cost of being
+    /// wrong here is a silently empty result rather than a loud failure, which
+    /// is how #73 stayed hidden. These cases keep that tolerance covered.
     #[test]
     fn agent_message_text_tolerates_layout_variants() {
-        let type_key: JsonLineEvent = serde_json::from_str(
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"a"}}"#,
+        let item_type_key: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"item_type":"agent_message","text":"a"}}"#,
         )
         .unwrap();
-        assert_eq!(type_key.agent_message_text().as_deref(), Some("a"));
+        assert_eq!(item_type_key.agent_message_text().as_deref(), Some("a"));
 
         let content_blocks: JsonLineEvent = serde_json::from_str(
             r#"{"type":"item.completed","item":{"item_type":"agent_message","content":[{"text":"b"},{"text":"c"}]}}"#,
@@ -733,14 +739,15 @@ mod tests {
 
     #[test]
     fn agent_message_text_ignores_other_items_and_events() {
+        // The item type a review's diff-reading steps arrive as.
         let other_item: JsonLineEvent = serde_json::from_str(
-            r#"{"type":"item.completed","item":{"item_type":"command_execution","text":"ls"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"git diff","exit_code":0}}"#,
         )
         .unwrap();
         assert_eq!(other_item.agent_message_text(), None);
 
         let other_event: JsonLineEvent = serde_json::from_str(
-            r#"{"type":"item.started","item":{"item_type":"agent_message","text":"x"}}"#,
+            r#"{"type":"item.started","item":{"id":"item_0","type":"agent_message","text":"x"}}"#,
         )
         .unwrap();
         assert_eq!(other_event.agent_message_text(), None);

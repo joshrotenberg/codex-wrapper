@@ -429,8 +429,8 @@ impl ExecCommand {
 
     /// Execute the command and return a typed [`QueryResult`].
     ///
-    /// Assembles the final result text, ids, and cost from the JSONL event
-    /// stream. Use [`execute_json_lines`](ExecCommand::execute_json_lines) for
+    /// Assembles the final result text, ids, and token usage from the JSONL
+    /// event stream. Use [`execute_json_lines`](ExecCommand::execute_json_lines) for
     /// the raw event stream. Requires the `json` feature.
     #[cfg(feature = "json")]
     pub async fn execute_json(&self, codex: &Codex) -> Result<QueryResult> {
@@ -806,8 +806,8 @@ impl ExecResumeCommand {
 
     /// Execute the resume command and return a typed [`QueryResult`].
     ///
-    /// Assembles the final result text, ids, and cost from the JSONL event
-    /// stream. Requires the `json` feature.
+    /// Assembles the final result text, ids, and token usage from the JSONL
+    /// event stream. Requires the `json` feature.
     #[cfg(feature = "json")]
     pub async fn execute_json(&self, codex: &Codex) -> Result<QueryResult> {
         let events = self.execute_json_lines(codex).await?;

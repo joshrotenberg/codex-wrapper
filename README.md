@@ -343,7 +343,18 @@ let output = ReviewCommand::new()
     .json()
     .execute(&codex)
     .await?;
+
+// Typed result, same shape ExecCommand returns
+let result = ReviewCommand::new()
+    .uncommitted()
+    .execute_json(&codex)
+    .await?;
+println!("{}", result.result);
 ```
+
+Review emits the same event vocabulary as `codex exec`, so `execute_json()` assembles the
+review comments into `QueryResult::result`. One difference: a review's `turn.completed`
+reports a usage object of all zeros, so `result.usage` carries no counts.
 
 ## MCP Server Management
 
