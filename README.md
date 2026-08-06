@@ -594,6 +594,26 @@ To disable default features:
 codex-wrapper = { version = "0.2", default-features = false }
 ```
 
+## Examples
+
+Runnable programs live in
+[`crates/codex-wrapper/examples`](https://github.com/joshrotenberg/codex-wrapper/tree/main/crates/codex-wrapper/examples).
+Each needs a working `codex` on `PATH`:
+
+```bash
+cargo run --example oneshot        # one prompt, raw output
+cargo run --example json_output    # JSONL events and the typed QueryResult
+cargo run --example stream_exec    # events delivered as they arrive
+cargo run --example session        # multi-turn via exec resume
+cargo run --example review         # code review, text and typed
+cargo run --example mcp_servers    # add / list / inspect / remove MCP servers
+cargo run --example health_check   # installed CLI vs the tested version range
+```
+
+All but `oneshot` and `health_check` need the `json` feature, which is on by default. Each is
+declared with its `required-features` in the manifest, so a reduced-feature build skips it
+rather than failing.
+
 ## Testing
 
 ```bash

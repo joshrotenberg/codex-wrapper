@@ -31,3 +31,31 @@ which = "8"
 [dev-dependencies]
 serde_json = "1"
 tokio = { workspace = true }
+
+# Each example declares the features it needs, so a reduced-feature build
+# skips it rather than failing to compile it.
+[[example]]
+name = "oneshot"
+
+[[example]]
+name = "health_check"
+
+[[example]]
+name = "json_output"
+required-features = ["json"]
+
+[[example]]
+name = "stream_exec"
+required-features = ["json"]
+
+[[example]]
+name = "session"
+required-features = ["json"]
+
+[[example]]
+name = "mcp_servers"
+required-features = ["json"]
+
+[[example]]
+name = "review"
+required-features = ["json"]
