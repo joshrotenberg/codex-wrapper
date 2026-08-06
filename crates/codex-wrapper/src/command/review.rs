@@ -295,6 +295,25 @@ impl ReviewCommand {
             })
             .collect()
     }
+
+    /// Execute the review and return a typed
+    /// [`QueryResult`](crate::types::QueryResult).
+    ///
+    /// Review emits the same event vocabulary as `codex exec`, so the review
+    /// comments arrive as the `agent_message` item that
+    /// [`result`](crate::types::QueryResult::result) is assembled from. Use
+    /// [`execute_json_lines`](Self::execute_json_lines) for the raw stream.
+    /// Requires the `json` feature.
+    ///
+    /// One difference from exec, observed on `codex-cli` 0.145.0: the
+    /// `turn.completed` event of a review reports a usage object of all
+    /// zeros, so [`usage`](crate::types::QueryResult::usage) is present but
+    /// carries no counts.
+    #[cfg(feature = "json")]
+    pub async fn execute_json(&self, codex: &Codex) -> Result<crate::types::QueryResult> {
+        let events = self.execute_json_lines(codex).await?;
+        Ok(crate::types::QueryResult::from_events(events))
+    }
 }
 
 impl Default for ReviewCommand {
@@ -501,5 +520,39 @@ mod tests {
                 "/tmp/schema.json"
             ]
         );
+    }
+
+    /// #70 asked whether `QueryResult::from_events` holds up on review output.
+    /// It does: the fixture is a transcript of a real review run, and the
+    /// review comments land in `result` the same way an exec answer does.
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn review_execute_json_assembles_a_query_result() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex-review.sh");
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .build()
+            .expect("bash must exist");
+
+        let result = ReviewCommand::new()
+            .uncommitted()
+            .execute_json(&codex)
+            .await
+            .unwrap();
+
+        assert_eq!(result.result, "- [P1] Keep add performing addition");
+        assert_eq!(
+            result.thread_id.as_deref(),
+            Some("019fd952-7ce9-7662-8a20-9c33c1718dca")
+        );
+        // The command_execution items the reviewer ran are in the stream but
+        // must not leak into the result text.
+        assert!(!result.result.contains("git diff"));
+        assert_eq!(result.events.len(), 6);
+        // Review reports usage, but a real run reports it as all zeros.
+        assert_eq!(result.usage.and_then(|u| u.total()), Some(0));
     }
 }

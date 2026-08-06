@@ -8,11 +8,14 @@
 # never emitted, which made every test that consumed it self-consistent and
 # wrong. See #73.
 #
-# Verified against the CLI: the event names, and that a completed turn reports
-# token counts rather than any monetary cost.
-# Assumed: the exact `item.completed` layout. See the ASSUMPTIONS block in
-# src/types.rs.
+# Verified against a real `codex exec --json --ephemeral` run: the event names,
+# the `type` discriminator on the item, and a completed turn reporting token
+# counts rather than any monetary cost. The usage object carries no
+# `total_tokens`, so `TokenUsage::total` reaches 165 through its input plus
+# output fallback, which is the path every real run takes.
+#
+# The ids and counts are synthetic. The shape is not.
 echo '{"type":"thread.started","thread_id":"thread_test"}'
 echo '{"type":"turn.started"}'
-echo '{"type":"item.completed","item":{"id":"item_0","item_type":"agent_message","text":"hello"}}'
-echo '{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":0,"output_tokens":45,"reasoning_output_tokens":0,"total_tokens":165}}'
+echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":45,"reasoning_output_tokens":0}}'

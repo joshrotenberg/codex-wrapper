@@ -259,6 +259,29 @@ async fn review_uncommitted() {
     assert!(output.is_ok() || output.is_err());
 }
 
+/// Requires uncommitted changes in the working tree to review. With a clean
+/// tree the CLI exits non-zero and this reports that rather than a schema
+/// problem.
+#[tokio::test]
+#[ignore]
+async fn review_query_result() {
+    let codex = codex();
+    let result = ReviewCommand::new()
+        .uncommitted()
+        .ephemeral()
+        .execute_json(&codex)
+        .await
+        .unwrap();
+    assert!(
+        result.thread_id.is_some(),
+        "expected a thread_id from the stream"
+    );
+    assert!(
+        !result.result.is_empty(),
+        "expected review comments in the assembled result, got: {result:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Resume / Fork (interactive - just verify arg building doesn't break)
 // ---------------------------------------------------------------------------
