@@ -72,14 +72,47 @@ pub async fn run_codex_with_retry(
     }
 }
 
-async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutput> {
-    let mut command_args = Vec::new();
-
-    // Global args first (before subcommand)
-    command_args.extend(codex.global_args.clone());
-
-    // Then command-specific args
+/// Assemble the full argument list for an invocation: the client's global
+/// args first, since they precede the subcommand, then the command's own.
+///
+/// Both spawn paths and [`CodexCommand::to_command_string`] go through here,
+/// so a previewed command cannot drift from the one that actually runs.
+///
+/// [`CodexCommand::to_command_string`]: crate::command::CodexCommand::to_command_string
+pub(crate) fn assemble_args(codex: &Codex, args: Vec<String>) -> Vec<String> {
+    let mut command_args = Vec::with_capacity(codex.global_args.len() + args.len());
+    command_args.extend(codex.global_args.iter().cloned());
     command_args.extend(args);
+    command_args
+}
+
+/// Render an invocation as a copy-pasteable shell command.
+pub(crate) fn command_string(codex: &Codex, args: Vec<String>) -> String {
+    let mut out = shell_quote(&codex.binary.display().to_string());
+    for arg in assemble_args(codex, args) {
+        out.push(' ');
+        out.push_str(&shell_quote(&arg));
+    }
+    out
+}
+
+/// Quote a single argument for a POSIX shell, if it needs it.
+///
+/// The empty string is quoted: unquoted it would vanish from the rendered
+/// command, turning a preview into something that runs differently from what
+/// it describes.
+pub(crate) fn shell_quote(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg.contains(|c: char| c.is_whitespace() || "\"'$\\`|;<>&()[]{}*?!~#".contains(c)) {
+        return format!("'{}'", arg.replace('\'', r"'\''"));
+    }
+    arg.to_string()
+}
+
+async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutput> {
+    let command_args = assemble_args(codex, args);
 
     debug!(binary = %codex.binary.display(), args = ?command_args, "executing codex command");
 
@@ -207,6 +240,29 @@ mod tests {
             exit_code: 0,
             success: true,
         }
+    }
+
+    #[test]
+    fn shell_quote_leaves_plain_words_alone() {
+        assert_eq!(shell_quote("exec"), "exec");
+        assert_eq!(shell_quote("--ephemeral"), "--ephemeral");
+        assert_eq!(shell_quote("model=gpt-5"), "model=gpt-5");
+    }
+
+    #[test]
+    fn shell_quote_wraps_anything_a_shell_would_read() {
+        assert_eq!(shell_quote("fix the tests"), "'fix the tests'");
+        assert_eq!(shell_quote("$HOME"), "'$HOME'");
+        assert_eq!(shell_quote("a;b"), "'a;b'");
+        assert_eq!(shell_quote("*.rs"), "'*.rs'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    /// An unquoted empty string would disappear from the rendered command,
+    /// making the preview describe a different invocation than it previews.
+    #[test]
+    fn shell_quote_keeps_the_empty_argument_visible() {
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]
