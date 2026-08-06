@@ -499,6 +499,24 @@ match ExecCommand::new("test").execute(&codex).await {
 }
 ```
 
+## Previewing the Command
+
+Every builder can render the exact command line it will spawn, without spawning it:
+
+```rust
+use codex_wrapper::{Codex, CodexCommand, ExecCommand};
+
+let codex = Codex::builder().config("model=\"gpt-5\"").build()?;
+let cmd = ExecCommand::new("fix the failing tests").ephemeral();
+
+println!("{}", cmd.to_command_string(&codex));
+// codex -c 'model="gpt-5"' exec --ephemeral 'fix the failing tests'
+```
+
+Global args precede the subcommand, the same order the spawn uses, because the preview and both
+spawn paths share one assembly function. The output is quoted for a POSIX shell so it can be
+pasted, but no shell is involved at spawn time: args go to the process directly.
+
 ## Cancellation
 
 Dropping the future returned by a command kills the spawned `codex` process. That covers a

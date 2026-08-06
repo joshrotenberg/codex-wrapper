@@ -73,9 +73,7 @@ async fn run_streaming<F>(codex: &Codex, args: Vec<String>, mut handler: F) -> R
 where
     F: FnMut(JsonLineEvent),
 {
-    let mut command_args = Vec::new();
-    command_args.extend(codex.global_args.clone());
-    command_args.extend(args);
+    let command_args = crate::exec::assemble_args(codex, args);
 
     debug!(binary = %codex.binary.display(), args = ?command_args, "streaming codex command");
 
