@@ -60,6 +60,13 @@ jobs:
       - name: Unit tests without default features
         run: cargo test --lib --no-default-features
 
+      # Runs nothing today: every test under tests/ is #[ignore]d and needs a
+      # real authenticated codex, which the contract job supplies with
+      # --ignored. This step compiles the directory and gives a non-ignored
+      # test somewhere to run, so one is not added to a suite CI never invokes.
+      - name: Integration test harness
+        run: cargo test --test '*' --all-features
+
       - name: Doc tests
         run: cargo test --doc --all-features
 
