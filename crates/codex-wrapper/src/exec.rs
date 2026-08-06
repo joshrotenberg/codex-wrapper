@@ -162,17 +162,75 @@ pub async fn run_codex_allow_exit_codes(
     }
 }
 
+/// Run a codex command, writing `prompt` to the child's stdin.
+///
+/// For `codex exec -`, where the prompt is delivered on stdin rather than as
+/// an argument. The prompt is written and the handle dropped, so the CLI sees
+/// EOF and stops waiting for more.
+///
+/// Retry does not apply. The policy is deliberately ignored rather than
+/// honored: a retry would have to write the prompt again, and the first
+/// attempt has already moved the caller's data into a pipe that cannot be
+/// rewound. Silently retrying with an empty stdin would be worse than not
+/// retrying at all.
+pub async fn run_codex_with_stdin_prompt(
+    codex: &Codex,
+    args: Vec<String>,
+    prompt: &str,
+) -> Result<CommandOutput> {
+    let command_args = assemble_args(codex, args);
+
+    debug!(
+        binary = %codex.binary.display(),
+        args = ?command_args,
+        prompt_bytes = prompt.len(),
+        "executing codex command with a stdin prompt"
+    );
+
+    let run = run_internal_inner(
+        &codex.binary,
+        &command_args,
+        &codex.env,
+        codex.working_dir.as_deref(),
+        Some(prompt),
+    );
+
+    match codex.timeout {
+        Some(timeout) => tokio::time::timeout(timeout, run)
+            .await
+            .map_err(|_| Error::Timeout {
+                timeout_seconds: timeout.as_secs(),
+            })?,
+        None => run.await,
+    }
+}
+
 async fn run_internal(
     binary: &std::path::Path,
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     working_dir: Option<&std::path::Path>,
 ) -> Result<CommandOutput> {
+    run_internal_inner(binary, args, env, working_dir, None).await
+}
+
+async fn run_internal_inner(
+    binary: &std::path::Path,
+    args: &[String],
+    env: &std::collections::HashMap<String, String>,
+    working_dir: Option<&std::path::Path>,
+    stdin_prompt: Option<&str>,
+) -> Result<CommandOutput> {
     let mut cmd = Command::new(binary);
     cmd.args(args);
 
-    // Prevent child from inheriting/blocking on parent's stdin.
-    cmd.stdin(std::process::Stdio::null());
+    // Pipe stdin only when there is a prompt to write. Otherwise close it, so
+    // the child neither inherits nor blocks on the parent's.
+    if stdin_prompt.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    } else {
+        cmd.stdin(std::process::Stdio::null());
+    }
 
     // Kill the child if this future is dropped: on timeout, on caller
     // cancellation, or on task abort. Without this, tokio detaches the child
@@ -187,11 +245,51 @@ async fn run_internal(
         cmd.env(key, value);
     }
 
-    let output = cmd.output().await.map_err(|e| Error::Io {
-        message: format!("failed to spawn codex: {e}"),
-        source: e,
-        working_dir: working_dir.map(|p| p.to_path_buf()),
-    })?;
+    let output = match stdin_prompt {
+        // `Command::output` forces stdin to null, so the piped case cannot use
+        // it and spawns directly.
+        None => cmd.output().await.map_err(|e| Error::Io {
+            message: format!("failed to spawn codex: {e}"),
+            source: e,
+            working_dir: working_dir.map(|p| p.to_path_buf()),
+        })?,
+        Some(prompt) => {
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+
+            let mut child = cmd.spawn().map_err(|e| Error::Io {
+                message: format!("failed to spawn codex: {e}"),
+                source: e,
+                working_dir: working_dir.map(|p| p.to_path_buf()),
+            })?;
+
+            let mut stdin = child.stdin.take().expect("stdin was configured as piped");
+            let write = async move {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(prompt.as_bytes()).await?;
+                // Closing the write half is what tells the CLI the prompt is
+                // complete. Without it the child waits for more input.
+                stdin.shutdown().await
+            };
+
+            // Concurrently, not sequentially: a prompt larger than the pipe
+            // buffer blocks until the child reads it, and a child that writes
+            // to stdout meanwhile blocks until we read that. Waiting for the
+            // write to finish before draining stdout would deadlock both.
+            let (write_result, output_result) = tokio::join!(write, child.wait_with_output());
+
+            write_result.map_err(|e| Error::Io {
+                message: format!("failed to write the prompt to codex stdin: {e}"),
+                source: e,
+                working_dir: working_dir.map(|p| p.to_path_buf()),
+            })?;
+            output_result.map_err(|e| Error::Io {
+                message: format!("failed to wait on codex: {e}"),
+                source: e,
+                working_dir: working_dir.map(|p| p.to_path_buf()),
+            })?
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();

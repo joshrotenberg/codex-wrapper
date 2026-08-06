@@ -67,6 +67,7 @@ pub(crate) fn effective_sandbox(
 #[derive(Debug, Clone)]
 pub struct ExecCommand {
     prompt: Option<String>,
+    prompt_via_stdin: bool,
     approval_policy: Option<ApprovalPolicyConfig>,
     web_search: Option<WebSearchMode>,
     config_overrides: Vec<String>,
@@ -101,6 +102,7 @@ impl ExecCommand {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: Some(prompt.into()),
+            prompt_via_stdin: false,
             approval_policy: None,
             web_search: None,
             config_overrides: Vec::new(),
@@ -130,10 +132,55 @@ impl ExecCommand {
         }
     }
 
-    /// Read the prompt from stdin (`-`).
+    /// Send the prompt on stdin instead of as an argument (`codex exec -`).
+    ///
+    /// Shorthand for [`new`](Self::new) followed by
+    /// [`prompt_via_stdin`](Self::prompt_via_stdin). Use it for prompts that
+    /// are large or awkward to pass through argv.
+    ///
+    /// ```no_run
+    /// use codex_wrapper::{Codex, CodexCommand, ExecCommand};
+    ///
+    /// # async fn example() -> codex_wrapper::Result<()> {
+    /// let codex = Codex::builder().build()?;
+    /// let diff = std::fs::read_to_string("huge.patch")?;
+    /// let output = ExecCommand::from_stdin(format!("Review this patch:\n{diff}"))
+    ///     .execute(&codex)
+    ///     .await?;
+    /// # let _ = output;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Before 0.3 this took no argument and set the prompt to the literal
+    /// `-`, which could not work: nothing wrote to the child's stdin, so the
+    /// CLI saw an immediate EOF and an empty prompt (#81).
     #[must_use]
-    pub fn from_stdin() -> Self {
-        Self::new("-")
+    pub fn from_stdin(prompt: impl Into<String>) -> Self {
+        Self::new(prompt).prompt_via_stdin()
+    }
+
+    /// Deliver this command's prompt on stdin rather than in argv.
+    ///
+    /// The prompt is replaced by `-` in the argument list and written to the
+    /// child's stdin instead.
+    ///
+    /// Retry does not apply to a stdin prompt, and any policy set on the
+    /// command or the client is ignored for it. A second attempt would need to
+    /// write the prompt again, into a pipe the first attempt has already
+    /// consumed, and retrying with an empty stdin would be worse than not
+    /// retrying.
+    #[must_use]
+    pub fn prompt_via_stdin(mut self) -> Self {
+        self.prompt_via_stdin = true;
+        self
+    }
+
+    /// The prompt to write to the child's stdin, if this command sends it
+    /// there. `None` when the prompt travels in argv.
+    pub(crate) fn stdin_prompt(&self) -> Option<&str> {
+        self.prompt_via_stdin
+            .then(|| self.prompt.as_deref().unwrap_or_default())
     }
 
     /// Override a config key (`-c key=value`).
@@ -423,7 +470,12 @@ impl ExecCommand {
             args.push("--json".into());
         }
 
-        let output = exec::run_codex_with_retry(codex, args, self.retry_policy.as_ref()).await?;
+        let output = if self.prompt_via_stdin {
+            let prompt = self.prompt.as_deref().unwrap_or_default();
+            exec::run_codex_with_stdin_prompt(codex, args, prompt).await?
+        } else {
+            exec::run_codex_with_retry(codex, args, self.retry_policy.as_ref()).await?
+        };
         parse_json_lines(&output.stdout)
     }
 
@@ -511,7 +563,11 @@ impl CodexCommand for ExecCommand {
             args.push("--output-last-message".into());
             args.push(path.clone());
         }
-        if let Some(prompt) = &self.prompt {
+        if self.prompt_via_stdin {
+            // The prompt travels on stdin; `-` is how the CLI is told to read
+            // it from there.
+            args.push("-".into());
+        } else if let Some(prompt) = &self.prompt {
             args.push(prompt.clone());
         }
 
@@ -519,6 +575,10 @@ impl CodexCommand for ExecCommand {
     }
 
     async fn execute(&self, codex: &Codex) -> Result<CommandOutput> {
+        if self.prompt_via_stdin {
+            let prompt = self.prompt.as_deref().unwrap_or_default();
+            return exec::run_codex_with_stdin_prompt(codex, self.args(), prompt).await;
+        }
         exec::run_codex_with_retry(codex, self.args(), self.retry_policy.as_ref()).await
     }
 }
@@ -1183,5 +1243,88 @@ mod tests {
                 "/tmp/schema.json"
             ]
         );
+    }
+
+    /// #81: the builder emitted `codex exec -` while every spawn path closed
+    /// the child's stdin, so the prompt was never delivered. This drives a
+    /// fake codex that echoes back what it read, which is the only way to see
+    /// the difference: the argv is identical either way.
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn stdin_prompt_reaches_the_child() {
+        let codex = echoing_stdin_codex();
+        let prompt = "a prompt too awkward for argv\nwith a second line";
+
+        let result = ExecCommand::from_stdin(prompt)
+            .execute_json(&codex)
+            .await
+            .unwrap();
+
+        assert_eq!(result.result, prompt);
+    }
+
+    /// The same delivery, on the streaming path, which pipes stdin separately.
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn stdin_prompt_reaches_the_child_when_streaming() {
+        let codex = echoing_stdin_codex();
+        let prompt = "streamed stdin prompt";
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+
+        ExecCommand::from_stdin(prompt)
+            .stream(&codex, move |event| {
+                if let Some(text) = event.agent_message_text() {
+                    sink.lock().unwrap().push(text);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &[prompt.to_string()]);
+    }
+
+    /// A prompt larger than a pipe buffer must not deadlock: the write and the
+    /// output drain have to run concurrently.
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn a_prompt_larger_than_the_pipe_buffer_still_completes() {
+        let codex = echoing_stdin_codex();
+        // Well past the usual 64 KiB pipe capacity.
+        let prompt = "x".repeat(512 * 1024);
+
+        let result = ExecCommand::from_stdin(&prompt)
+            .execute_json(&codex)
+            .await
+            .unwrap();
+
+        assert_eq!(result.result.len(), prompt.len());
+    }
+
+    #[cfg(all(unix, feature = "json"))]
+    fn echoing_stdin_codex() -> Codex {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex-echo-stdin.sh");
+        Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .build()
+            .expect("bash must exist")
+    }
+
+    #[test]
+    fn from_stdin_emits_the_dash_positional_not_the_prompt() {
+        let args = ExecCommand::from_stdin("secret prompt").ephemeral().args();
+        assert_eq!(args, vec!["exec", "--ephemeral", "-"]);
+        // The prompt must not leak into argv, which is the whole point of
+        // sending it on stdin.
+        assert!(!args.iter().any(|a| a.contains("secret")));
+    }
+
+    #[test]
+    fn prompt_via_stdin_converts_an_existing_prompt() {
+        let args = ExecCommand::new("hello").prompt_via_stdin().args();
+        assert_eq!(args, vec!["exec", "-"]);
     }
 }
