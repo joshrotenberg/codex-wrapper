@@ -676,6 +676,7 @@ mod tests {
         assert!(!bogus.is_turn_completed());
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn json_line_event_usage() {
         let event: JsonLineEvent = serde_json::from_str(
@@ -691,6 +692,7 @@ mod tests {
         assert_eq!(usage.total(), Some(165));
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn token_usage_total_falls_back_to_input_plus_output() {
         let usage = TokenUsage {
@@ -703,12 +705,14 @@ mod tests {
 
     /// A missing total must not read as zero, which would silently understate
     /// a session's usage.
+    #[cfg(feature = "json")]
     #[test]
     fn token_usage_total_is_none_when_nothing_reported() {
         assert_eq!(TokenUsage::default().total(), None);
     }
 
     /// The shape a real run emits: `type` on the item, text in `text`.
+    #[cfg(feature = "json")]
     #[test]
     fn agent_message_text_from_item_completed() {
         let event: JsonLineEvent = serde_json::from_str(
@@ -722,6 +726,7 @@ mod tests {
     /// emit. The accessor still tolerates them, because the cost of being
     /// wrong here is a silently empty result rather than a loud failure, which
     /// is how #73 stayed hidden. These cases keep that tolerance covered.
+    #[cfg(feature = "json")]
     #[test]
     fn agent_message_text_tolerates_layout_variants() {
         let item_type_key: JsonLineEvent = serde_json::from_str(
@@ -737,6 +742,7 @@ mod tests {
         assert_eq!(content_blocks.agent_message_text().as_deref(), Some("bc"));
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn agent_message_text_ignores_other_items_and_events() {
         // The item type a review's diff-reading steps arrive as.
@@ -753,6 +759,7 @@ mod tests {
         assert_eq!(other_event.agent_message_text(), None);
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn json_line_event_role() {
         let event: JsonLineEvent =
@@ -814,6 +821,7 @@ mod tests {
         assert_eq!(result.events.len(), 3);
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn query_result_concatenates_multiple_agent_messages() {
         let events: Vec<JsonLineEvent> = [
@@ -830,6 +838,7 @@ mod tests {
 
     /// A failed turn has no agent message and no usage. Both must come back
     /// empty rather than fabricated.
+    #[cfg(feature = "json")]
     #[test]
     fn query_result_from_a_failed_turn() {
         let events: Vec<JsonLineEvent> = [
