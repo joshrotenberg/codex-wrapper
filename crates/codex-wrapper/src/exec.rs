@@ -141,6 +141,11 @@ async fn run_internal(
     // Prevent child from inheriting/blocking on parent's stdin.
     cmd.stdin(std::process::Stdio::null());
 
+    // Kill the child if this future is dropped: on timeout, on caller
+    // cancellation, or on task abort. Without this, tokio detaches the child
+    // and codex keeps running with no handle left to stop it.
+    cmd.kill_on_drop(true);
+
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
@@ -220,5 +225,59 @@ mod tests {
         let debug = format!("{output:?}");
         assert!(debug.contains("... (300 bytes total)"));
         assert!(!debug.contains(&long));
+    }
+
+    /// A wrapper timeout drops `run_internal`'s future. Without
+    /// `kill_on_drop`, `Error::Timeout` would mean "we stopped waiting" while
+    /// codex kept running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_spawned_process() {
+        use crate::test_support::{PidFile, blocking_codex, wait_until_gone};
+
+        let pid_file = PidFile::new("exec-timeout");
+        let codex = blocking_codex(&pid_file)
+            .timeout(Duration::from_millis(500))
+            .build()
+            .expect("bash must exist");
+
+        let result = run_codex(&codex, vec!["exec".into(), "probe".into()]).await;
+        assert!(
+            matches!(result, Err(Error::Timeout { .. })),
+            "expected timeout error, got: {result:?}"
+        );
+
+        let pid = pid_file.read_pid().await;
+        assert!(
+            wait_until_gone(pid).await,
+            "codex ({pid}) survived the timeout"
+        );
+    }
+
+    /// The caller dropping the future is the case an operator kill or a
+    /// graceful shutdown produces, with no wrapper timeout involved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_the_spawned_process() {
+        use crate::test_support::{PidFile, blocking_codex, wait_until_gone};
+
+        let pid_file = PidFile::new("exec-cancel");
+        let codex = blocking_codex(&pid_file).build().expect("bash must exist");
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_codex(&codex, vec!["exec".into(), "probe".into()]),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "fake codex should still have been running, got: {cancelled:?}"
+        );
+
+        let pid = pid_file.read_pid().await;
+        assert!(
+            wait_until_gone(pid).await,
+            "codex ({pid}) survived the dropped future"
+        );
     }
 }

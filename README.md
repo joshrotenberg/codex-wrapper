@@ -488,6 +488,32 @@ match ExecCommand::new("test").execute(&codex).await {
 }
 ```
 
+## Cancellation
+
+Dropping the future returned by a command kills the spawned `codex` process. That covers a
+timeout, an aborted task, and a caller that stops awaiting during a graceful shutdown:
+cancelling the future cancels the work, rather than leaving codex running and billing with no
+handle left to stop it.
+
+```rust
+use codex_wrapper::{ExecCommand, CodexCommand};
+use std::time::Duration;
+
+// The codex process is killed when the timeout drops the future.
+let result = tokio::time::timeout(
+    Duration::from_secs(30),
+    ExecCommand::new("long task").execute(&codex),
+)
+.await;
+```
+
+Two limits are worth knowing:
+
+- The kill reaps the `codex` process itself. Subprocesses codex spawned for tool use are not
+  signalled and can outlive it.
+- Reaping needs the tokio runtime to still be running. A future dropped as part of runtime
+  shutdown may not get far enough to kill the child.
+
 ## Retry Policy
 
 Configure automatic retries for transient failures:
