@@ -143,6 +143,21 @@
 //! # }
 //! ```
 //!
+//! # Cancellation
+//!
+//! Dropping the future returned by a command kills the spawned `codex`
+//! process. That covers a timeout, an aborted task, and a caller that stops
+//! awaiting during a graceful shutdown: cancelling the future cancels the
+//! work, rather than leaving codex running and billing with no handle left to
+//! stop it.
+//!
+//! Two limits are worth knowing:
+//!
+//! - The kill reaps the `codex` process itself. Subprocesses codex spawned for
+//!   tool use are not signalled and can outlive it.
+//! - Reaping needs the tokio runtime to still be running. A future dropped as
+//!   part of runtime shutdown may not get far enough to kill the child.
+//!
 //! # Features
 //!
 //! - `json` *(enabled by default)* - JSONL output parsing via `serde_json`
@@ -155,6 +170,8 @@ pub mod retry;
 pub mod session;
 #[cfg(feature = "json")]
 pub mod streaming;
+#[cfg(all(test, unix))]
+mod test_support;
 pub mod types;
 pub mod version;
 

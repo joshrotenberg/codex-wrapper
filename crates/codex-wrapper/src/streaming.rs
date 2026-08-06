@@ -85,6 +85,11 @@ where
     child_cmd.stdout(std::process::Stdio::piped());
     child_cmd.stderr(std::process::Stdio::piped());
 
+    // Kill the child if this future is dropped: on timeout, on caller
+    // cancellation, or on task abort. Without this, tokio detaches the child
+    // and codex keeps running with no handle left to stop it.
+    child_cmd.kill_on_drop(true);
+
     if let Some(dir) = &codex.working_dir {
         child_cmd.current_dir(dir);
     }
@@ -259,6 +264,58 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Timeout { .. })),
             "expected timeout error, got: {result:?}"
+        );
+    }
+
+    /// The streaming path drops both `stream_future` and the child it borrows.
+    /// Without `kill_on_drop`, the timeout above would leave codex running.
+    #[tokio::test]
+    async fn stream_exec_timeout_kills_the_spawned_process() {
+        use crate::test_support::{PidFile, blocking_codex, wait_until_gone};
+
+        let pid_file = PidFile::new("stream-timeout");
+        let codex = blocking_codex(&pid_file)
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .expect("bash must exist");
+
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+        let result = stream_exec(&codex, &cmd, |_| {}).await;
+        assert!(
+            matches!(result, Err(Error::Timeout { .. })),
+            "expected timeout error, got: {result:?}"
+        );
+
+        let pid = pid_file.read_pid().await;
+        assert!(
+            wait_until_gone(pid).await,
+            "codex ({pid}) survived the timeout"
+        );
+    }
+
+    /// The caller dropping the stream future, with no wrapper timeout.
+    #[tokio::test]
+    async fn stream_exec_cancellation_kills_the_spawned_process() {
+        use crate::test_support::{PidFile, blocking_codex, wait_until_gone};
+
+        let pid_file = PidFile::new("stream-cancel");
+        let codex = blocking_codex(&pid_file).build().expect("bash must exist");
+
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stream_exec(&codex, &cmd, |_| {}),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "fake codex should still have been running, got: {cancelled:?}"
+        );
+
+        let pid = pid_file.read_pid().await;
+        assert!(
+            wait_until_gone(pid).await,
+            "codex ({pid}) survived the dropped future"
         );
     }
 
