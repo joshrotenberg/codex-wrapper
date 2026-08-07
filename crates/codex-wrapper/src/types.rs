@@ -27,6 +27,14 @@
 //!   diff-reading steps arrive as `command_execution` items on the same event.
 //! - A review's `turn.completed` reports a usage object of all zeros.
 //!
+//! - The stream carries **no incremental text**. Three captured runs, a
+//!   one-word exec, a four-sentence exec, and a review, each delivered the
+//!   whole assistant message in a single `item.completed`. No `item.updated`,
+//!   no partial or delta fields, and `codex exec --help` has no flag that
+//!   changes output granularity. There is nothing to assemble, which is why
+//!   this module has no equivalent of `claude-wrapper`'s `PartialMessageEvent`
+//!   (#84).
+//!
 //! **Assumed**, still: nothing load-bearing.
 //! [`JsonLineEvent::agent_message_text`] also accepts an `item_type`
 //! discriminator and a `content` block array, neither of which has been seen
@@ -340,6 +348,43 @@ impl JsonLineEvent {
             .join("");
         if text.is_empty() { None } else { Some(text) }
     }
+
+    /// The `item` discriminator on an `item.*` event.
+    ///
+    /// `agent_message` and `command_execution` are the observed values. This
+    /// is the field to match on when narrowing an item event, and it is
+    /// present on `item.started` as well as `item.completed`.
+    ///
+    /// Accepts `item_type` as well as `type` for the same reason
+    /// [`agent_message_text`](Self::agent_message_text) does.
+    #[must_use]
+    pub fn item_type(&self) -> Option<&str> {
+        let item = self.extra.get("item")?;
+        item.get("type").or_else(|| item.get("item_type"))?.as_str()
+    }
+
+    /// A shell command the model ran, from a `command_execution` item.
+    ///
+    /// `None` for any other item. `exit_code` and `status` are only populated
+    /// on `item.completed`; an `item.started` for the same command carries the
+    /// command alone.
+    #[must_use]
+    pub fn command_execution(&self) -> Option<CommandExecution> {
+        if self.item_type()? != "command_execution" {
+            return None;
+        }
+        let item = self.extra.get("item")?;
+        let string = |key: &str| item.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        Some(CommandExecution {
+            command: string("command"),
+            status: string("status"),
+            exit_code: item
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|code| i32::try_from(code).ok()),
+            aggregated_output: string("aggregated_output"),
+        })
+    }
 }
 
 /// A typed summary of a completed `codex exec` run, assembled from the JSONL
@@ -415,6 +460,24 @@ impl QueryResult {
             events,
         }
     }
+}
+
+/// A shell command the model ran, from a `command_execution` item.
+///
+/// Every field is optional: an `item.started` carries the command with no
+/// outcome yet, and the CLI has added fields to this item before.
+#[cfg(feature = "json")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CommandExecution {
+    /// The command line, as the CLI recorded it.
+    pub command: Option<String>,
+    /// Reported status, `completed` being the observed value.
+    pub status: Option<String>,
+    /// Exit code, once the command has finished.
+    pub exit_code: Option<i32>,
+    /// Combined stdout and stderr, when the CLI included it.
+    pub aggregated_output: Option<String>,
 }
 
 /// Token counts reported on a completed turn.
@@ -853,5 +916,66 @@ mod tests {
         assert_eq!(result.result, "");
         assert_eq!(result.usage, None);
         assert_eq!(result.thread_id.as_deref(), Some("thread_2"));
+    }
+
+    /// Both values transcribed from captured runs.
+    #[cfg(feature = "json")]
+    #[test]
+    fn item_type_reads_the_discriminator() {
+        let message: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"hi"}}"#,
+        )
+        .unwrap();
+        assert_eq!(message.item_type(), Some("agent_message"));
+
+        let command: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"git diff"}}"#,
+        )
+        .unwrap();
+        assert_eq!(command.item_type(), Some("command_execution"));
+
+        let turn: JsonLineEvent = serde_json::from_str(r#"{"type":"turn.completed"}"#).unwrap();
+        assert_eq!(turn.item_type(), None);
+    }
+
+    /// Transcribed from a captured `codex exec review` run, where the reviewer
+    /// reads the diff before commenting.
+    #[cfg(feature = "json")]
+    #[test]
+    fn command_execution_reads_a_finished_command() {
+        let event: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"git diff","aggregated_output":"","exit_code":0,"status":"completed"}}"#,
+        )
+        .unwrap();
+
+        let command = event.command_execution().unwrap();
+        assert_eq!(command.command.as_deref(), Some("git diff"));
+        assert_eq!(command.exit_code, Some(0));
+        assert_eq!(command.status.as_deref(), Some("completed"));
+    }
+
+    /// An `item.started` has no outcome yet, and must not invent one.
+    #[cfg(feature = "json")]
+    #[test]
+    fn command_execution_tolerates_a_command_still_running() {
+        let event: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"git diff"}}"#,
+        )
+        .unwrap();
+
+        let command = event.command_execution().unwrap();
+        assert_eq!(command.command.as_deref(), Some("git diff"));
+        assert_eq!(command.exit_code, None);
+        assert_eq!(command.status, None);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn command_execution_is_none_for_other_items() {
+        let event: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"hi"}}"#,
+        )
+        .unwrap();
+        assert!(event.command_execution().is_none());
     }
 }
