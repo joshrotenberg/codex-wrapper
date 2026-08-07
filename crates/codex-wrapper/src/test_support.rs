@@ -85,6 +85,12 @@ pub(crate) async fn wait_until_gone(pid: u32) -> bool {
     false
 }
 
+/// Public-in-crate view of [`is_running`], for a test that asserts a process
+/// is still alive rather than waiting for it to go.
+pub(crate) fn is_running_for_test(pid: u32) -> bool {
+    is_running(pid)
+}
+
 /// `true` while `pid` is a live process. Empty `ps` output means the PID is
 /// gone; a leading `Z` means it exited and is awaiting reaping.
 fn is_running(pid: u32) -> bool {

@@ -101,12 +101,14 @@ impl Drop for SpanOutcome {
 /// subprocesses for tool use. Without a group of its own, cancelling leaves
 /// those running (#78).
 #[cfg(unix)]
-pub(crate) fn own_process_group(cmd: &mut Command) {
-    cmd.process_group(0);
+pub(crate) fn own_process_group(cmd: &mut Command, enabled: bool) {
+    if enabled {
+        cmd.process_group(0);
+    }
 }
 
 #[cfg(not(unix))]
-pub(crate) fn own_process_group(_cmd: &mut Command) {}
+pub(crate) fn own_process_group(_cmd: &mut Command, _enabled: bool) {}
 
 /// Signal a process group, given the group leader's pid.
 ///
@@ -309,6 +311,7 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                     &codex.env,
                     codex.working_dir.as_deref(),
                     timeout,
+                    codex.process_group,
                 )
                 .await
             }
@@ -318,6 +321,7 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                     &command_args,
                     &codex.env,
                     codex.working_dir.as_deref(),
+                    codex.process_group,
                 )
                 .await
             }
@@ -361,11 +365,14 @@ where
 
         let mut outcome = SpanOutcome::start(outcome_span);
         let result = run_internal_inner(
-            &codex.binary,
-            &command_args,
-            &codex.env,
-            codex.working_dir.as_deref(),
-            None,
+            SpawnSpec {
+                binary: &codex.binary,
+                args: &command_args,
+                env: &codex.env,
+                working_dir: codex.working_dir.as_deref(),
+                stdin_prompt: None,
+                process_group: codex.process_group,
+            },
             Some(Box::pin(cancel)),
             codex.termination_grace,
         )
@@ -447,11 +454,14 @@ pub async fn run_codex_with_stdin_prompt(
 
         let mut outcome = SpanOutcome::start(outcome_span);
         let run = run_internal_inner(
-            &codex.binary,
-            &command_args,
-            &codex.env,
-            codex.working_dir.as_deref(),
-            Some(prompt),
+            SpawnSpec {
+                binary: &codex.binary,
+                args: &command_args,
+                env: &codex.env,
+                working_dir: codex.working_dir.as_deref(),
+                stdin_prompt: Some(prompt),
+                process_group: codex.process_group,
+            },
             None,
             Duration::from_secs(0),
         );
@@ -477,13 +487,17 @@ async fn run_internal(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     working_dir: Option<&std::path::Path>,
+    process_group: bool,
 ) -> Result<CommandOutput> {
     run_internal_inner(
-        binary,
-        args,
-        env,
-        working_dir,
-        None,
+        SpawnSpec {
+            binary,
+            args,
+            env,
+            working_dir,
+            stdin_prompt: None,
+            process_group,
+        },
         None,
         Duration::from_secs(0),
     )
@@ -492,15 +506,31 @@ async fn run_internal(
 
 type CancelFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
+/// Everything one spawn needs, gathered so the signature stays readable.
+struct SpawnSpec<'a> {
+    binary: &'a std::path::Path,
+    args: &'a [String],
+    env: &'a std::collections::HashMap<String, String>,
+    working_dir: Option<&'a std::path::Path>,
+    /// A prompt to deliver on stdin, for `codex exec -`.
+    stdin_prompt: Option<&'a str>,
+    /// Whether the run leads its own process group.
+    process_group: bool,
+}
+
 async fn run_internal_inner(
-    binary: &std::path::Path,
-    args: &[String],
-    env: &std::collections::HashMap<String, String>,
-    working_dir: Option<&std::path::Path>,
-    stdin_prompt: Option<&str>,
+    spec: SpawnSpec<'_>,
     cancel: Option<CancelFuture<'_>>,
     grace: Duration,
 ) -> Result<CommandOutput> {
+    let SpawnSpec {
+        binary,
+        args,
+        env,
+        working_dir,
+        stdin_prompt,
+        process_group,
+    } = spec;
     let mut cmd = Command::new(binary);
     cmd.args(args);
 
@@ -516,7 +546,7 @@ async fn run_internal_inner(
     // cancellation, or on task abort. Without this, tokio detaches the child
     // and codex keeps running with no handle left to stop it.
     cmd.kill_on_drop(true);
-    own_process_group(&mut cmd);
+    own_process_group(&mut cmd, process_group);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -540,7 +570,9 @@ async fn run_internal_inner(
 
     // Armed for the whole run. If this future is dropped, its Drop signals the
     // group, which is what reaches the subprocesses codex started.
-    let mut group = GroupKillGuard::new(child.id());
+    // Only meaningful when the run leads its own group. Sharing the parent's
+    // means signalling it would hit the parent too.
+    let mut group = GroupKillGuard::new(process_group.then(|| child.id()).flatten());
     let child_stdin = child.stdin.take();
 
     let write = async move {
@@ -620,12 +652,16 @@ async fn run_with_timeout(
     env: &std::collections::HashMap<String, String>,
     working_dir: Option<&std::path::Path>,
     timeout: Duration,
+    process_group: bool,
 ) -> Result<CommandOutput> {
-    tokio::time::timeout(timeout, run_internal(binary, args, env, working_dir))
-        .await
-        .map_err(|_| Error::Timeout {
-            timeout_seconds: timeout.as_secs(),
-        })?
+    tokio::time::timeout(
+        timeout,
+        run_internal(binary, args, env, working_dir, process_group),
+    )
+    .await
+    .map_err(|_| Error::Timeout {
+        timeout_seconds: timeout.as_secs(),
+    })?
 }
 
 #[cfg(test)]
@@ -1158,5 +1194,52 @@ mod tests {
             .await
             .unwrap();
         assert!(output.success);
+    }
+
+    /// Opting out is not cosmetic: without a group of its own, cancelling
+    /// reaches the direct child only and its subprocesses survive. That is the
+    /// terminal-attached contract, where the terminal is the supervisor and
+    /// Ctrl-C reaches the whole run directly instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opting_out_of_process_groups_leaves_the_subprocess() {
+        use crate::test_support::wait_until_gone;
+
+        let pid_file = crate::test_support::PidFile::new("group-optout");
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex-spawns-child.sh");
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .env(
+                "CODEX_WRAPPER_TEST_PIDFILE",
+                pid_file.path().to_str().unwrap(),
+            )
+            .process_group(false)
+            .build()
+            .expect("bash must exist");
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(400),
+            run_codex(&codex, vec!["exec".into()]),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the run should still have been going");
+
+        let (parent, child) = read_pids(&pid_file).await;
+        assert!(
+            wait_until_gone(parent).await,
+            "kill_on_drop still reaps the direct child ({parent})"
+        );
+        // The point of the contrast with
+        // `cancelling_kills_the_whole_process_group`.
+        assert!(
+            crate::test_support::is_running_for_test(child),
+            "with groups off, the subprocess ({child}) is expected to survive"
+        );
+        // Do not leave it behind.
+        signal_group(child, libc::SIGKILL);
+        unsafe { libc::kill(i32::try_from(child).unwrap_or(0), libc::SIGKILL) };
     }
 }

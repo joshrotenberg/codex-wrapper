@@ -260,6 +260,7 @@ pub struct Codex {
     pub(crate) global_args: Vec<String>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) termination_grace: Duration,
+    pub(crate) process_group: bool,
     pub(crate) retry_policy: Option<RetryPolicy>,
     pub(crate) tested_cli_version_range: (CliVersion, CliVersion),
 }
@@ -446,6 +447,7 @@ pub struct CodexBuilder {
     global_args: Vec<String>,
     timeout: Option<Duration>,
     termination_grace: Option<Duration>,
+    process_group: Option<bool>,
     retry_policy: Option<RetryPolicy>,
     tested_cli_version_range: Option<(CliVersion, CliVersion)>,
 }
@@ -522,6 +524,26 @@ impl CodexBuilder {
         self
     }
 
+    /// Whether each run gets its own process group. On by default.
+    ///
+    /// With a group of its own, cancelling a run reaches the subprocesses
+    /// codex spawned for tool use, not just codex itself (#78). That is the
+    /// right contract for a supervisor that cancels programmatically.
+    ///
+    /// Opting out puts the child in the parent's group, so a terminal Ctrl-C
+    /// reaches the whole run directly. Then a wrapper-side kill reaches only
+    /// the direct child, and its subprocesses survive. That is the right
+    /// contract for a terminal-attached host that shells out synchronously and
+    /// treats the terminal as the supervisor.
+    ///
+    /// Matches `claude-wrapper`'s option of the same name. No effect on
+    /// non-unix targets, which have no process groups.
+    #[must_use]
+    pub fn process_group(mut self, enabled: bool) -> Self {
+        self.process_group = Some(enabled);
+        self
+    }
+
     /// Append a raw global argument passed before any subcommand.
     #[must_use]
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
@@ -578,6 +600,7 @@ impl CodexBuilder {
             termination_grace: self
                 .termination_grace
                 .unwrap_or_else(|| Duration::from_secs(5)),
+            process_group: self.process_group.unwrap_or(true),
             timeout: self.timeout,
             retry_policy: self.retry_policy,
             tested_cli_version_range: self.tested_cli_version_range.unwrap_or((
