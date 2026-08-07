@@ -403,6 +403,38 @@ McpAddCommand::http("sentry", "https://mcp.sentry.dev/mcp")
 McpRemoveCommand::new("old-server").execute(&codex).await?;
 ```
 
+## Per-run MCP Servers
+
+`mcp add` mutates persistent config, which is the wrong tool for a host running isolated
+invocations: a cancelled run leaves residue and concurrent runs race. `McpConfigBuilder` scopes a
+server set to one run instead:
+
+```rust
+use codex_wrapper::{ExecCommand, McpConfigBuilder, McpServerConfig};
+
+let mcp = McpConfigBuilder::new()
+    .server("files", McpServerConfig::stdio("npx").arg("-y").arg("server"))
+    .server("docs", McpServerConfig::http("https://example.com/mcp")
+        .bearer_token_env_var("TOKEN"));
+
+let mut cmd = ExecCommand::new("summarize the docs");
+for override_ in mcp.config_overrides() {
+    cmd = cmd.config(override_);
+}
+```
+
+**These are `-c` overrides, not a config file.** codex has no `--mcp-config` flag; the only
+config-bearing options are `-c`, `--profile`, and `--ignore-user-config`. Overrides suit the
+purpose better anyway: nothing is written, nothing survives a cancelled run, and two runs cannot
+collide. A contract check feeds the builder's real output to the CLI so the generated forms
+cannot drift.
+
+For the cases that do want a file, `to_toml()` and `write_profile()` produce a
+`$CODEX_HOME/<name>.config.toml` that `--profile` layers. That one is persistent.
+
+Only the *name* of the environment variable holding a bearer token is ever recorded, never the
+token.
+
 ## Sandbox Execution
 
 Run commands inside the Codex sandbox:
