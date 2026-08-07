@@ -110,6 +110,9 @@ pub(crate) fn own_process_group(_cmd: &mut Command) {}
 
 /// Signal a process group, given the group leader's pid.
 ///
+/// Unix only: there is no non-unix counterpart, because every caller of this
+/// is itself gated on unix. A stub would only be dead code.
+///
 /// Negating the pid is what makes this reach the group rather than the leader
 /// alone. Errors are ignored: the only interesting failure is that the group
 /// is already gone, which is the desired state.
@@ -124,9 +127,6 @@ pub(crate) fn signal_group(pid: u32, signal: i32) {
         libc::kill(-pid, signal);
     }
 }
-
-#[cfg(not(unix))]
-pub(crate) fn signal_group(_pid: u32, _signal: i32) {}
 
 /// SIGKILLs the run's process group when dropped.
 ///
@@ -161,17 +161,23 @@ impl GroupKillGuard {
         signal_group(pid, libc::SIGKILL);
     }
 
+    /// No process groups here, so there is nothing to ask politely. The
+    /// child still dies with the dropped future via `kill_on_drop`.
     #[cfg(not(unix))]
     pub(crate) async fn terminate(&mut self, _grace: Duration) {
-        self.pid = None;
+        let _ = self.pid.take();
     }
 }
 
 impl Drop for GroupKillGuard {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.pid {
+        // Taken unconditionally so the field is read on every platform, not
+        // just the one that can act on it.
+        if let Some(pid) = self.pid.take() {
+            #[cfg(unix)]
             signal_group(pid, libc::SIGKILL);
+            #[cfg(not(unix))]
+            let _ = pid;
         }
     }
 }
