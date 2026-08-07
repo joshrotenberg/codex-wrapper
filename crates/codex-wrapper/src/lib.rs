@@ -177,6 +177,7 @@ pub mod error;
 pub mod exec;
 #[cfg(feature = "json")]
 pub mod history;
+pub mod mcp_config;
 pub mod retry;
 #[cfg(feature = "json")]
 pub mod session;
@@ -225,6 +226,7 @@ pub use error::{Error, FailureKind, Result};
 pub use exec::CommandOutput;
 #[cfg(feature = "json")]
 pub use history::{SessionFile, SessionLog, SessionMeta, SessionQuery};
+pub use mcp_config::{McpConfigBuilder, McpServerConfig};
 pub use retry::{BackoffStrategy, RetryPolicy};
 #[cfg(feature = "json")]
 pub use session::{Session, TurnRecord};

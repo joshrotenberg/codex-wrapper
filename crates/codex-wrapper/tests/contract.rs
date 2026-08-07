@@ -648,3 +648,56 @@ fn dangerous_flags_contract() {
         .args();
     assert_contract("ReviewCommand::dangerous", args, 2);
 }
+
+// ---------------------------------------------------------------------------
+// MCP config overrides (#87)
+//
+// codex has no --mcp-config flag, so per-run MCP servers are expressed as `-c`
+// overrides. These are generated strings rather than builder flags, so
+// `assert_contract` does not see them: this feeds the builder's real output to
+// the CLI and asserts config load accepts it.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn mcp_config_overrides_contract() {
+    use codex_wrapper::{McpConfigBuilder, McpServerConfig};
+
+    let mcp = McpConfigBuilder::new()
+        .server(
+            "files",
+            McpServerConfig::stdio("npx")
+                .arg("-y")
+                .arg("server")
+                .env("API_KEY", "x"),
+        )
+        .server(
+            "docs",
+            McpServerConfig::http("https://example.com/mcp").bearer_token_env_var("TOKEN"),
+        );
+
+    let mut args = vec!["exec".to_string(), "--strict-config".to_string()];
+    for override_ in mcp.config_overrides() {
+        args.push("-c".into());
+        args.push(override_);
+    }
+    args.push("probe".into());
+
+    let output = run_codex(&args);
+
+    // Config load happens before anything else, so any rejection of these
+    // overrides shows up here. A malformed server fails with `invalid
+    // transport`, and an unknown field with `unknown configuration field`.
+    assert!(
+        !output.contains("unknown configuration field"),
+        "the CLI rejected a generated MCP override:\n{output}"
+    );
+    assert!(
+        !output.contains("invalid transport"),
+        "the CLI could not read a generated MCP server:\n{output}"
+    );
+    assert!(
+        !output.contains("Error loading config.toml"),
+        "config load failed on the generated overrides:\n{output}"
+    );
+}
