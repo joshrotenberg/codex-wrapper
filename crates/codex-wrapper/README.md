@@ -815,6 +815,18 @@ let codex = Codex::builder()
 let result = run_codex_cancellable(&codex, args, async { shutdown.await }).await;
 ```
 
+Groups are on by default, and can be turned off:
+
+```rust
+let codex = Codex::builder().process_group(false).build()?;
+```
+
+Off, the child shares the parent's group, so a terminal Ctrl-C reaches the whole run directly and
+a wrapper-side cancel reaches only the direct child. That is the right contract for a
+terminal-attached host that shells out synchronously and treats the terminal as the supervisor;
+the default suits a supervisor that cancels programmatically. `claude-wrapper` has the same
+option under the same name.
+
 One limit remains: reaping needs the tokio runtime to still be running, so a future dropped as
 part of runtime shutdown may not get far enough. Process groups are unix-only; elsewhere this
 degrades to killing the direct child.
