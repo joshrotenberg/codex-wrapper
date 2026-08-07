@@ -2,13 +2,89 @@
 //! binary, including timeout and retry support.
 
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{Instrument, Span, debug, field, info_span};
 
 use crate::Codex;
 use crate::error::{Error, Result};
+
+/// Build the span covering one invocation.
+///
+/// The fields carry what identifies a run, never what it contains: no prompt
+/// and no environment. Both routinely hold content a host would not want in
+/// its logs, and a span is recorded whenever any subscriber is installed.
+pub(crate) fn command_span(name: &'static str, codex: &Codex, args: &[String]) -> Span {
+    let working_dir = codex
+        .working_dir
+        .as_ref()
+        .map_or_else(|| "(inherited)".to_string(), |p| p.display().to_string());
+
+    info_span!(
+        parent: Span::current(),
+        "codex",
+        otel.name = name,
+        subcommand = args.first().map_or("(none)", String::as_str),
+        binary = %codex.binary.display(),
+        working_dir = %working_dir,
+        outcome = field::Empty,
+        exit_code = field::Empty,
+        duration_ms = field::Empty,
+    )
+}
+
+/// Records how a run ended on its span, including when it does not end at all.
+///
+/// The dropped-future case is the one worth the machinery. Cancellation kills
+/// the process and runs nothing else, so without this the span would close
+/// with no outcome and an abandoned run would be indistinguishable from one
+/// still in progress. The span is passed in and held rather than read from
+/// [`Span::current`]: current-span tracking is the subscriber's job, and a
+/// subscriber that does not implement it would silently drop every record,
+/// including the drop-time one this exists for.
+pub(crate) struct SpanOutcome {
+    span: Span,
+    started: Instant,
+    settled: bool,
+}
+
+impl SpanOutcome {
+    pub(crate) fn start(span: Span) -> Self {
+        Self {
+            span,
+            started: Instant::now(),
+            settled: false,
+        }
+    }
+
+    pub(crate) fn settle(&mut self, outcome: &'static str, exit_code: Option<i32>) {
+        self.settled = true;
+        self.span.record("outcome", outcome);
+        self.span
+            .record("duration_ms", self.started.elapsed().as_millis() as u64);
+        if let Some(code) = exit_code {
+            self.span.record("exit_code", code);
+        }
+    }
+
+    fn settle_from(&mut self, result: &Result<CommandOutput>) {
+        match result {
+            Ok(output) => self.settle("ok", Some(output.exit_code)),
+            Err(Error::CommandFailed { exit_code, .. }) => self.settle("failed", Some(*exit_code)),
+            Err(Error::Timeout { .. }) => self.settle("timeout", None),
+            Err(_) => self.settle("error", None),
+        }
+    }
+}
+
+impl Drop for SpanOutcome {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle("cancelled", None);
+        }
+    }
+}
 
 /// Raw output from a Codex CLI invocation.
 ///
@@ -66,7 +142,16 @@ pub async fn run_codex_with_retry(
 
     match policy {
         Some(policy) => {
-            crate::retry::with_retry(policy, || run_codex_once(codex, args.clone())).await
+            // A parent span so the retry events and each attempt's own span
+            // nest under one run rather than arriving as unrelated lines.
+            let span = info_span!(
+                "codex.retry",
+                subcommand = args.first().map_or("(none)", String::as_str),
+                max_attempts = policy.max_attempts,
+            );
+            crate::retry::with_retry(policy, || run_codex_once(codex, args.clone()))
+                .instrument(span)
+                .await
         }
         None => run_codex_once(codex, args).await,
     }
@@ -112,30 +197,40 @@ pub(crate) fn shell_quote(arg: &str) -> String {
 }
 
 async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutput> {
+    let span = command_span("codex.exec", codex, &args);
+    let outcome_span = span.clone();
     let command_args = assemble_args(codex, args);
 
-    debug!(binary = %codex.binary.display(), args = ?command_args, "executing codex command");
+    async move {
+        debug!(binary = %codex.binary.display(), args = ?command_args, "executing codex command");
 
-    let output = if let Some(timeout) = codex.timeout {
-        run_with_timeout(
-            &codex.binary,
-            &command_args,
-            &codex.env,
-            codex.working_dir.as_deref(),
-            timeout,
-        )
-        .await?
-    } else {
-        run_internal(
-            &codex.binary,
-            &command_args,
-            &codex.env,
-            codex.working_dir.as_deref(),
-        )
-        .await?
-    };
-
-    Ok(output)
+        let mut outcome = SpanOutcome::start(outcome_span);
+        let result = match codex.timeout {
+            Some(timeout) => {
+                run_with_timeout(
+                    &codex.binary,
+                    &command_args,
+                    &codex.env,
+                    codex.working_dir.as_deref(),
+                    timeout,
+                )
+                .await
+            }
+            None => {
+                run_internal(
+                    &codex.binary,
+                    &command_args,
+                    &codex.env,
+                    codex.working_dir.as_deref(),
+                )
+                .await
+            }
+        };
+        outcome.settle_from(&result);
+        result
+    }
+    .instrument(span)
+    .await
 }
 
 /// Run a codex command and allow specific non-zero exit codes.
@@ -178,31 +273,41 @@ pub async fn run_codex_with_stdin_prompt(
     args: Vec<String>,
     prompt: &str,
 ) -> Result<CommandOutput> {
+    let span = command_span("codex.exec", codex, &args);
+    let outcome_span = span.clone();
     let command_args = assemble_args(codex, args);
 
-    debug!(
-        binary = %codex.binary.display(),
-        args = ?command_args,
-        prompt_bytes = prompt.len(),
-        "executing codex command with a stdin prompt"
-    );
+    async move {
+        debug!(
+            binary = %codex.binary.display(),
+            args = ?command_args,
+            prompt_bytes = prompt.len(),
+            "executing codex command with a stdin prompt"
+        );
 
-    let run = run_internal_inner(
-        &codex.binary,
-        &command_args,
-        &codex.env,
-        codex.working_dir.as_deref(),
-        Some(prompt),
-    );
+        let mut outcome = SpanOutcome::start(outcome_span);
+        let run = run_internal_inner(
+            &codex.binary,
+            &command_args,
+            &codex.env,
+            codex.working_dir.as_deref(),
+            Some(prompt),
+        );
 
-    match codex.timeout {
-        Some(timeout) => tokio::time::timeout(timeout, run)
-            .await
-            .map_err(|_| Error::Timeout {
-                timeout_seconds: timeout.as_secs(),
-            })?,
-        None => run.await,
+        let result = match codex.timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, run).await {
+                Ok(result) => result,
+                Err(_) => Err(Error::Timeout {
+                    timeout_seconds: timeout.as_secs(),
+                }),
+            },
+            None => run.await,
+        };
+        outcome.settle_from(&result);
+        result
     }
+    .instrument(span)
+    .await
 }
 
 async fn run_internal(
@@ -433,5 +538,154 @@ mod tests {
             wait_until_gone(pid).await,
             "codex ({pid}) survived the dropped future"
         );
+    }
+
+    /// Minimal recording subscriber, written by hand because #63 rules out a
+    /// new dependency and `tracing-subscriber` would be one. It collects every
+    /// field recorded on any span, which is all these tests need.
+    #[cfg(unix)]
+    mod recorder {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        #[derive(Clone, Default)]
+        pub(super) struct Recorder(Arc<Mutex<Vec<(String, String)>>>);
+
+        impl Recorder {
+            pub(super) fn value(&self, field: &str) -> Option<String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, value)| value.clone())
+            }
+        }
+
+        struct Collect<'a>(&'a mut Vec<(String, String)>);
+
+        impl Visit for Collect<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.push((field.name().into(), format!("{value:?}")));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.push((field.name().into(), value.into()));
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.0.push((field.name().into(), value.to_string()));
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.0.push((field.name().into(), value.to_string()));
+            }
+        }
+
+        impl Subscriber for Recorder {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, attrs: &Attributes<'_>) -> Id {
+                attrs.record(&mut Collect(&mut self.0.lock().unwrap()));
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, values: &Record<'_>) {
+                values.record(&mut Collect(&mut self.0.lock().unwrap()));
+            }
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn span_records_the_subcommand_and_a_clean_outcome() {
+        let recorder = recorder::Recorder::default();
+        let _guard = tracing::subscriber::set_default(recorder.clone());
+
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .build()
+            .expect("echo must exist");
+        run_codex(&codex, vec!["exec".into()]).await.unwrap();
+
+        assert_eq!(recorder.value("subcommand").as_deref(), Some("exec"));
+        assert_eq!(recorder.value("outcome").as_deref(), Some("ok"));
+        assert_eq!(recorder.value("exit_code").as_deref(), Some("0"));
+        assert!(recorder.value("duration_ms").is_some());
+    }
+
+    /// The prompt must never reach the span. It is in argv, so recording the
+    /// arguments would leak it into any host's logs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn span_does_not_carry_the_prompt() {
+        let recorder = recorder::Recorder::default();
+        let _guard = tracing::subscriber::set_default(recorder.clone());
+
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .build()
+            .expect("echo must exist");
+        run_codex(&codex, vec!["exec".into(), "a very secret prompt".into()])
+            .await
+            .unwrap();
+
+        let recorded = format!("{:?}", recorder.value("subcommand"));
+        assert!(!recorded.contains("secret"));
+        for field in ["binary", "working_dir", "outcome", "exit_code"] {
+            let value = recorder.value(field).unwrap_or_default();
+            assert!(
+                !value.contains("secret"),
+                "{field} leaked the prompt: {value}"
+            );
+        }
+    }
+
+    /// A dropped future records an outcome rather than leaving the span open,
+    /// so an abandoned run is distinguishable from one still in progress.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_run_is_recorded_as_cancelled() {
+        let recorder = recorder::Recorder::default();
+        let _guard = tracing::subscriber::set_default(recorder.clone());
+
+        let pid_file = crate::test_support::PidFile::new("span-cancel");
+        let codex = crate::test_support::blocking_codex(&pid_file)
+            .build()
+            .expect("bash must exist");
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(300),
+            run_codex(&codex, vec!["exec".into()]),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the run should still have been going");
+
+        assert_eq!(recorder.value("outcome").as_deref(), Some("cancelled"));
+    }
+
+    /// A wrapper timeout is its own outcome, distinct from a caller
+    /// cancelling: the run reached its deadline rather than being abandoned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_run_is_recorded_as_timeout() {
+        let recorder = recorder::Recorder::default();
+        let _guard = tracing::subscriber::set_default(recorder.clone());
+
+        let pid_file = crate::test_support::PidFile::new("span-timeout");
+        let codex = crate::test_support::blocking_codex(&pid_file)
+            .timeout(Duration::from_millis(300))
+            .build()
+            .expect("bash must exist");
+
+        let result = run_codex(&codex, vec!["exec".into()]).await;
+        assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
+
+        assert_eq!(recorder.value("outcome").as_deref(), Some("timeout"));
     }
 }

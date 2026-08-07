@@ -536,6 +536,34 @@ Global args precede the subcommand, the same order the spawn uses, because the p
 spawn paths share one assembly function. The output is quoted for a POSIX shell so it can be
 pasted, but no shell is involved at spawn time: args go to the process directly.
 
+## Tracing
+
+Every invocation is wrapped in a `tracing` span. Nothing is emitted unless the host installs a
+subscriber, and there is no separate metrics abstraction: `tracing` is the seam, and hosts that
+want metrics bridge it themselves.
+
+| Span | Raised by |
+|---|---|
+| `codex.exec` | any buffered run, one per attempt |
+| `codex.stream` | a streaming run, closing when the stream ends |
+| `codex.retry` | a retried run, parent to each attempt's span |
+
+Fields on open: `subcommand`, `binary`, `working_dir`. On close: `outcome`, `duration_ms`, and
+`exit_code` where the process produced one.
+
+`outcome` distinguishes four endings, including the two that are easy to miss:
+
+| `outcome` | Meaning |
+|---|---|
+| `ok` | exited zero |
+| `failed` | exited non-zero |
+| `timeout` | hit the client's timeout |
+| `cancelled` | the future was dropped, so the run was abandoned and the process killed |
+
+**The prompt is never recorded.** It travels in argv, so recording the arguments would put it in
+the host's logs; the same goes for the environment. Note that the existing `debug!` line does log
+the full argv, prompt included, as a debugging aid at that level.
+
 ## Cancellation
 
 Dropping the future returned by a command kills the spawned `codex` process. That covers a

@@ -24,7 +24,7 @@
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{Instrument, debug};
 
 use crate::Codex;
 use crate::command::CodexCommand;
@@ -81,9 +81,15 @@ async fn run_streaming<F>(
 where
     F: FnMut(JsonLineEvent),
 {
+    let span = crate::exec::command_span("codex.stream", codex, &args);
     let command_args = crate::exec::assemble_args(codex, args);
+    let _span_guard = span.clone().entered();
 
     debug!(binary = %codex.binary.display(), args = ?command_args, "streaming codex command");
+
+    // Settles on every exit below, and on drop for the one that has no exit:
+    // a cancelled stream, which is the outcome most easily missed.
+    let mut outcome = crate::exec::SpanOutcome::start(span.clone());
 
     let mut child_cmd = Command::new(&codex.binary);
     child_cmd.args(&command_args);
@@ -202,6 +208,7 @@ where
 
         let exit_code = status.code().unwrap_or(-1);
         if !status.success() {
+            outcome.settle("failed", Some(exit_code));
             return Err(Error::CommandFailed {
                 command: format!("{} {}", codex.binary.display(), command_args.join(" ")),
                 exit_code,
@@ -211,17 +218,27 @@ where
             });
         }
 
+        outcome.settle("ok", Some(exit_code));
         Ok(())
     };
 
+    // Dropped explicitly before awaiting: the guard exists so the span is the
+    // parent of everything above, while the await below must not hold it
+    // across a yield point.
+    drop(_span_guard);
+
     if let Some(timeout) = codex.timeout {
-        tokio::time::timeout(timeout, stream_future)
-            .await
-            .map_err(|_| Error::Timeout {
+        // On elapse the stream future is dropped, taking `outcome` with it,
+        // whose drop records the run as cancelled. That is the same path a
+        // caller dropping this future takes.
+        match tokio::time::timeout(timeout, stream_future.instrument(span.clone())).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Timeout {
                 timeout_seconds: timeout.as_secs(),
-            })?
+            }),
+        }
     } else {
-        stream_future.await
+        stream_future.instrument(span).await
     }
 }
 
