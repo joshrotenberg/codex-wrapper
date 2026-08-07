@@ -52,7 +52,7 @@
 //! // Each command is a separate builder
 //! let output = ExecCommand::new("fix the failing tests")
 //!     .model("o3")
-//!     .dangerously_bypass_approvals_and_sandbox()
+//!     .sandbox(codex_wrapper::SandboxMode::WorkspaceWrite)
 //!     .skip_git_repo_check()
 //!     .ephemeral()
 //!     .execute(&codex)
@@ -172,6 +172,7 @@ mod codex_home;
 pub mod command;
 #[cfg(feature = "config")]
 pub mod config;
+pub mod dangerous;
 pub mod error;
 pub mod exec;
 #[cfg(feature = "json")]

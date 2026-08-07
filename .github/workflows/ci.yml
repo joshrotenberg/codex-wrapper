@@ -151,5 +151,11 @@ jobs:
 
       # No auth is configured here, and none is needed: every check reads
       # `--help` or fails during config load, before the CLI contacts anything.
+      #
+      # CODEX_WRAPPER_ALLOW_DANGEROUS unlocks the two bypass flags gated in
+      # #86, so they stay covered by the contract check. Nothing here runs a
+      # model, so the flags are only ever compared against `--help`.
       - name: Check emitted flags against the CLI
+        env:
+          CODEX_WRAPPER_ALLOW_DANGEROUS: "1"
         run: cargo test --test contract --all-features -- --ignored

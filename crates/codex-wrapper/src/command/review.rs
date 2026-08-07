@@ -202,7 +202,7 @@ impl ReviewCommand {
     ///
     /// Allows configured hooks to run without confirmation. Use with caution.
     #[must_use]
-    pub fn dangerously_bypass_hook_trust(mut self) -> Self {
+    pub(crate) fn set_bypass_hook_trust(mut self) -> Self {
         self.dangerously_bypass_hook_trust = true;
         self
     }
@@ -219,7 +219,7 @@ impl ReviewCommand {
     }
 
     #[must_use]
-    pub fn dangerously_bypass_approvals_and_sandbox(mut self) -> Self {
+    pub(crate) fn set_bypass_approvals_and_sandbox(mut self) -> Self {
         self.dangerously_bypass_approvals_and_sandbox = true;
         self
     }
@@ -444,7 +444,7 @@ mod tests {
         let args = ReviewCommand::new()
             .uncommitted()
             .strict_config()
-            .dangerously_bypass_hook_trust()
+            .set_bypass_hook_trust()
             .args();
 
         assert_eq!(

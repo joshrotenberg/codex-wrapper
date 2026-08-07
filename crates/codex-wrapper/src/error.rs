@@ -113,6 +113,15 @@ pub enum Error {
         message: String,
     },
 
+    /// A bypass of codex's safety controls was requested without permission.
+    ///
+    /// See [`crate::dangerous`]. Never a command failure: nothing ran.
+    #[error("bypassing codex safety controls requires {variable} to be set")]
+    DangerousNotAllowed {
+        /// The environment variable that would have permitted it.
+        variable: &'static str,
+    },
+
     /// JSON parsing failed.
     #[cfg(feature = "json")]
     #[error("json parse error: {message}")]

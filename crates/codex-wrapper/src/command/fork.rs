@@ -169,14 +169,14 @@ impl ForkCommand {
     }
 
     #[must_use]
-    pub fn dangerously_bypass_approvals_and_sandbox(mut self) -> Self {
+    pub(crate) fn set_bypass_approvals_and_sandbox(mut self) -> Self {
         self.dangerously_bypass_approvals_and_sandbox = true;
         self
     }
 
     /// Bypass the hook trust prompt (`--dangerously-bypass-hook-trust`).
     #[must_use]
-    pub fn dangerously_bypass_hook_trust(mut self) -> Self {
+    pub(crate) fn set_bypass_hook_trust(mut self) -> Self {
         self.dangerously_bypass_hook_trust = true;
         self
     }
@@ -396,7 +396,7 @@ mod tests {
         let args = ForkCommand::new()
             .last()
             .strict_config()
-            .dangerously_bypass_hook_trust()
+            .set_bypass_hook_trust()
             .no_alt_screen()
             .remote("ws://host:9000")
             .remote_auth_token_env("CODEX_TOKEN")
