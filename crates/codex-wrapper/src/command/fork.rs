@@ -11,6 +11,7 @@ use crate::types::{ApprovalPolicy, SandboxMode};
 /// Fork a previous interactive Codex session, creating a new branch of conversation.
 #[derive(Debug, Clone)]
 pub struct ForkCommand {
+    approve_for_me: bool,
     session_id: Option<String>,
     prompt: Option<String>,
     last: bool,
@@ -41,6 +42,7 @@ impl ForkCommand {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            approve_for_me: false,
             session_id: None,
             prompt: None,
             last: false,
@@ -168,6 +170,19 @@ impl ForkCommand {
         self
     }
 
+    /// Route approval requests through automatic review, using the
+    /// workspace-write sandbox (`--approve-for-me`).
+    ///
+    /// Added in `codex-cli` 0.147.0. Older releases reject it as an unexpected
+    /// argument, so this is the one builder method with a floor above the
+    /// wrapper's tested minimum. `codex exec review` and `codex exec resume`
+    /// do not accept it.
+    #[must_use]
+    pub fn approve_for_me(mut self) -> Self {
+        self.approve_for_me = true;
+        self
+    }
+
     #[must_use]
     pub(crate) fn set_bypass_approvals_and_sandbox(mut self) -> Self {
         self.dangerously_bypass_approvals_and_sandbox = true;
@@ -286,6 +301,9 @@ impl CodexCommand for ForkCommand {
         if let Some(policy) = self.approval_policy {
             args.push("--ask-for-approval".into());
             args.push(policy.as_arg().into());
+        }
+        if self.approve_for_me {
+            args.push("--approve-for-me".into());
         }
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());

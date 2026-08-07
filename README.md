@@ -157,6 +157,7 @@ let output = ExecCommand::new("fix the failing tests")
 | `enable()` / `disable()` | `--enable` / `--disable` | Feature flags |
 | `oss()` | `--oss` | Use local OSS provider |
 | `local_provider()` | `--local-provider` | Specify lmstudio/ollama |
+| `approve_for_me()` | `--approve-for-me` | Route approvals through automatic review (needs 0.147.0) |
 | `prompt_via_stdin()` | *(prompt becomes `-`)* | Send the prompt on stdin |
 | `retry()` | *(client-side)* | Per-command retry policy |
 

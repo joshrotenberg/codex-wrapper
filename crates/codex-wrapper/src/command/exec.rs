@@ -66,6 +66,7 @@ pub(crate) fn effective_sandbox(
 /// ```
 #[derive(Debug, Clone)]
 pub struct ExecCommand {
+    approve_for_me: bool,
     prompt: Option<String>,
     prompt_via_stdin: bool,
     approval_policy: Option<ApprovalPolicyConfig>,
@@ -101,6 +102,7 @@ impl ExecCommand {
     #[must_use]
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
+            approve_for_me: false,
             prompt: Some(prompt.into()),
             prompt_via_stdin: false,
             approval_policy: None,
@@ -352,6 +354,19 @@ impl ExecCommand {
         self
     }
 
+    /// Route approval requests through automatic review, using the
+    /// workspace-write sandbox (`--approve-for-me`).
+    ///
+    /// Added in `codex-cli` 0.147.0. Older releases reject it as an unexpected
+    /// argument, so this is the one builder method with a floor above the
+    /// wrapper's tested minimum. `codex exec review` and `codex exec resume`
+    /// do not accept it.
+    #[must_use]
+    pub fn approve_for_me(mut self) -> Self {
+        self.approve_for_me = true;
+        self
+    }
+
     /// Bypass all approval prompts and sandbox restrictions.
     ///
     /// Passes `--dangerously-bypass-approvals-and-sandbox`. Use with caution.
@@ -527,6 +542,9 @@ impl CodexCommand for ExecCommand {
         if let Some(profile) = &self.profile {
             args.push("--profile".into());
             args.push(profile.clone());
+        }
+        if self.approve_for_me {
+            args.push("--approve-for-me".into());
         }
         if self.dangerously_bypass_approvals_and_sandbox {
             args.push("--dangerously-bypass-approvals-and-sandbox".into());

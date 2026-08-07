@@ -701,3 +701,65 @@ fn mcp_config_overrides_contract() {
         "config load failed on the generated overrides:\n{output}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --approve-for-me (0.147.0)
+//
+// This flag arrived in 0.147.0, which is the tested range's upper bound but
+// not its lower one. It cannot go in the maximal builders above, because the
+// contract job also runs against 0.145.0 where it does not exist.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn approve_for_me_contract() {
+    use codex_wrapper::CliVersion;
+
+    let introduced = CliVersion::new(0, 147, 0);
+    let installed = CliVersion::parse_version_output(&cli_version())
+        .expect("the CLI should report a parsable version");
+
+    // Asserted in both directions rather than skipped below 0.147, so a wrong
+    // floor is caught either way: if the flag turns up earlier than claimed,
+    // the else branch fails and the docs need correcting.
+    for subcommand in [
+        vec!["exec".to_string()],
+        vec!["fork".to_string()],
+        vec!["resume".to_string()],
+    ] {
+        let accepted = help_flags(&subcommand);
+        let name = subcommand.join(" ");
+        if installed >= introduced {
+            assert!(
+                accepted.contains("--approve-for-me"),
+                "`codex {name}` no longer accepts --approve-for-me on {installed}"
+            );
+        } else {
+            assert!(
+                !accepted.contains("--approve-for-me"),
+                "`codex {name}` accepts --approve-for-me on {installed}, earlier than \
+                 the 0.147.0 floor documented on the builder methods"
+            );
+        }
+    }
+
+    if installed < introduced {
+        return;
+    }
+
+    assert_contract(
+        "ExecCommand::approve_for_me",
+        ExecCommand::new("probe").approve_for_me().args(),
+        1,
+    );
+    assert_contract(
+        "ForkCommand::approve_for_me",
+        ForkCommand::new().last().approve_for_me().args(),
+        1,
+    );
+    assert_contract(
+        "ResumeCommand::approve_for_me",
+        ResumeCommand::new().last().approve_for_me().args(),
+        1,
+    );
+}

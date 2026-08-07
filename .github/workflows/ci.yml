@@ -138,7 +138,7 @@ jobs:
         # ends of the range declared by TESTED_CLI_VERSION_MIN and
         # TESTED_CLI_VERSION_MAX in src/version.rs, and a test asserts the two
         # stay in step. Bump deliberately, fixing any drift in the same change.
-        codex: ["0.145.0", "0.146.0"]
+        codex: ["0.145.0", "0.147.0"]
     steps:
       - uses: actions/checkout@v7
 
