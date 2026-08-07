@@ -122,6 +122,17 @@ pub enum Error {
         variable: &'static str,
     },
 
+    /// The run was cancelled by the caller.
+    ///
+    /// The process group was asked to stop, given `grace_seconds`, then
+    /// killed. Distinct from [`Error::Timeout`], which is the client's own
+    /// deadline rather than the caller's decision.
+    #[error("codex run cancelled (after a {grace_seconds}s grace period)")]
+    Cancelled {
+        /// How long the group was given to exit before being killed.
+        grace_seconds: u64,
+    },
+
     /// JSON parsing failed.
     #[cfg(feature = "json")]
     #[error("json parse error: {message}")]

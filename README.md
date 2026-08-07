@@ -799,12 +799,25 @@ let result = tokio::time::timeout(
 .await;
 ```
 
-Two limits are worth knowing:
+The whole process group goes, not just the `codex` process: each run is spawned into its own
+group, so the subprocesses codex started for tool use die with it.
 
-- The kill reaps the `codex` process itself. Subprocesses codex spawned for tool use are not
-  signalled and can outlive it.
-- Reaping needs the tokio runtime to still be running. A future dropped as part of runtime
-  shutdown may not get far enough to kill the child.
+`Drop` cannot wait, so that path is an immediate kill. For a graceful stop, cancel explicitly:
+
+```rust
+use codex_wrapper::exec::run_codex_cancellable;
+
+let codex = Codex::builder()
+    .termination_grace(Duration::from_secs(5))
+    .build()?;
+
+// SIGTERM to the group, then five seconds, then SIGKILL.
+let result = run_codex_cancellable(&codex, args, async { shutdown.await }).await;
+```
+
+One limit remains: reaping needs the tokio runtime to still be running, so a future dropped as
+part of runtime shutdown may not get far enough. Process groups are unix-only; elsewhere this
+degrades to killing the direct child.
 
 ## Retry Policy
 
