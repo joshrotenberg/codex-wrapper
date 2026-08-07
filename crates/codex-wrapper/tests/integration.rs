@@ -441,3 +441,51 @@ async fn timeout_fires() {
         "expected timeout error, got: {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// History (reads the real ~/.codex/sessions on this machine)
+// ---------------------------------------------------------------------------
+
+/// Reads every session log on this machine and asserts the parser gets
+/// something out of each. Ignored because it depends on local state, but it is
+/// the check that matters: the fixtures in `history.rs` are transcriptions,
+/// and only a real history has the full spread of CLI versions that wrote it.
+#[tokio::test]
+#[ignore]
+async fn history_reads_every_real_session() {
+    use codex_wrapper::history::{self, SessionQuery};
+
+    let sessions = history::list(&SessionQuery::new()).unwrap();
+    if sessions.is_empty() {
+        eprintln!("no sessions on this machine; nothing to check");
+        return;
+    }
+
+    let mut with_meta = 0;
+    let mut legacy = 0;
+    let mut empty = Vec::new();
+
+    for session in &sessions {
+        let log = history::read(&session.path).unwrap();
+        if log.meta.is_some() {
+            with_meta += 1;
+        }
+        if log.entries.iter().any(|e| e.entry_type.is_none()) {
+            legacy += 1;
+        }
+        if log.meta.is_none() && log.entries.is_empty() {
+            empty.push(session.path.clone());
+        }
+    }
+
+    eprintln!(
+        "{} sessions, {with_meta} with metadata, {legacy} containing legacy lines",
+        sessions.len()
+    );
+    assert!(
+        empty.is_empty(),
+        "parsed nothing at all out of {} file(s): {:?}",
+        empty.len(),
+        &empty[..empty.len().min(3)]
+    );
+}
