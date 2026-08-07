@@ -56,6 +56,15 @@ jobs:
       - name: Build the config feature alone
         run: cargo build --no-default-features --features config
 
+      # The lib builds and tests without default features, and every target
+      # builds with all of them, but nothing checked the intersection: a test
+      # naming a json-only API compiles under --all-features and breaks here.
+      # Clippy rather than check, so an unused import that only appears in
+      # this configuration fails too.
+      - name: Lint every target without default features
+        if: matrix.rust == 'stable'
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
       - name: Unit tests
         run: cargo test --lib --all-features
 

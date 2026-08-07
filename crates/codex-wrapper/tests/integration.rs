@@ -8,11 +8,13 @@
 
 use codex_wrapper::{
     ApplyCommand, ArchiveCommand, Codex, CodexCommand, CompletionCommand, DeleteCommand,
-    DoctorCommand, ExecCommand, ExecResumeCommand, FeaturesListCommand, ForkCommand,
-    LoginStatusCommand, McpListCommand, McpServerCommand, PluginListCommand,
-    PluginMarketplaceListCommand, ResumeCommand, ReviewCommand, SandboxCommand, Shell,
-    UnarchiveCommand, VersionCommand,
+    DoctorCommand, ExecCommand, FeaturesListCommand, ForkCommand, LoginStatusCommand,
+    McpListCommand, McpServerCommand, PluginListCommand, PluginMarketplaceListCommand,
+    ResumeCommand, ReviewCommand, SandboxCommand, Shell, UnarchiveCommand, VersionCommand,
 };
+// Only the json-gated tests use this one.
+#[cfg(feature = "json")]
+use codex_wrapper::ExecResumeCommand;
 
 fn codex() -> Codex {
     Codex::builder()
@@ -140,6 +142,7 @@ async fn mcp_list() {
     assert!(output.success);
 }
 
+#[cfg(feature = "json")]
 #[tokio::test]
 #[ignore]
 async fn mcp_list_json() {
@@ -185,6 +188,7 @@ async fn exec_simple() {
     assert!(output.success);
 }
 
+#[cfg(feature = "json")]
 #[tokio::test]
 #[ignore]
 async fn exec_json_lines() {
@@ -203,6 +207,7 @@ async fn exec_json_lines() {
     );
 }
 
+#[cfg(feature = "json")]
 #[tokio::test]
 #[ignore]
 async fn exec_query_result() {
@@ -223,6 +228,7 @@ async fn exec_query_result() {
     );
 }
 
+#[cfg(feature = "json")]
 #[tokio::test]
 #[ignore]
 async fn exec_resume_json_lines() {
@@ -262,6 +268,7 @@ async fn review_uncommitted() {
 /// Requires uncommitted changes in the working tree to review. With a clean
 /// tree the CLI exits non-zero and this reports that rather than a schema
 /// problem.
+#[cfg(feature = "json")]
 #[tokio::test]
 #[ignore]
 async fn review_query_result() {
@@ -450,6 +457,7 @@ async fn timeout_fires() {
 /// something out of each. Ignored because it depends on local state, but it is
 /// the check that matters: the fixtures in `history.rs` are transcriptions,
 /// and only a real history has the full spread of CLI versions that wrote it.
+#[cfg(feature = "json")]
 #[tokio::test]
 #[ignore]
 async fn history_reads_every_real_session() {
