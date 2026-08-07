@@ -163,6 +163,8 @@
 //! - `json` *(enabled by default)* - JSONL output parsing via `serde_json`
 
 #[cfg(feature = "json")]
+pub mod auth;
+#[cfg(feature = "json")]
 pub mod budget;
 pub mod command;
 pub mod error;
@@ -181,6 +183,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(feature = "json")]
+pub use auth::{AuthStatus, AuthStrategy};
 #[cfg(feature = "json")]
 pub use budget::{TokenBudget, TokenBudgetBuilder};
 pub use command::CodexCommand;
@@ -273,6 +277,35 @@ impl Codex {
     }
 
     /// Query the installed Codex CLI version.
+    /// Which credential this client's CLI would use, without spawning it.
+    ///
+    /// Honors a `CODEX_HOME` set on this client via
+    /// [`env`](CodexBuilder::env), falling back to the process environment.
+    /// See [`crate::auth`] for what the strategies mean and how they were
+    /// determined.
+    ///
+    /// ```no_run
+    /// use codex_wrapper::Codex;
+    ///
+    /// # fn example() -> codex_wrapper::Result<()> {
+    /// let codex = Codex::builder().build()?;
+    /// if !codex.auth_status().is_configured() {
+    ///     eprintln!("no credentials; run `codex login`");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "json")]
+    #[must_use]
+    pub fn auth_status(&self) -> crate::auth::AuthStatus {
+        crate::auth::detect_with(|key| {
+            self.env
+                .get(key)
+                .cloned()
+                .or_else(|| std::env::var(key).ok())
+        })
+    }
+
     pub async fn cli_version(&self) -> Result<CliVersion> {
         let output = VersionCommand::new().execute(self).await?;
         CliVersion::parse_version_output(&output.stdout).map_err(|e| Error::Io {
@@ -584,5 +617,37 @@ mod tests {
             err.to_string(),
             "CLI version 0.200.0 is outside the tested range 0.145.0..=0.146.0"
         );
+    }
+
+    /// A CODEX_HOME set on the client must win over the process environment,
+    /// or a client pointed at a different home reports the wrong credentials.
+    #[cfg(feature = "json")]
+    #[test]
+    fn auth_status_honors_a_client_codex_home() {
+        let dir =
+            std::env::temp_dir().join(format!("codex-wrapper-client-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-secret"}"#,
+        )
+        .unwrap();
+
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .env("CODEX_HOME", dir.to_str().unwrap())
+            .build()
+            .unwrap();
+
+        let status = codex.auth_status();
+        assert_eq!(status.codex_home, dir);
+        assert!(status.is_configured());
+        assert!(
+            !format!("{status:?}").contains("sk-secret"),
+            "the credential leaked into the status"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

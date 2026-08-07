@@ -563,6 +563,34 @@ Global args precede the subcommand, the same order the spawn uses, because the p
 spawn paths share one assembly function. The output is quoted for a POSIX shell so it can be
 pasted, but no shell is involved at spawn time: args go to the process directly.
 
+## Auth Pre-flight
+
+Check which credential the CLI would use, synchronously, without spawning it:
+
+```rust
+use codex_wrapper::{Codex, AuthStrategy};
+
+let codex = Codex::builder().build()?;
+let status = codex.auth_status();
+
+match &status.strategy {
+    AuthStrategy::None => eprintln!("no credentials; run `codex login`"),
+    AuthStrategy::Mixed { .. } => eprintln!("stored login and env key both set; the env key wins"),
+    other => println!("will authenticate via {other:?}"),
+}
+```
+
+Useful for health endpoints and for failing fast instead of on an opaque non-zero exit. It answers
+a different question from `LoginStatusCommand`, which asks the CLI whether a stored credential is
+still valid; this asks which one the CLI would pick. Keep both.
+
+Nothing here reads or returns a credential value. Environment variables are reported by name and
+stored credentials by mode.
+
+The resolution was read off `codex doctor` on 0.145.0 rather than assumed, including the case
+where both a stored login and an env key are present, which the CLI itself flags as "mixed auth
+signals" and resolves in favour of the environment key.
+
 ## Token Budgets
 
 Cap what a session may consume. The ceiling is in tokens, not dollars, because the CLI reports
