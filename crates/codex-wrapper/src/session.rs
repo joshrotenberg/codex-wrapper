@@ -89,6 +89,7 @@ pub struct Session {
     codex: Arc<Codex>,
     thread_id: Option<String>,
     history: Vec<TurnRecord>,
+    budget: Option<crate::budget::TokenBudget>,
 }
 
 impl Session {
@@ -100,6 +101,7 @@ impl Session {
             codex,
             thread_id: None,
             history: Vec::new(),
+            budget: None,
         }
     }
 
@@ -112,7 +114,42 @@ impl Session {
             codex,
             thread_id: Some(thread_id.into()),
             history: Vec::new(),
+            budget: None,
         }
+    }
+
+    /// Attach a [`TokenBudget`](crate::TokenBudget).
+    ///
+    /// Every turn's reported usage is added to it, and each turn is refused
+    /// with [`Error::TokenBudgetExceeded`] once the ceiling is reached. The
+    /// check happens before a turn starts, so the ceiling can be overshot by
+    /// at most the turn that crosses it: usage is only known once spent.
+    ///
+    /// The budget is [`Clone`] over shared state, so one can span several
+    /// sessions.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use codex_wrapper::{Codex, Session, TokenBudget};
+    ///
+    /// # fn example() -> codex_wrapper::Result<()> {
+    /// let codex = Arc::new(Codex::builder().build()?);
+    /// let budget = TokenBudget::builder().max_tokens(200_000).build();
+    /// let session = Session::new(codex).with_budget(budget.clone());
+    /// # let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_budget(mut self, budget: crate::budget::TokenBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// The attached budget, if any.
+    #[must_use]
+    pub fn budget(&self) -> Option<&crate::budget::TokenBudget> {
+        self.budget.as_ref()
     }
 
     /// Send a prompt, automatically routing to `exec` or `exec resume`.
@@ -219,6 +256,7 @@ impl Session {
     where
         F: FnMut(JsonLineEvent),
     {
+        self.check_budget()?;
         let codex = Arc::clone(&self.codex);
         let mut collected = Vec::new();
         let outcome = cmd
@@ -241,6 +279,7 @@ impl Session {
     where
         F: FnMut(JsonLineEvent),
     {
+        self.check_budget()?;
         let codex = Arc::clone(&self.codex);
         let mut collected = Vec::new();
         let outcome = cmd
@@ -335,12 +374,29 @@ impl Session {
         self.capture_thread_id(&events);
         let result = QueryResult::from_events(events);
         let events = result.events.clone();
+        if let Some(budget) = &self.budget {
+            // `None` when the turn reported no usage, which the budget counts
+            // separately rather than treating as zero consumption.
+            budget.record(result.usage.and_then(|usage| usage.total()));
+        }
         self.history.push(TurnRecord { result });
         events
     }
 
+    /// Refuse a turn that would run past the budget.
+    ///
+    /// Checked before the turn rather than after, so the ceiling stops the
+    /// next run instead of being noticed once more has already been spent.
+    fn check_budget(&self) -> Result<()> {
+        match &self.budget {
+            Some(budget) => budget.check(),
+            None => Ok(()),
+        }
+    }
+
     /// Run an [`ExecCommand`] and record the turn.
     async fn run_exec(&mut self, cmd: ExecCommand) -> Result<Vec<JsonLineEvent>> {
+        self.check_budget()?;
         match cmd.execute_json_lines(&self.codex).await {
             Ok(events) => Ok(self.record_turn(events)),
             Err(Error::CommandFailed {
@@ -365,6 +421,7 @@ impl Session {
 
     /// Run an [`ExecResumeCommand`] and record the turn.
     async fn run_resume(&mut self, cmd: ExecResumeCommand) -> Result<Vec<JsonLineEvent>> {
+        self.check_budget()?;
         match cmd.execute_json_lines(&self.codex).await {
             Ok(events) => Ok(self.record_turn(events)),
             Err(Error::CommandFailed {
@@ -627,5 +684,93 @@ mod tests {
         assert_eq!(session.total_turns(), 2);
         assert_eq!(session.total_tokens(), 330);
         assert_eq!(session.turns_missing_usage(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Budget (#60)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_session_without_a_budget_is_unaffected() {
+        let mut session = Session::new(test_codex());
+        session.record_turn(completed(500));
+        assert!(session.budget().is_none());
+        assert_eq!(session.total_tokens(), 500);
+    }
+
+    #[test]
+    fn turns_accumulate_into_the_attached_budget() {
+        let budget = crate::budget::TokenBudget::builder()
+            .max_tokens(1000)
+            .build();
+        let mut session = Session::new(test_codex()).with_budget(budget.clone());
+
+        session.record_turn(completed(300));
+        session.record_turn(completed(250));
+
+        assert_eq!(budget.total_tokens(), 550);
+        assert_eq!(session.total_tokens(), 550);
+    }
+
+    /// The ceiling stops the next turn rather than being noticed after more
+    /// has already been spent.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_turn_past_the_ceiling_is_refused_before_it_runs() {
+        let budget = crate::budget::TokenBudget::builder()
+            .max_tokens(100)
+            .build();
+        let mut session = streaming_session().with_budget(budget.clone());
+
+        // First turn runs and puts the budget over its ceiling: the fixture
+        // reports 165 tokens.
+        session.send("first").await.unwrap();
+        assert!(budget.total_tokens() >= 100);
+
+        let refused = session.send("second").await;
+        assert!(
+            matches!(refused, Err(Error::TokenBudgetExceeded { .. })),
+            "expected the second turn to be refused, got: {refused:?}"
+        );
+        // Refused before running, so no turn was recorded for it.
+        assert_eq!(session.total_turns(), 1);
+    }
+
+    /// A review reports usage as all zeros (#79), so a session of reviews
+    /// never advances a budget. Pinned rather than left as a surprise.
+    #[test]
+    fn an_all_zero_usage_turn_does_not_advance_the_budget() {
+        let budget = crate::budget::TokenBudget::builder()
+            .max_tokens(100)
+            .build();
+        let mut session = Session::new(test_codex()).with_budget(budget.clone());
+
+        for _ in 0..10 {
+            session.record_turn(completed(0));
+        }
+
+        assert_eq!(budget.total_tokens(), 0);
+        assert_eq!(
+            budget.turns_missing_usage(),
+            0,
+            "zero is reported, not missing"
+        );
+        assert!(budget.check().is_ok(), "a review-only session never stops");
+    }
+
+    /// A turn with no usage object must not read as zero consumption, which
+    /// would let an unmeasured session run forever against its ceiling.
+    #[test]
+    fn a_turn_with_no_usage_is_counted_as_unmeasured() {
+        let budget = crate::budget::TokenBudget::builder()
+            .max_tokens(100)
+            .build();
+        let mut session = Session::new(test_codex()).with_budget(budget.clone());
+
+        session.record_turn(turn(&[r#"{"type":"turn.completed"}"#]));
+
+        assert_eq!(budget.total_tokens(), 0);
+        assert_eq!(budget.turns_missing_usage(), 1);
+        assert_eq!(session.turns_missing_usage(), 1);
     }
 }

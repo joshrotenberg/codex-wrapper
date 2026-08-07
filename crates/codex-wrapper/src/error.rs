@@ -37,6 +37,19 @@ pub enum Error {
     #[error("codex command timed out after {timeout_seconds}s")]
     Timeout { timeout_seconds: u64 },
 
+    /// A session's token budget was reached.
+    ///
+    /// Denominated in tokens rather than money because the CLI reports token
+    /// counts and no cost; see [`crate::budget`].
+    #[error("token budget exceeded: {total_tokens} of {max_tokens} tokens")]
+    TokenBudgetExceeded {
+        /// Tokens recorded when the ceiling was hit. May exceed `max_tokens`,
+        /// since a turn's usage is only known once it has been spent.
+        total_tokens: u64,
+        /// The configured ceiling.
+        max_tokens: u64,
+    },
+
     /// JSON parsing failed.
     #[cfg(feature = "json")]
     #[error("json parse error: {message}")]
