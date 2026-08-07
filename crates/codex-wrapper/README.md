@@ -200,6 +200,18 @@ println!("tokens: {:?}", result.usage.and_then(|u| u.total()));
 `QueryResult` fields: `result`, `session_id`, `thread_id`, `usage`, and the
 full `events` stream as an escape hatch.
 
+### Typed accessors on events
+
+`JsonLineEvent` keeps every field in `extra`, with accessors for the ones worth naming:
+`session_id()`, `thread_id()`, `is_turn_completed()`, `is_turn_failed()`, `usage()`,
+`agent_message_text()`, `role()`, `content_text()`, `item_type()`, and `command_execution()`.
+
+**There are no incremental text deltas to consume.** Three captured runs, a one-word exec, a
+four-sentence exec, and a review, each delivered the whole assistant message in a single
+`item.completed`. The CLI emits no `item.updated` and no partial fields, and no flag changes
+that. So this crate has no equivalent of `claude-wrapper`'s `PartialMessageEvent`: streaming here
+delivers whole events as they arrive, not partial sentences.
+
 The CLI reports **token counts, not money**. There is no cost field to read.
 Converting tokens to dollars needs a per-model price table the CLI does not
 provide, so this crate does not guess at one.
