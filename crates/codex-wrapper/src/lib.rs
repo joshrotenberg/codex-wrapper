@@ -207,7 +207,7 @@ pub use command::sandbox::SandboxCommand;
 pub use command::session_mgmt::{ArchiveCommand, DeleteCommand, UnarchiveCommand};
 pub use command::update::UpdateCommand;
 pub use command::version::VersionCommand;
-pub use error::{Error, Result};
+pub use error::{Error, FailureKind, Result};
 pub use exec::CommandOutput;
 pub use retry::{BackoffStrategy, RetryPolicy};
 #[cfg(feature = "json")]

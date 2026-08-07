@@ -502,6 +502,33 @@ available for a plain minimum-version gate.
 
 ## Error Handling
 
+Failed commands are classified at the error boundary, so a caller branches on the class instead
+of substring-matching stderr:
+
+```rust
+use codex_wrapper::{ExecCommand, CodexCommand, Error, FailureKind};
+
+match ExecCommand::new("test").execute(&codex).await {
+    Ok(output) => println!("{}", output.stdout),
+    Err(e) => match e.failure_kind() {
+        Some(FailureKind::Auth) => eprintln!("re-authenticate and retry"),
+        Some(FailureKind::NotTrustedDirectory) => eprintln!("run in a git repo, or skip the check"),
+        Some(FailureKind::Config) => eprintln!("fix the config: {e}"),
+        Some(FailureKind::SessionNotFound) => eprintln!("start a new session"),
+        _ => eprintln!("{e}"),
+    },
+}
+```
+
+Classification reads stderr, because it has to: every failure observed on `codex-cli` 0.145.0
+exits 1, so the exit code carries no information. Each signature comes from a captured failing
+run. A failure matching none of them stays `Error::CommandFailed` with its output intact, so
+classification never loses anything.
+
+The classified failures are deterministic, so they are never retried even when their exit code is
+on a retry policy's list. Re-running gets the same rejection, and the CLI has already retried the
+auth case internally before it surfaces.
+
 All commands return `Result<T>`, with errors typed via `thiserror`:
 
 ```rust
