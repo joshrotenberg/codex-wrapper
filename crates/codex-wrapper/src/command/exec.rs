@@ -178,6 +178,9 @@ impl ExecCommand {
 
     /// The prompt to write to the child's stdin, if this command sends it
     /// there. `None` when the prompt travels in argv.
+    ///
+    /// Only the streaming path needs this, and that path is `json`-gated.
+    #[cfg(feature = "json")]
     pub(crate) fn stdin_prompt(&self) -> Option<&str> {
         self.prompt_via_stdin
             .then(|| self.prompt.as_deref().unwrap_or_default())

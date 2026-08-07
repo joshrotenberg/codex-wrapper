@@ -133,9 +133,7 @@ pub fn detect_in(codex_home: impl AsRef<Path>) -> AuthStatus {
 /// testable without mutating global state, which would make the tests race
 /// each other.
 pub(crate) fn detect_with(env: impl Fn(&str) -> Option<String>) -> AuthStatus {
-    let codex_home = env("CODEX_HOME")
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| default_codex_home(&env), PathBuf::from);
+    let codex_home = crate::codex_home::resolve(&env);
     let auth_file = codex_home.join("auth.json");
 
     let vars: Vec<&'static str> = AUTH_ENV_VARS
@@ -182,17 +180,6 @@ fn read_stored_mode(auth_file: &Path) -> Option<Option<String>> {
         return None;
     }
     Some(mode)
-}
-
-/// `$HOME/.codex`, the CLI's default.
-///
-/// Reads `HOME` through the same injected lookup as everything else, so a
-/// test never depends on the machine it runs on.
-fn default_codex_home(env: &impl Fn(&str) -> Option<String>) -> PathBuf {
-    env("HOME").filter(|home| !home.is_empty()).map_or_else(
-        || PathBuf::from(".codex"),
-        |home| Path::new(&home).join(".codex"),
-    )
 }
 
 #[cfg(test)]
