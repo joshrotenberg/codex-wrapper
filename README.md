@@ -536,6 +536,37 @@ Global args precede the subcommand, the same order the spawn uses, because the p
 spawn paths share one assembly function. The output is quoted for a POSIX shell so it can be
 pasted, but no shell is involved at spawn time: args go to the process directly.
 
+## Token Budgets
+
+Cap what a session may consume. The ceiling is in tokens, not dollars, because the CLI reports
+token counts and no monetary cost:
+
+```rust
+use std::sync::Arc;
+use codex_wrapper::{Codex, Session, TokenBudget};
+
+let budget = TokenBudget::builder()
+    .max_tokens(200_000)
+    .warn_at_tokens(150_000)
+    .on_warning(|total| eprintln!("at {total} tokens"))
+    .build();
+
+let mut session = Session::new(Arc::new(codex)).with_budget(budget.clone());
+```
+
+Each turn's reported usage is added to the budget, and a turn is refused with
+`Error::TokenBudgetExceeded` once the ceiling is reached. The check runs before a turn starts, so
+the ceiling can be overshot by at most the turn that crosses it: usage is only known once spent.
+`TokenBudget` is `Clone` over shared state, so one budget can span several sessions.
+
+Two things a budget cannot see, both worth knowing before relying on one:
+
+- A `turn.completed` with no `usage` object contributes nothing. `turns_missing_usage()` counts
+  those separately, so an unmeasured turn is distinguishable from a genuinely cheap one.
+- A review reports usage as all zeros, so a session of reviews never advances the budget.
+
+Treat the total as a floor on consumption rather than an exact measure.
+
 ## Tracing
 
 Every invocation is wrapped in a `tracing` span. Nothing is emitted unless the host installs a

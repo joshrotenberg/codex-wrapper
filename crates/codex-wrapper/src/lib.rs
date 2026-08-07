@@ -162,6 +162,8 @@
 //!
 //! - `json` *(enabled by default)* - JSONL output parsing via `serde_json`
 
+#[cfg(feature = "json")]
+pub mod budget;
 pub mod command;
 pub mod error;
 pub mod exec;
@@ -179,6 +181,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(feature = "json")]
+pub use budget::{TokenBudget, TokenBudgetBuilder};
 pub use command::CodexCommand;
 pub use command::apply::ApplyCommand;
 pub use command::completion::{CompletionCommand, Shell};
