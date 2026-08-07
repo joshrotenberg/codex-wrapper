@@ -105,6 +105,7 @@ where
     // cancellation, or on task abort. Without this, tokio detaches the child
     // and codex keeps running with no handle left to stop it.
     child_cmd.kill_on_drop(true);
+    crate::exec::own_process_group(&mut child_cmd);
 
     if let Some(dir) = &codex.working_dir {
         child_cmd.current_dir(dir);
@@ -118,6 +119,11 @@ where
         source: e,
         working_dir: codex.working_dir.clone(),
     })?;
+
+    // Armed for the whole stream. Dropping this future signals the group,
+    // which reaches the subprocesses codex started for tool use; kill_on_drop
+    // alone would leave those running (#78).
+    let mut group = crate::exec::GroupKillGuard::new(child.id());
 
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
@@ -219,6 +225,7 @@ where
         }
 
         outcome.settle("ok", Some(exit_code));
+        group.disarm();
         Ok(())
     };
 

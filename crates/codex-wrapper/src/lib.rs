@@ -259,6 +259,7 @@ pub struct Codex {
     pub(crate) env: HashMap<String, String>,
     pub(crate) global_args: Vec<String>,
     pub(crate) timeout: Option<Duration>,
+    pub(crate) termination_grace: Duration,
     pub(crate) retry_policy: Option<RetryPolicy>,
     pub(crate) tested_cli_version_range: (CliVersion, CliVersion),
 }
@@ -444,6 +445,7 @@ pub struct CodexBuilder {
     env: HashMap<String, String>,
     global_args: Vec<String>,
     timeout: Option<Duration>,
+    termination_grace: Option<Duration>,
     retry_policy: Option<RetryPolicy>,
     tested_cli_version_range: Option<(CliVersion, CliVersion)>,
 }
@@ -507,6 +509,19 @@ impl CodexBuilder {
         self
     }
 
+    /// How long a cancelled run's process group gets to exit before it is
+    /// killed. Defaults to five seconds.
+    ///
+    /// Applies to
+    /// [`run_codex_cancellable`](crate::exec::run_codex_cancellable), which
+    /// sends SIGTERM, waits this long, then sends SIGKILL. A dropped future
+    /// does not use it: `Drop` cannot wait, so it kills immediately.
+    #[must_use]
+    pub fn termination_grace(mut self, duration: Duration) -> Self {
+        self.termination_grace = Some(duration);
+        self
+    }
+
     /// Append a raw global argument passed before any subcommand.
     #[must_use]
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
@@ -560,6 +575,9 @@ impl CodexBuilder {
             working_dir: self.working_dir,
             env: self.env,
             global_args: self.global_args,
+            termination_grace: self
+                .termination_grace
+                .unwrap_or_else(|| Duration::from_secs(5)),
             timeout: self.timeout,
             retry_policy: self.retry_policy,
             tested_cli_version_range: self.tested_cli_version_range.unwrap_or((

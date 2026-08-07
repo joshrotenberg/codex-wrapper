@@ -68,6 +68,10 @@ impl SpanOutcome {
         }
     }
 
+    fn settle_from_ref(&mut self, result: &Result<CommandOutput>) {
+        self.settle_from(result);
+    }
+
     fn settle_from(&mut self, result: &Result<CommandOutput>) {
         match result {
             Ok(output) => self.settle("ok", Some(output.exit_code)),
@@ -86,6 +90,88 @@ impl Drop for SpanOutcome {
     fn drop(&mut self) {
         if !self.settled {
             self.settle("cancelled", None);
+        }
+    }
+}
+
+/// Put the child in its own process group, so the whole run can be signalled
+/// as a unit.
+///
+/// `kill_on_drop` reaps the direct child only, and codex spawns its own
+/// subprocesses for tool use. Without a group of its own, cancelling leaves
+/// those running (#78).
+#[cfg(unix)]
+pub(crate) fn own_process_group(cmd: &mut Command) {
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn own_process_group(_cmd: &mut Command) {}
+
+/// Signal a process group, given the group leader's pid.
+///
+/// Negating the pid is what makes this reach the group rather than the leader
+/// alone. Errors are ignored: the only interesting failure is that the group
+/// is already gone, which is the desired state.
+#[cfg(unix)]
+pub(crate) fn signal_group(pid: u32, signal: i32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: `kill` with a negative pid signals a process group. Passing a
+    // pid the OS has already reaped is defined and simply fails.
+    unsafe {
+        libc::kill(-pid, signal);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn signal_group(_pid: u32, _signal: i32) {}
+
+/// SIGKILLs the run's process group when dropped.
+///
+/// `kill_on_drop` handles the direct child; this is what reaches the
+/// subprocesses codex started. Drop cannot await, so this is the abrupt path.
+/// For a graceful one, see
+/// [`ExecCommand::execute_cancellable`](crate::ExecCommand::execute_cancellable).
+pub(crate) struct GroupKillGuard {
+    pid: Option<u32>,
+}
+
+impl GroupKillGuard {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    /// Stop killing on drop, once the run has finished on its own.
+    pub(crate) fn disarm(&mut self) {
+        self.pid = None;
+    }
+
+    /// Ask the group to stop, then insist after `grace`.
+    ///
+    /// Async, so it can wait, which is why it cannot live in `Drop`.
+    #[cfg(unix)]
+    pub(crate) async fn terminate(&mut self, grace: Duration) {
+        let Some(pid) = self.pid.take() else {
+            return;
+        };
+        signal_group(pid, libc::SIGTERM);
+        tokio::time::sleep(grace).await;
+        signal_group(pid, libc::SIGKILL);
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) async fn terminate(&mut self, _grace: Duration) {
+        self.pid = None;
+    }
+}
+
+impl Drop for GroupKillGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            signal_group(pid, libc::SIGKILL);
         }
     }
 }
@@ -237,6 +323,58 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
     .await
 }
 
+/// Run a codex command, stopping it gracefully if `cancel` resolves first.
+///
+/// On cancellation the run's process group is sent SIGTERM, given the client's
+/// [`termination_grace`](crate::CodexBuilder::termination_grace), then killed.
+/// Signalling the group rather than the pid is what reaches the subprocesses
+/// codex started for tool use; killing only the direct child leaves those
+/// running (#78).
+///
+/// Dropping the future instead is still safe, and still kills the group, but
+/// abruptly: `Drop` cannot wait out a grace period.
+///
+/// Retry does not apply. A cancelled run is a decision, not a transient
+/// failure.
+///
+/// On platforms without process groups this degrades to killing the child.
+pub async fn run_codex_cancellable<C>(
+    codex: &Codex,
+    args: Vec<String>,
+    cancel: C,
+) -> Result<CommandOutput>
+where
+    C: std::future::Future<Output = ()> + Send,
+{
+    let span = command_span("codex.exec", codex, &args);
+    let outcome_span = span.clone();
+    let command_args = assemble_args(codex, args);
+
+    async move {
+        debug!(binary = %codex.binary.display(), args = ?command_args, "executing cancellable codex command");
+
+        let mut outcome = SpanOutcome::start(outcome_span);
+        let result = run_internal_inner(
+            &codex.binary,
+            &command_args,
+            &codex.env,
+            codex.working_dir.as_deref(),
+            None,
+            Some(Box::pin(cancel)),
+            codex.termination_grace,
+        )
+        .await;
+
+        match &result {
+            Err(Error::Cancelled { .. }) => outcome.settle("cancelled", None),
+            other => outcome.settle_from_ref(other),
+        }
+        result
+    }
+    .instrument(span)
+    .await
+}
+
 /// Run a codex command and allow specific non-zero exit codes.
 pub async fn run_codex_allow_exit_codes(
     codex: &Codex,
@@ -308,6 +446,8 @@ pub async fn run_codex_with_stdin_prompt(
             &codex.env,
             codex.working_dir.as_deref(),
             Some(prompt),
+            None,
+            Duration::from_secs(0),
         );
 
         let result = match codex.timeout {
@@ -332,8 +472,19 @@ async fn run_internal(
     env: &std::collections::HashMap<String, String>,
     working_dir: Option<&std::path::Path>,
 ) -> Result<CommandOutput> {
-    run_internal_inner(binary, args, env, working_dir, None).await
+    run_internal_inner(
+        binary,
+        args,
+        env,
+        working_dir,
+        None,
+        None,
+        Duration::from_secs(0),
+    )
+    .await
 }
+
+type CancelFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
 async fn run_internal_inner(
     binary: &std::path::Path,
@@ -341,6 +492,8 @@ async fn run_internal_inner(
     env: &std::collections::HashMap<String, String>,
     working_dir: Option<&std::path::Path>,
     stdin_prompt: Option<&str>,
+    cancel: Option<CancelFuture<'_>>,
+    grace: Duration,
 ) -> Result<CommandOutput> {
     let mut cmd = Command::new(binary);
     cmd.args(args);
@@ -357,6 +510,7 @@ async fn run_internal_inner(
     // cancellation, or on task abort. Without this, tokio detaches the child
     // and codex keeps running with no handle left to stop it.
     cmd.kill_on_drop(true);
+    own_process_group(&mut cmd);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -366,51 +520,71 @@ async fn run_internal_inner(
         cmd.env(key, value);
     }
 
-    let output = match stdin_prompt {
-        // `Command::output` forces stdin to null, so the piped case cannot use
-        // it and spawns directly.
-        None => cmd.output().await.map_err(|e| Error::Io {
-            message: format!("failed to spawn codex: {e}"),
-            source: e,
-            working_dir: working_dir.map(|p| p.to_path_buf()),
-        })?,
-        Some(prompt) => {
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
+    // Always spawn rather than using `Command::output`: the pid is needed to
+    // signal the process group, and `output` does not surrender it. It also
+    // forces stdin to null, which the stdin-prompt path cannot use.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
 
-            let mut child = cmd.spawn().map_err(|e| Error::Io {
-                message: format!("failed to spawn codex: {e}"),
-                source: e,
-                working_dir: working_dir.map(|p| p.to_path_buf()),
-            })?;
+    let mut child = cmd.spawn().map_err(|e| Error::Io {
+        message: format!("failed to spawn codex: {e}"),
+        source: e,
+        working_dir: working_dir.map(|p| p.to_path_buf()),
+    })?;
 
-            let mut stdin = child.stdin.take().expect("stdin was configured as piped");
-            let write = async move {
-                use tokio::io::AsyncWriteExt;
-                stdin.write_all(prompt.as_bytes()).await?;
-                // Closing the write half is what tells the CLI the prompt is
-                // complete. Without it the child waits for more input.
-                stdin.shutdown().await
-            };
+    // Armed for the whole run. If this future is dropped, its Drop signals the
+    // group, which is what reaches the subprocesses codex started.
+    let mut group = GroupKillGuard::new(child.id());
+    let child_stdin = child.stdin.take();
 
-            // Concurrently, not sequentially: a prompt larger than the pipe
-            // buffer blocks until the child reads it, and a child that writes
-            // to stdout meanwhile blocks until we read that. Waiting for the
-            // write to finish before draining stdout would deadlock both.
-            let (write_result, output_result) = tokio::join!(write, child.wait_with_output());
-
-            write_result.map_err(|e| Error::Io {
-                message: format!("failed to write the prompt to codex stdin: {e}"),
-                source: e,
-                working_dir: working_dir.map(|p| p.to_path_buf()),
-            })?;
-            output_result.map_err(|e| Error::Io {
-                message: format!("failed to wait on codex: {e}"),
-                source: e,
-                working_dir: working_dir.map(|p| p.to_path_buf()),
-            })?
-        }
+    let write = async move {
+        let (Some(prompt), Some(mut stdin)) = (stdin_prompt, child_stdin) else {
+            return Ok(());
+        };
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(prompt.as_bytes()).await?;
+        // Closing the write half is what tells the CLI the prompt is
+        // complete. Without it the child waits for more input.
+        stdin.shutdown().await
     };
+
+    // Concurrently, not sequentially: a prompt larger than the pipe buffer
+    // blocks until the child reads it, and a child that writes to stdout
+    // meanwhile blocks until we read that. Waiting for the write to finish
+    // before draining stdout would deadlock both.
+    let run = async { tokio::join!(write, child.wait_with_output()) };
+
+    let finished = match cancel {
+        None => Some(run.await),
+        // Racing the run against the caller's signal. Cancellation here is
+        // graceful, which is the whole reason it cannot live in `Drop`:
+        // asking a process to stop and then waiting requires awaiting.
+        Some(cancel) => tokio::select! {
+            outcome = run => Some(outcome),
+            () = cancel => None,
+        },
+    };
+
+    let Some((write_result, output_result)) = finished else {
+        group.terminate(grace).await;
+        return Err(Error::Cancelled {
+            grace_seconds: grace.as_secs(),
+        });
+    };
+
+    write_result.map_err(|e| Error::Io {
+        message: format!("failed to write the prompt to codex stdin: {e}"),
+        source: e,
+        working_dir: working_dir.map(|p| p.to_path_buf()),
+    })?;
+    let output = output_result.map_err(|e| Error::Io {
+        message: format!("failed to wait on codex: {e}"),
+        source: e,
+        working_dir: working_dir.map(|p| p.to_path_buf()),
+    })?;
+
+    // Finished on its own, so there is no group left to kill.
+    group.disarm();
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -851,5 +1025,132 @@ mod tests {
             "{}",
             output.stderr
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Process groups and cancellation (#78)
+    // -----------------------------------------------------------------
+
+    /// A fake codex that spawns a child of its own, the way the real CLI does
+    /// for tool use, and the pids of both.
+    #[cfg(unix)]
+    fn spawning_codex(label: &str) -> (Codex, crate::test_support::PidFile) {
+        let pid_file = crate::test_support::PidFile::new(label);
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex-spawns-child.sh");
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .env(
+                "CODEX_WRAPPER_TEST_PIDFILE",
+                pid_file.path().to_str().unwrap(),
+            )
+            .build()
+            .expect("bash must exist");
+        (codex, pid_file)
+    }
+
+    #[cfg(unix)]
+    async fn read_pids(pid_file: &crate::test_support::PidFile) -> (u32, u32) {
+        for _ in 0..200 {
+            if let Ok(contents) = std::fs::read_to_string(pid_file.path()) {
+                let parse = |prefix: &str| -> Option<u32> {
+                    contents
+                        .lines()
+                        .find_map(|l| l.strip_prefix(prefix))
+                        .and_then(|v| v.trim().parse().ok())
+                };
+                if let (Some(parent), Some(child)) = (parse("parent="), parse("child=")) {
+                    return (parent, child);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the fake codex never recorded both pids");
+    }
+
+    /// The point of #78. `kill_on_drop` reaps the direct child only, so before
+    /// process groups the grandchild outlived a cancelled run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_kills_the_whole_process_group() {
+        use crate::test_support::wait_until_gone;
+
+        let (codex, pid_file) = spawning_codex("group-drop");
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(400),
+            run_codex(&codex, vec!["exec".into()]),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the run should still have been going");
+
+        let (parent, child) = read_pids(&pid_file).await;
+        assert!(wait_until_gone(parent).await, "codex ({parent}) survived");
+        assert!(
+            wait_until_gone(child).await,
+            "the subprocess ({child}) survived the cancelled run"
+        );
+    }
+
+    /// The graceful path: SIGTERM, a grace period, then SIGKILL. It cannot
+    /// live in `Drop`, which is why there is an explicit entry point.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_codex_cancellable_stops_the_group_gracefully() {
+        use crate::test_support::wait_until_gone;
+
+        let (codex, pid_file) = spawning_codex("group-cancel");
+        let codex = Codex::builder()
+            .binary(codex.binary())
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests")
+                    .join("fake-codex-spawns-child.sh")
+                    .to_str()
+                    .unwrap(),
+            )
+            .env(
+                "CODEX_WRAPPER_TEST_PIDFILE",
+                pid_file.path().to_str().unwrap(),
+            )
+            .termination_grace(Duration::from_millis(50))
+            .build()
+            .unwrap();
+
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        };
+        let result = run_codex_cancellable(&codex, vec!["exec".into()], cancel).await;
+
+        assert!(
+            matches!(result, Err(Error::Cancelled { .. })),
+            "expected a cancellation, got: {result:?}"
+        );
+
+        let (parent, child) = read_pids(&pid_file).await;
+        assert!(wait_until_gone(parent).await, "codex ({parent}) survived");
+        assert!(
+            wait_until_gone(child).await,
+            "the subprocess ({child}) survived cancellation"
+        );
+    }
+
+    /// A run that finishes before the signal must not be reported as
+    /// cancelled, and must not be killed on the way out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_that_finishes_first_is_not_cancelled() {
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .build()
+            .expect("echo must exist");
+
+        let never = std::future::pending::<()>();
+        let output = run_codex_cancellable(&codex, vec!["exec".into()], never)
+            .await
+            .unwrap();
+        assert!(output.success);
     }
 }

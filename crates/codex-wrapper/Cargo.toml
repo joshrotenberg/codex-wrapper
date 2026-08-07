@@ -32,6 +32,11 @@ tokio = { version = "1", features = ["process", "time", "io-util", "macros"] }
 tracing = { workspace = true }
 which = "8"
 
+# Signalling a process group needs kill(2). Already in the tree: tokio's
+# `process` feature depends on it on unix, so this adds nothing new.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 serde_json = "1"
 tokio = { workspace = true }
