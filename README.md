@@ -593,6 +593,33 @@ mixed in.
 
 A missing `config.toml` is `Ok(None)`, not an error. A malformed one is `Error::ConfigParse`.
 
+## Session History
+
+Read-side access to the logs the CLI writes under `$CODEX_HOME/sessions`:
+
+```rust
+use codex_wrapper::history::{self, SessionQuery};
+
+for session in history::list(&SessionQuery::new().after(2026, 8, 1))? {
+    let log = history::read(&session.path)?;
+    println!("{} in {:?}", session.id, log.meta.and_then(|m| m.cwd));
+}
+```
+
+Read-only; `ArchiveCommand` and `DeleteCommand` cover mutation through the CLI. Date filters are
+cheap because the layout is `sessions/<YYYY>/<MM>/<DD>/`, so they narrow directories without
+opening files. A `cwd` filter has to read each candidate's first line.
+
+**Two envelope generations.** Modern files wrap every line as
+`{timestamp, type, payload}`. Older ones have no envelope at all: the first line *is* the
+metadata and later lines are bare records. Both were present on the machine this was written on,
+205 files with 7 still carrying legacy lines, so a reader that assumed the current shape would
+return nothing for part of a real history. `SessionEntry::entry_type` is `None` for a legacy
+line, and every `SessionMeta` field is optional because older files record no `cwd` and no
+`cli_version`.
+
+Unknown entry types are kept rather than dropped, with the payload available as raw JSON.
+
 ## Auth Pre-flight
 
 Check which credential the CLI would use, synchronously, without spawning it:
