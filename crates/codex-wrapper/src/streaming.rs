@@ -209,13 +209,13 @@ where
         let exit_code = status.code().unwrap_or(-1);
         if !status.success() {
             outcome.settle("failed", Some(exit_code));
-            return Err(Error::CommandFailed {
-                command: format!("{} {}", codex.binary.display(), command_args.join(" ")),
+            return Err(Error::from_command_failure(
+                format!("{} {}", codex.binary.display(), command_args.join(" ")),
                 exit_code,
-                stdout: String::new(),
-                stderr: stderr_output,
-                working_dir: codex.working_dir.clone(),
-            });
+                String::new(),
+                stderr_output,
+                codex.working_dir.clone(),
+            ));
         }
 
         outcome.settle("ok", Some(exit_code));

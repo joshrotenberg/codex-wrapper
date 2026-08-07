@@ -126,6 +126,11 @@ impl RetryPolicy {
     pub(crate) fn should_retry(&self, error: &Error) -> bool {
         match error {
             Error::Timeout { .. } => self.retry_on_timeout,
+            // A classified failure is a deterministic rejection: bad
+            // credentials, a rejected config, an untrusted directory, a
+            // session that does not exist. Re-running gets the same answer,
+            // so these are never retried even when the exit code is listed.
+            _ if error.is_deterministic_failure() => false,
             Error::CommandFailed { exit_code, .. } => self.retry_exit_codes.contains(exit_code),
             _ => false,
         }

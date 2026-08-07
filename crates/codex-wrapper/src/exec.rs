@@ -71,9 +71,13 @@ impl SpanOutcome {
     fn settle_from(&mut self, result: &Result<CommandOutput>) {
         match result {
             Ok(output) => self.settle("ok", Some(output.exit_code)),
-            Err(Error::CommandFailed { exit_code, .. }) => self.settle("failed", Some(*exit_code)),
             Err(Error::Timeout { .. }) => self.settle("timeout", None),
-            Err(_) => self.settle("error", None),
+            // Covers the classified failures too, which are no longer
+            // CommandFailed but did still come from a process exit.
+            Err(e) => match e.exit_code() {
+                Some(code) => self.settle("failed", Some(code)),
+                None => self.settle("error", None),
+            },
         }
     }
 }
@@ -242,17 +246,29 @@ pub async fn run_codex_allow_exit_codes(
     let output = run_codex(codex, args).await;
 
     match output {
-        Err(Error::CommandFailed {
-            exit_code,
-            stdout,
-            stderr,
-            ..
-        }) if allowed_codes.contains(&exit_code) => Ok(CommandOutput {
-            stdout,
-            stderr,
-            exit_code,
-            success: false,
-        }),
+        // Matched on the exit code rather than the variant: classification
+        // moves some failures off CommandFailed, and an allowed code is
+        // allowed whatever the wrapper made of the message.
+        Err(e)
+            if e.exit_code()
+                .is_some_and(|code| allowed_codes.contains(&code)) =>
+        {
+            let exit_code = e.exit_code().unwrap_or(-1);
+            let (stdout, stderr) = match &e {
+                Error::CommandFailed { stdout, stderr, .. } => (stdout.clone(), stderr.clone()),
+                Error::Auth { message, .. }
+                | Error::Config { message, .. }
+                | Error::NotTrustedDirectory { message, .. }
+                | Error::SessionNotFound { message, .. } => (String::new(), message.clone()),
+                _ => (String::new(), String::new()),
+            };
+            Ok(CommandOutput {
+                stdout,
+                stderr,
+                exit_code,
+                success: false,
+            })
+        }
         other => other,
     }
 }
@@ -401,13 +417,13 @@ async fn run_internal_inner(
     let exit_code = output.status.code().unwrap_or(-1);
 
     if !output.status.success() {
-        return Err(Error::CommandFailed {
-            command: format!("{} {}", binary.display(), args.join(" ")),
+        return Err(Error::from_command_failure(
+            format!("{} {}", binary.display(), args.join(" ")),
             exit_code,
             stdout,
             stderr,
-            working_dir: working_dir.map(|p| p.to_path_buf()),
-        });
+            working_dir.map(|p| p.to_path_buf()),
+        ));
     }
 
     Ok(CommandOutput {
@@ -541,29 +557,58 @@ mod tests {
     }
 
     /// Minimal recording subscriber, written by hand because #63 rules out a
-    /// new dependency and `tracing-subscriber` would be one. It collects every
-    /// field recorded on any span, which is all these tests need.
+    /// new dependency and `tracing-subscriber` would be one.
+    ///
+    /// Installed once as the **global** default, fanning out to a per-thread
+    /// sink. A thread-local `set_default` is not enough: tracing caches
+    /// callsite interest globally, so a test running concurrently against no
+    /// subscriber caches this crate's span callsites as `never` and the
+    /// recording test then sees nothing. That produced a real flake, about one
+    /// run in three. A single always-enabled global subscriber keeps interest
+    /// stable, and the per-thread sink keeps tests isolated.
     #[cfg(unix)]
     mod recorder {
-        use std::sync::{Arc, Mutex};
+        use std::cell::RefCell;
+        use std::sync::{Arc, Mutex, Once};
 
         use tracing::field::{Field, Visit};
         use tracing::span::{Attributes, Id, Record};
         use tracing::{Event, Metadata, Subscriber};
 
-        #[derive(Clone, Default)]
-        pub(super) struct Recorder(Arc<Mutex<Vec<(String, String)>>>);
+        type Sink = Arc<Mutex<Vec<(String, String)>>>;
 
-        impl Recorder {
-            pub(super) fn value(&self, field: &str) -> Option<String> {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .rev()
-                    .find(|(name, _)| name == field)
-                    .map(|(_, value)| value.clone())
+        thread_local! {
+            static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+        }
+
+        struct Global;
+
+        impl Global {
+            fn collect(f: impl FnOnce(&mut Vec<(String, String)>)) {
+                SINK.with(|sink| {
+                    if let Some(sink) = sink.borrow().as_ref() {
+                        f(&mut sink.lock().unwrap());
+                    }
+                });
             }
+        }
+
+        impl Subscriber for Global {
+            /// Always true, so callsite interest is never cached as `never`.
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, attrs: &Attributes<'_>) -> Id {
+                Self::collect(|fields| attrs.record(&mut Collect(fields)));
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, values: &Record<'_>) {
+                Self::collect(|fields| values.record(&mut Collect(fields)));
+            }
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
         }
 
         struct Collect<'a>(&'a mut Vec<(String, String)>);
@@ -583,29 +628,46 @@ mod tests {
             }
         }
 
-        impl Subscriber for Recorder {
-            fn enabled(&self, _: &Metadata<'_>) -> bool {
-                true
+        pub(super) struct Recorder(Sink);
+
+        impl Recorder {
+            /// Start recording spans raised on this thread.
+            pub(super) fn install() -> Self {
+                static INIT: Once = Once::new();
+                INIT.call_once(|| {
+                    let _ = tracing::subscriber::set_global_default(Global);
+                });
+                let sink: Sink = Arc::new(Mutex::new(Vec::new()));
+                SINK.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&sink)));
+                Self(sink)
             }
-            fn new_span(&self, attrs: &Attributes<'_>) -> Id {
-                attrs.record(&mut Collect(&mut self.0.lock().unwrap()));
-                Id::from_u64(1)
+
+            pub(super) fn dump(&self) -> String {
+                format!("{:?}", self.0.lock().unwrap())
             }
-            fn record(&self, _: &Id, values: &Record<'_>) {
-                values.record(&mut Collect(&mut self.0.lock().unwrap()));
+
+            pub(super) fn value(&self, field: &str) -> Option<String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, value)| value.clone())
             }
-            fn record_follows_from(&self, _: &Id, _: &Id) {}
-            fn event(&self, _: &Event<'_>) {}
-            fn enter(&self, _: &Id) {}
-            fn exit(&self, _: &Id) {}
+        }
+
+        impl Drop for Recorder {
+            fn drop(&mut self) {
+                SINK.with(|slot| *slot.borrow_mut() = None);
+            }
         }
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn span_records_the_subcommand_and_a_clean_outcome() {
-        let recorder = recorder::Recorder::default();
-        let _guard = tracing::subscriber::set_default(recorder.clone());
+        let recorder = recorder::Recorder::install();
 
         let codex = Codex::builder()
             .binary("/bin/echo")
@@ -624,8 +686,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn span_does_not_carry_the_prompt() {
-        let recorder = recorder::Recorder::default();
-        let _guard = tracing::subscriber::set_default(recorder.clone());
+        let recorder = recorder::Recorder::install();
 
         let codex = Codex::builder()
             .binary("/bin/echo")
@@ -651,8 +712,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cancelled_run_is_recorded_as_cancelled() {
-        let recorder = recorder::Recorder::default();
-        let _guard = tracing::subscriber::set_default(recorder.clone());
+        let recorder = recorder::Recorder::install();
 
         let pid_file = crate::test_support::PidFile::new("span-cancel");
         let codex = crate::test_support::blocking_codex(&pid_file)
@@ -666,7 +726,12 @@ mod tests {
         .await;
         assert!(cancelled.is_err(), "the run should still have been going");
 
-        assert_eq!(recorder.value("outcome").as_deref(), Some("cancelled"));
+        assert_eq!(
+            recorder.value("outcome").as_deref(),
+            Some("cancelled"),
+            "recorded: {}",
+            recorder.dump()
+        );
     }
 
     /// A wrapper timeout is its own outcome, distinct from a caller
@@ -674,8 +739,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_run_is_recorded_as_timeout() {
-        let recorder = recorder::Recorder::default();
-        let _guard = tracing::subscriber::set_default(recorder.clone());
+        let recorder = recorder::Recorder::install();
 
         let pid_file = crate::test_support::PidFile::new("span-timeout");
         let codex = crate::test_support::blocking_codex(&pid_file)
@@ -687,5 +751,105 @@ mod tests {
         assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
 
         assert_eq!(recorder.value("outcome").as_deref(), Some("timeout"));
+    }
+
+    // -----------------------------------------------------------------
+    // Classification end to end (#85)
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn failing_codex(case: &str) -> Codex {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex-failure.sh");
+        Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .env("CODEX_WRAPPER_TEST_FAILURE", case)
+            .build()
+            .expect("bash must exist")
+    }
+
+    /// Classification has to happen on the spawn path, not only in the
+    /// constructor, or a caller still gets a bare CommandFailed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_spawn_returns_a_classified_error() {
+        use crate::error::FailureKind;
+
+        for (case, expected) in [
+            ("auth", FailureKind::Auth),
+            ("not-trusted", FailureKind::NotTrustedDirectory),
+            ("config", FailureKind::Config),
+            ("session", FailureKind::SessionNotFound),
+            ("mystery", FailureKind::Unclassified),
+        ] {
+            let codex = failing_codex(case);
+            let err = run_codex(&codex, vec!["exec".into()]).await.unwrap_err();
+            assert_eq!(err.failure_kind(), Some(expected), "case {case}: {err}");
+        }
+    }
+
+    /// A deterministic failure must not be retried even when its exit code is
+    /// on the retry list. Re-running gets the same rejection, and the auth
+    /// case has already been retried inside the CLI before it reaches here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_classified_failure_is_not_retried() {
+        let policy = crate::retry::RetryPolicy::new()
+            .max_attempts(3)
+            .initial_backoff(Duration::from_millis(1))
+            .retry_on_exit_codes([1]);
+
+        let started = Instant::now();
+        let codex = failing_codex("auth");
+        let err = run_codex_with_retry(&codex, vec!["exec".into()], Some(&policy))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Auth { .. }), "{err}");
+        // Three attempts with backoff would be visibly slower; this asserts
+        // the shape rather than the timing, but the timing corroborates it.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "looks like it retried: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An unclassified failure keeps the old retry behaviour.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unclassified_failure_still_retries() {
+        let policy = crate::retry::RetryPolicy::new()
+            .max_attempts(2)
+            .initial_backoff(Duration::from_millis(1))
+            .retry_on_exit_codes([1]);
+
+        let codex = failing_codex("mystery");
+        let err = run_codex_with_retry(&codex, vec!["exec".into()], Some(&policy))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::CommandFailed { .. }), "{err}");
+    }
+
+    /// The allow-list works on the exit code, so it still applies to a
+    /// failure that classification moved off CommandFailed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn allowed_exit_codes_still_apply_to_a_classified_failure() {
+        let codex = failing_codex("auth");
+        let output = run_codex_allow_exit_codes(&codex, vec!["exec".into()], &[1])
+            .await
+            .expect("exit code 1 was allowed");
+
+        assert_eq!(output.exit_code, 1);
+        assert!(!output.success);
+        assert!(
+            output.stderr.contains("401 Unauthorized"),
+            "{}",
+            output.stderr
+        );
     }
 }
