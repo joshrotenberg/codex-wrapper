@@ -166,7 +166,12 @@
 pub mod auth;
 #[cfg(feature = "json")]
 pub mod budget;
+// Only the read-side modules need it, and each sits behind its own feature.
+#[cfg(any(feature = "json", feature = "config"))]
+mod codex_home;
 pub mod command;
+#[cfg(feature = "config")]
+pub mod config;
 pub mod error;
 pub mod exec;
 pub mod retry;
@@ -211,6 +216,8 @@ pub use command::sandbox::SandboxCommand;
 pub use command::session_mgmt::{ArchiveCommand, DeleteCommand, UnarchiveCommand};
 pub use command::update::UpdateCommand;
 pub use command::version::VersionCommand;
+#[cfg(feature = "config")]
+pub use config::CodexConfig;
 pub use error::{Error, FailureKind, Result};
 pub use exec::CommandOutput;
 pub use retry::{BackoffStrategy, RetryPolicy};
@@ -277,6 +284,21 @@ impl Codex {
     }
 
     /// Query the installed Codex CLI version.
+    /// Read `config.toml` for this client's `CODEX_HOME`.
+    ///
+    /// `Ok(None)` when there is no config file. Requires the `config` feature.
+    /// See [`crate::config`] for what is typed and what stays raw.
+    #[cfg(feature = "config")]
+    pub fn config(&self) -> Result<Option<crate::config::CodexConfig>> {
+        let home = crate::codex_home::resolve(&|key| {
+            self.env
+                .get(key)
+                .cloned()
+                .or_else(|| std::env::var(key).ok())
+        });
+        crate::config::load_from_home(home)
+    }
+
     /// Which credential this client's CLI would use, without spawning it.
     ///
     /// Honors a `CODEX_HOME` set on this client via

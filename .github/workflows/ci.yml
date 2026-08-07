@@ -51,6 +51,11 @@ jobs:
       - name: Build without default features
         run: cargo build --no-default-features
 
+      # `config` is off by default, so --all-features is the only job that
+      # compiles it. This checks it also stands alone, without `json`.
+      - name: Build the config feature alone
+        run: cargo build --no-default-features --features config
+
       - name: Unit tests
         run: cargo test --lib --all-features
 

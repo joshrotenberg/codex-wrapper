@@ -99,6 +99,20 @@ pub enum Error {
         max_tokens: u64,
     },
 
+    /// A file on disk could not be parsed.
+    ///
+    /// Distinct from [`Error::Config`], which is the CLI rejecting a
+    /// configuration it was given. This one never ran a command, so it
+    /// carries no exit code and is not a [`FailureKind`].
+    #[cfg(feature = "config")]
+    #[error("failed to parse {}: {message}", path.display())]
+    ConfigParse {
+        /// The file that could not be parsed.
+        path: PathBuf,
+        /// The parser's message.
+        message: String,
+    },
+
     /// JSON parsing failed.
     #[cfg(feature = "json")]
     #[error("json parse error: {message}")]

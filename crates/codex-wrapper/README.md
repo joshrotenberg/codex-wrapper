@@ -563,6 +563,36 @@ Global args precede the subcommand, the same order the spawn uses, because the p
 spawn paths share one assembly function. The output is quoted for a POSIX shell so it can be
 pasted, but no shell is involved at spawn time: args go to the process directly.
 
+## Reading config.toml
+
+Behind the optional `config` feature, since it pulls in a TOML parser:
+
+```toml
+codex-wrapper = { version = "0.2", features = ["config"] }
+```
+
+```rust
+if let Some(config) = codex.config()? {
+    println!("model:    {:?}", config.model);
+    println!("profiles: {:?}", config.profiles);
+    println!("anything else: {:?}", config.raw.get("personality"));
+}
+```
+
+This matters more than it used to: `approval_policy` and `web_search` moved from `exec` flags to
+config keys in 0.145.0, so config is where some behavior is now decided.
+
+Only the keys the wrapper has a reason to know about are typed (`model`, `approval_policy`,
+`sandbox_mode`, `web_search`, `[features]`, `[projects]` trust levels). Everything else stays in
+`raw`, because modelling the whole file would mean tracking a schema that changes every release.
+
+**Profiles are files, not a table.** `--profile <name>` layers `$CODEX_HOME/<name>.config.toml`
+over the base config, so `profiles` lists those files. A `[profiles]` table is the legacy
+mechanism the CLI no longer writes; it is reported separately as `legacy_profiles` rather than
+mixed in.
+
+A missing `config.toml` is `Ok(None)`, not an error. A malformed one is `Error::ConfigParse`.
+
 ## Auth Pre-flight
 
 Check which credential the CLI would use, synchronously, without spawning it:
@@ -719,6 +749,7 @@ let output = RawCommand::new("cloud")
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `json` | Yes | JSONL output parsing via `serde_json` -- enables `execute_json_lines()`, `execute_json()`, `stream()`, `Session`, `QueryResult`, `JsonLineEvent` and typed accessors |
+| `config` | No | Read `~/.codex/config.toml` via the `toml` crate -- enables `codex.config()` and the `config` module |
 
 To disable default features:
 
