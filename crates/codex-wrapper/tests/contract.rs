@@ -289,11 +289,9 @@ fn exec_contract() {
         .local_provider("ollama")
         .sandbox(SandboxMode::WorkspaceWrite)
         .strict_config()
-        .dangerously_bypass_hook_trust()
         .ignore_user_config()
         .ignore_rules()
         .profile("default")
-        .dangerously_bypass_approvals_and_sandbox()
         .cd("/tmp")
         .skip_git_repo_check()
         .add_dir("/tmp/extra")
@@ -329,11 +327,9 @@ fn exec_resume_contract() {
         .image("/tmp/a.png")
         .model("o3")
         .strict_config()
-        .dangerously_bypass_hook_trust()
         .ignore_user_config()
         .ignore_rules()
         .output_schema("/tmp/schema.json")
-        .dangerously_bypass_approvals_and_sandbox()
         .skip_git_repo_check()
         .ephemeral()
         .json()
@@ -362,11 +358,9 @@ fn review_contract() {
         .model("o3")
         .title("probe")
         .strict_config()
-        .dangerously_bypass_hook_trust()
         .ignore_user_config()
         .ignore_rules()
         .output_schema("/tmp/schema.json")
-        .dangerously_bypass_approvals_and_sandbox()
         .skip_git_repo_check()
         .ephemeral()
         .json()
@@ -397,8 +391,6 @@ fn fork_contract() {
         .profile("default")
         .sandbox(SandboxMode::WorkspaceWrite)
         .approval_policy(ApprovalPolicy::Never)
-        .dangerously_bypass_approvals_and_sandbox()
-        .dangerously_bypass_hook_trust()
         .strict_config()
         .no_alt_screen()
         .remote("ws://127.0.0.1:9000")
@@ -432,8 +424,6 @@ fn resume_contract() {
         .profile("default")
         .sandbox(SandboxMode::WorkspaceWrite)
         .approval_policy(ApprovalPolicy::Never)
-        .dangerously_bypass_approvals_and_sandbox()
-        .dangerously_bypass_hook_trust()
         .strict_config()
         .no_alt_screen()
         .include_non_interactive()
@@ -612,4 +602,49 @@ fn top_level_review_remains_a_subset_of_exec_review() {
          narrower and needs updating",
         cli_version()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Dangerous flags (#86)
+//
+// These moved behind `dangerous::DangerousClient`, so a maximal builder can no
+// longer emit them and the checks above lost that coverage. This restores it
+// through the gated path. The contract CI job sets the variable; a local run
+// without it fails loudly rather than skipping, because a silent skip here
+// would read as "these flags are still verified" when they are not.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn dangerous_flags_contract() {
+    use codex_wrapper::dangerous::{ALLOW_DANGEROUS_ENV, Dangerous, DangerousClient};
+
+    let allow = DangerousClient::new().unwrap_or_else(|_| {
+        panic!(
+            "set {ALLOW_DANGEROUS_ENV}=1 to run this check; without it the two \
+             dangerous flags are not verified against the CLI at all"
+        )
+    });
+
+    let args = ExecCommand::new("probe")
+        .bypass_approvals_and_sandbox(&allow)
+        .unwrap()
+        .bypass_hook_trust(&allow)
+        .unwrap()
+        .args();
+    assert!(
+        args.iter()
+            .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+        "{args:?}"
+    );
+    assert_contract("ExecCommand::dangerous", args, 1);
+
+    let args = ReviewCommand::new()
+        .uncommitted()
+        .bypass_approvals_and_sandbox(&allow)
+        .unwrap()
+        .bypass_hook_trust(&allow)
+        .unwrap()
+        .args();
+    assert_contract("ReviewCommand::dangerous", args, 2);
 }

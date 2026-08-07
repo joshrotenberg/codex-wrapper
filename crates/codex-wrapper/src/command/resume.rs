@@ -171,14 +171,14 @@ impl ResumeCommand {
     }
 
     #[must_use]
-    pub fn dangerously_bypass_approvals_and_sandbox(mut self) -> Self {
+    pub(crate) fn set_bypass_approvals_and_sandbox(mut self) -> Self {
         self.dangerously_bypass_approvals_and_sandbox = true;
         self
     }
 
     /// Bypass the hook trust prompt (`--dangerously-bypass-hook-trust`).
     #[must_use]
-    pub fn dangerously_bypass_hook_trust(mut self) -> Self {
+    pub(crate) fn set_bypass_hook_trust(mut self) -> Self {
         self.dangerously_bypass_hook_trust = true;
         self
     }

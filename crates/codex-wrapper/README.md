@@ -146,7 +146,7 @@ let output = ExecCommand::new("fix the failing tests")
 | `add_dir()` | `--add-dir` | Additional writable dirs |
 | `ignore_user_config()` | `--ignore-user-config` | Ignore user-level config |
 | `ignore_rules()` | `--ignore-rules` | Ignore project rules files |
-| `dangerously_bypass_hook_trust()` | `--dangerously-bypass-hook-trust` | Skip the hook trust prompt |
+| *(see Dangerous Operations)* | `--dangerously-bypass-hook-trust` | Skip the hook trust prompt |
 | `ephemeral()` | `--ephemeral` | Don't persist session |
 | `output_schema()` | `--output-schema` | JSON Schema for response |
 | `color()` | `--color` | Color output mode |
@@ -544,6 +544,35 @@ match ExecCommand::new("test").execute(&codex).await {
     Err(e) => eprintln!("{e}"),
 }
 ```
+
+## Dangerous Operations
+
+`--dangerously-bypass-approvals-and-sandbox` turns off every approval prompt and the sandbox;
+`--dangerously-bypass-hook-trust` lets configured hooks run unconfirmed. Neither is a plain
+builder method, because a method name is not a barrier: it can be reached by autocomplete, by a
+copied snippet, or by an agent editing a call site.
+
+Both need two things that cannot happen by accident together:
+
+```rust
+use codex_wrapper::{CodexCommand, ExecCommand};
+use codex_wrapper::dangerous::{Dangerous, DangerousClient};
+
+// Errors unless CODEX_WRAPPER_ALLOW_DANGEROUS is set in the environment.
+let allow = DangerousClient::new()?;
+
+let output = ExecCommand::new("rewrite everything")
+    .bypass_approvals_and_sandbox(&allow)?   // re-checks the variable here
+    .execute(&codex)
+    .await?;
+```
+
+The second check is not redundant: a client built while the variable was set stops working the
+moment it is unset, so permission reflects the environment when the bypass is applied rather than
+whenever the client happened to be created. Without it, the call returns
+`Error::DangerousNotAllowed`.
+
+The variable name matches `claude-wrapper`'s `CLAUDE_WRAPPER_ALLOW_DANGEROUS`.
 
 ## Previewing the Command
 

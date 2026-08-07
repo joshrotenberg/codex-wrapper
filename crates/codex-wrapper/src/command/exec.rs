@@ -309,7 +309,7 @@ impl ExecCommand {
     ///
     /// Allows configured hooks to run without confirmation. Use with caution.
     #[must_use]
-    pub fn dangerously_bypass_hook_trust(mut self) -> Self {
+    pub(crate) fn set_bypass_hook_trust(mut self) -> Self {
         self.dangerously_bypass_hook_trust = true;
         self
     }
@@ -356,7 +356,7 @@ impl ExecCommand {
     ///
     /// Passes `--dangerously-bypass-approvals-and-sandbox`. Use with caution.
     #[must_use]
-    pub fn dangerously_bypass_approvals_and_sandbox(mut self) -> Self {
+    pub(crate) fn set_bypass_approvals_and_sandbox(mut self) -> Self {
         self.dangerously_bypass_approvals_and_sandbox = true;
         self
     }
@@ -783,7 +783,7 @@ impl ExecResumeCommand {
     ///
     /// Allows configured hooks to run without confirmation. Use with caution.
     #[must_use]
-    pub fn dangerously_bypass_hook_trust(mut self) -> Self {
+    pub(crate) fn set_bypass_hook_trust(mut self) -> Self {
         self.dangerously_bypass_hook_trust = true;
         self
     }
@@ -824,7 +824,7 @@ impl ExecResumeCommand {
     ///
     /// Passes `--dangerously-bypass-approvals-and-sandbox`. Use with caution.
     #[must_use]
-    pub fn dangerously_bypass_approvals_and_sandbox(mut self) -> Self {
+    pub(crate) fn set_bypass_approvals_and_sandbox(mut self) -> Self {
         self.dangerously_bypass_approvals_and_sandbox = true;
         self
     }
@@ -1033,8 +1033,8 @@ mod tests {
     #[test]
     fn exec_args_hook_trust() {
         let args = ExecCommand::new("go")
-            .dangerously_bypass_approvals_and_sandbox()
-            .dangerously_bypass_hook_trust()
+            .set_bypass_approvals_and_sandbox()
+            .set_bypass_hook_trust()
             .args();
 
         assert_eq!(
@@ -1082,7 +1082,7 @@ mod tests {
         let args = ExecResumeCommand::new()
             .last()
             .strict_config()
-            .dangerously_bypass_hook_trust()
+            .set_bypass_hook_trust()
             .args();
 
         assert_eq!(
