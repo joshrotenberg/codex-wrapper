@@ -48,7 +48,7 @@ where
     if !args.contains(&"--json".to_string()) {
         args.push("--json".into());
     }
-    run_streaming(codex, args, handler).await
+    run_streaming(codex, args, cmd.stdin_prompt(), handler).await
 }
 
 /// Stream JSONL events from `codex exec resume`, invoking `handler` for each
@@ -65,11 +65,19 @@ where
     if !args.contains(&"--json".to_string()) {
         args.push("--json".into());
     }
-    run_streaming(codex, args, handler).await
+    run_streaming(codex, args, None, handler).await
 }
 
 /// Core streaming implementation shared by both exec variants.
-async fn run_streaming<F>(codex: &Codex, args: Vec<String>, mut handler: F) -> Result<()>
+///
+/// `stdin_prompt` carries the prompt for a `codex exec -` run, where it is
+/// delivered on stdin rather than in argv.
+async fn run_streaming<F>(
+    codex: &Codex,
+    args: Vec<String>,
+    stdin_prompt: Option<&str>,
+    mut handler: F,
+) -> Result<()>
 where
     F: FnMut(JsonLineEvent),
 {
@@ -79,7 +87,11 @@ where
 
     let mut child_cmd = Command::new(&codex.binary);
     child_cmd.args(&command_args);
-    child_cmd.stdin(std::process::Stdio::null());
+    if stdin_prompt.is_some() {
+        child_cmd.stdin(std::process::Stdio::piped());
+    } else {
+        child_cmd.stdin(std::process::Stdio::null());
+    }
     child_cmd.stdout(std::process::Stdio::piped());
     child_cmd.stderr(std::process::Stdio::piped());
 
@@ -103,6 +115,32 @@ where
 
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
+    // Taken up front so the write does not borrow `child`, which the wait
+    // below needs.
+    let child_stdin = child.stdin.take();
+
+    // Write the prompt and close the handle, so the CLI stops waiting for
+    // more. This runs as part of the streamed future rather than before it,
+    // so a prompt larger than the pipe buffer cannot block the readers.
+    let stdin_task = async {
+        let (Some(prompt), Some(mut stdin)) = (stdin_prompt, child_stdin) else {
+            return Ok(());
+        };
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .map_err(|e| Error::Io {
+                message: format!("failed to write the prompt to codex stdin: {e}"),
+                source: e,
+                working_dir: codex.working_dir.clone(),
+            })?;
+        stdin.shutdown().await.map_err(|e| Error::Io {
+            message: format!("failed to close codex stdin: {e}"),
+            source: e,
+            working_dir: codex.working_dir.clone(),
+        })
+    };
 
     let stdout_task = async {
         let reader = BufReader::new(stdout);
@@ -146,7 +184,9 @@ where
     };
 
     let stream_future = async {
-        let (events_result, stderr_result) = tokio::join!(stdout_task, stderr_task);
+        let (stdin_result, events_result, stderr_result) =
+            tokio::join!(stdin_task, stdout_task, stderr_task);
+        stdin_result?;
         let events = events_result?;
         let stderr_output = stderr_result?;
 

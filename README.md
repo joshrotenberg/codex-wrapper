@@ -157,7 +157,26 @@ let output = ExecCommand::new("fix the failing tests")
 | `enable()` / `disable()` | `--enable` / `--disable` | Feature flags |
 | `oss()` | `--oss` | Use local OSS provider |
 | `local_provider()` | `--local-provider` | Specify lmstudio/ollama |
+| `prompt_via_stdin()` | *(prompt becomes `-`)* | Send the prompt on stdin |
 | `retry()` | *(client-side)* | Per-command retry policy |
+
+### Prompts on stdin
+
+For prompts too large or awkward for argv, `ExecCommand::from_stdin` sends the prompt on the
+child's stdin and emits `codex exec -`:
+
+```rust
+use codex_wrapper::{CodexCommand, ExecCommand};
+
+let patch = std::fs::read_to_string("huge.patch")?;
+let output = ExecCommand::from_stdin(format!("Review this patch:\n{patch}"))
+    .execute(&codex)
+    .await?;
+```
+
+Retry does not apply to a stdin prompt. Any policy set on the command or the client is ignored
+for it: a second attempt would need to write the prompt into a pipe the first has already
+consumed, and retrying with an empty stdin would be worse than not retrying.
 
 ## Typed Result
 
