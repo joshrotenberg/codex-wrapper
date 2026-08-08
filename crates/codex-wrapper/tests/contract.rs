@@ -673,7 +673,10 @@ fn mcp_config_overrides_contract() {
         )
         .server(
             "docs",
-            McpServerConfig::http("https://example.com/mcp").bearer_token_env_var("TOKEN"),
+            McpServerConfig::http("https://example.com/mcp")
+                .bearer_token_env_var("TOKEN")
+                .env_http_header("X-Identity", "IDENTITY_TOKEN")
+                .required(),
         );
 
     let mut args = vec!["exec".to_string(), "--strict-config".to_string()];

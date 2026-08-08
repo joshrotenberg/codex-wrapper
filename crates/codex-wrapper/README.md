@@ -428,7 +428,8 @@ use codex_wrapper::{ExecCommand, McpConfigBuilder, McpServerConfig};
 let mcp = McpConfigBuilder::new()
     .server("files", McpServerConfig::stdio("npx").arg("-y").arg("server"))
     .server("docs", McpServerConfig::http("https://example.com/mcp")
-        .bearer_token_env_var("TOKEN"));
+        .env_http_header("X-Identity", "IDENTITY_TOKEN")
+        .required());
 
 let mut cmd = ExecCommand::new("summarize the docs");
 for override_ in mcp.config_overrides() {
@@ -445,8 +446,9 @@ cannot drift.
 For the cases that do want a file, `to_toml()` and `write_profile()` produce a
 `$CODEX_HOME/<name>.config.toml` that `--profile` layers. That one is persistent.
 
-Only the *name* of the environment variable holding a bearer token is ever recorded, never the
-token.
+`bearer_token_env_var()` and `env_http_header()` record only environment-variable names, never
+the secret values. `required()` makes an unavailable server fail the run instead of silently
+continuing without a capability the caller expected.
 
 ## Sandbox Execution
 
