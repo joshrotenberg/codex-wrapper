@@ -158,7 +158,6 @@ where
     let stdout_task = async {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
-        let mut events = Vec::new();
         while let Some(line) = lines.next_line().await.map_err(|e| Error::Io {
             message: format!("failed to read stdout line: {e}"),
             source: e,
@@ -166,7 +165,7 @@ where
         })? {
             if line.trim_start().starts_with('{') {
                 match serde_json::from_str::<JsonLineEvent>(&line) {
-                    Ok(event) => events.push(event),
+                    Ok(event) => handler(event),
                     Err(source) => {
                         return Err(Error::Json {
                             message: format!("failed to parse JSONL event: {line}"),
@@ -176,7 +175,7 @@ where
                 }
             }
         }
-        Ok::<Vec<JsonLineEvent>, Error>(events)
+        Ok::<(), Error>(())
     };
 
     let stderr_task = async {
@@ -197,15 +196,11 @@ where
     };
 
     let stream_future = async {
-        let (stdin_result, events_result, stderr_result) =
+        let (stdin_result, stdout_result, stderr_result) =
             tokio::join!(stdin_task, stdout_task, stderr_task);
         stdin_result?;
-        let events = events_result?;
+        stdout_result?;
         let stderr_output = stderr_result?;
-
-        for event in events {
-            handler(event);
-        }
 
         let status = child.wait().await.map_err(|e| Error::Io {
             message: format!("failed to wait on codex process: {e}"),
@@ -291,6 +286,46 @@ mod tests {
         assert!(
             types.contains(&"turn.completed"),
             "expected turn.completed, got: {types:?}"
+        );
+    }
+
+    /// The API promises delivery as events arrive. Buffering until stdout
+    /// closes loses a thread id when a long-running process or its host dies
+    /// after `thread.started`, which is the durability use case for streaming.
+    #[tokio::test]
+    async fn stream_exec_delivers_an_event_while_the_child_is_still_running() {
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg("-c")
+            .arg(
+                "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-early\"}'; sleep 10",
+            )
+            .build()
+            .expect("bash must exist");
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+        let (sent, delivered) = tokio::sync::oneshot::channel();
+        let mut sent = Some(sent);
+
+        let task = tokio::spawn(async move {
+            stream_exec(&codex, &cmd, move |event| {
+                if event.thread_id() == Some("thread-early")
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
+                }
+            })
+            .await
+        });
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), delivered).await;
+        let still_running = !task.is_finished();
+        task.abort();
+        let _ = task.await;
+
+        assert!(delivered.is_ok(), "callback waited for the child to exit");
+        assert!(
+            still_running,
+            "the fixture must still be running when the callback fires"
         );
     }
 
