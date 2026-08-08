@@ -34,6 +34,8 @@
 //! mcp_servers.<name>.env={API_KEY="x"}
 //! mcp_servers.<name>.url="https://example.com/mcp"
 //! mcp_servers.<name>.bearer_token_env_var="TOKEN"
+//! mcp_servers.<name>.env_http_headers={X-Identity="IDENTITY_TOKEN"}
+//! mcp_servers.<name>.required=true
 //! ```
 //!
 //! # Example
@@ -66,6 +68,7 @@ enum Transport {
     Http {
         url: String,
         bearer_token_env_var: Option<String>,
+        env_http_headers: BTreeMap<String, String>,
     },
 }
 
@@ -77,6 +80,7 @@ enum Transport {
 pub struct McpServerConfig {
     transport: Transport,
     env: BTreeMap<String, String>,
+    required: bool,
 }
 
 impl McpServerConfig {
@@ -89,6 +93,7 @@ impl McpServerConfig {
                 args: Vec::new(),
             },
             env: BTreeMap::new(),
+            required: false,
         }
     }
 
@@ -99,8 +104,10 @@ impl McpServerConfig {
             transport: Transport::Http {
                 url: url.into(),
                 bearer_token_env_var: None,
+                env_http_headers: BTreeMap::new(),
             },
             env: BTreeMap::new(),
+            required: false,
         }
     }
 
@@ -137,6 +144,37 @@ impl McpServerConfig {
         self
     }
 
+    /// Source an HTTP request header from an environment variable.
+    ///
+    /// Both arguments are names: `header` is sent on each request and
+    /// `env_var` is read by Codex for its value. The secret itself therefore
+    /// stays out of argv and persistent configuration. Ignored for a stdio
+    /// server.
+    #[must_use]
+    pub fn env_http_header(
+        mut self,
+        header: impl Into<String>,
+        env_var: impl Into<String>,
+    ) -> Self {
+        if let Transport::Http {
+            env_http_headers, ..
+        } = &mut self.transport
+        {
+            env_http_headers.insert(header.into(), env_var.into());
+        }
+        self
+    }
+
+    /// Require this server to initialize successfully.
+    ///
+    /// Codex otherwise treats an unavailable MCP server as a warning and may
+    /// continue without capabilities the caller expected to be present.
+    #[must_use]
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
     /// `key = value` pairs for this server, without the `mcp_servers.<name>.`
     /// prefix.
     fn fields(&self) -> Vec<(String, String)> {
@@ -152,10 +190,21 @@ impl McpServerConfig {
             Transport::Http {
                 url,
                 bearer_token_env_var,
+                env_http_headers,
             } => {
                 out.push(("url".into(), toml_string(url)));
                 if let Some(var) = bearer_token_env_var {
                     out.push(("bearer_token_env_var".into(), toml_string(var)));
+                }
+                if !env_http_headers.is_empty() {
+                    let pairs: Vec<String> = env_http_headers
+                        .iter()
+                        .map(|(header, var)| format!("{}={}", toml_key(header), toml_string(var)))
+                        .collect();
+                    out.push((
+                        "env_http_headers".into(),
+                        format!("{{{}}}", pairs.join(",")),
+                    ));
                 }
             }
         }
@@ -166,6 +215,9 @@ impl McpServerConfig {
                 .map(|(k, v)| format!("{}={}", toml_key(k), toml_string(v)))
                 .collect();
             out.push(("env".into(), format!("{{{}}}", pairs.join(","))));
+        }
+        if self.required {
+            out.push(("required".into(), "true".into()));
         }
         out
     }
@@ -309,7 +361,10 @@ mod tests {
             )
             .server(
                 "docs",
-                McpServerConfig::http("https://example.com/mcp").bearer_token_env_var("TOKEN"),
+                McpServerConfig::http("https://example.com/mcp")
+                    .bearer_token_env_var("TOKEN")
+                    .env_http_header("X-Identity", "IDENTITY_TOKEN")
+                    .required(),
             );
 
         assert_eq!(
@@ -317,6 +372,8 @@ mod tests {
             vec![
                 r#"mcp_servers.docs.url="https://example.com/mcp""#,
                 r#"mcp_servers.docs.bearer_token_env_var="TOKEN""#,
+                r#"mcp_servers.docs.env_http_headers={X-Identity="IDENTITY_TOKEN"}"#,
+                "mcp_servers.docs.required=true",
                 r#"mcp_servers.files.command="npx""#,
                 r#"mcp_servers.files.args=["-y","server"]"#,
             ]
@@ -385,6 +442,33 @@ mod tests {
         assert_eq!(
             stdio.config_overrides(),
             vec![r#"mcp_servers.s.command="run""#]
+        );
+
+        let stdio = McpConfigBuilder::new().server(
+            "s",
+            McpServerConfig::stdio("run").env_http_header("X-Identity", "TOKEN"),
+        );
+        assert_eq!(
+            stdio.config_overrides(),
+            vec![r#"mcp_servers.s.command="run""#]
+        );
+    }
+
+    #[test]
+    fn env_backed_http_headers_are_ordered_and_escape_header_names() {
+        let mcp = McpConfigBuilder::new().server(
+            "api",
+            McpServerConfig::http("https://example.com/mcp")
+                .env_http_header("x.second", "SECOND_TOKEN")
+                .env_http_header("x-first", "FIRST_TOKEN"),
+        );
+
+        assert_eq!(
+            mcp.config_overrides(),
+            vec![
+                r#"mcp_servers.api.url="https://example.com/mcp""#,
+                r#"mcp_servers.api.env_http_headers={x-first="FIRST_TOKEN","x.second"="SECOND_TOKEN"}"#,
+            ]
         );
     }
 
