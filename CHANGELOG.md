@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1](https://github.com/joshrotenberg/codex-wrapper/compare/v0.3.0...v0.3.1) - 2026-08-08
+
+### Added
+
+- support env-backed HTTP MCP headers ([#114](https://github.com/joshrotenberg/codex-wrapper/pull/114))
+
+### Fixed
+
+- deliver JSONL events before process exit ([#115](https://github.com/joshrotenberg/codex-wrapper/pull/115))
+
 ## [0.3.0](https://github.com/joshrotenberg/codex-wrapper/compare/v0.2.0...v0.3.0) - 2026-08-07
 
 ### Added
