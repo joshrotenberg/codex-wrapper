@@ -16,6 +16,54 @@ pub(crate) struct PidFile {
     path: PathBuf,
 }
 
+/// Complete environment recorded by the fake Codex child, cleaned up on
+/// drop. Each caller supplies a unique label because unit tests share a pid.
+pub(crate) struct EnvCapture {
+    path: PathBuf,
+}
+
+impl EnvCapture {
+    pub(crate) fn new(label: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("codex-wrapper-{}-{label}.env", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Self { path }
+    }
+
+    pub(crate) fn read(&self) -> std::collections::BTreeMap<String, String> {
+        let contents = std::fs::read_to_string(&self.path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", self.path.display()));
+        contents
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+}
+
+impl Drop for EnvCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A [`Codex`] builder backed by a fake binary that records its full
+/// environment and then emits valid JSONL for streaming callers.
+pub(crate) fn env_capturing_codex(capture: &EnvCapture) -> CodexBuilder {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fake-codex-capture-env.sh");
+    Codex::builder()
+        .binary("/bin/bash")
+        .arg(script.to_str().expect("fixture path is utf-8"))
+        .env(
+            "CODEX_WRAPPER_ENV_CAPTURE",
+            capture.path.to_str().expect("capture path is utf-8"),
+        )
+}
+
 impl PidFile {
     /// Reserve a PID file path. `label` distinguishes concurrent tests, which
     /// share a process ID because cargo runs them as threads.

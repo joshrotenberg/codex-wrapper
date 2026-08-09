@@ -68,10 +68,39 @@ Options:
 - `binary()` -- path to `codex` binary (auto-detected via `PATH` by default)
 - `working_dir()` -- working directory for commands
 - `env()` / `envs()` -- environment variables
+- `clear_env()` -- clear inherited variables before applying `env()` / `envs()`
 - `timeout_secs()` / `timeout()` -- command timeout
 - `config()` -- global config overrides (`-c key=value`)
 - `enable()` / `disable()` -- global feature flags
 - `retry()` -- default retry policy
+
+### Child Environment Policy
+
+Children inherit the wrapper process's environment by default for backwards
+compatibility. Use `clear_env()` to construct the direct Codex child's
+environment explicitly:
+
+```rust
+use codex_wrapper::Codex;
+
+let codex = Codex::builder()
+    .clear_env()
+    .envs([
+        ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        ("CODEX_HOME", "/srv/codex/agent-home"),
+    ])
+    .build()?;
+```
+
+`clear_env()` is call-order independent, so explicit entries survive whether
+they are added before or after it. `config()` and `auth_status()` use the same
+effective environment as the child and do not fall back to ambient variables
+for a cleared client. Debug output reports explicit variable names but never
+their values.
+
+This is direct-child environment control, not OS or same-user isolation. It
+does not prevent Codex from reading files, process metadata, sockets, or other
+resources available to its user and sandbox.
 
 ### Command Builders
 
