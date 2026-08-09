@@ -346,6 +346,36 @@ mod tests {
         assert!(!events.is_empty(), "expected at least one event");
     }
 
+    /// Contract captured from a paid 0.145.0 run: the callback receives the
+    /// typed terminal before the process reports its non-zero exit, including
+    /// an assistant message but no fabricated token counts.
+    #[tokio::test]
+    async fn stream_exec_classifies_native_rollout_budget_exhaustion() {
+        let codex = fake_codex("fake-codex-rollout-budget.sh");
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&events);
+
+        let error = stream_exec(&codex, &cmd, move |event| {
+            collected.lock().unwrap().push(event);
+        })
+        .await
+        .expect_err("captured rollout exhaustion exits non-zero");
+
+        assert_eq!(error.exit_code(), Some(1));
+        let events = events.lock().unwrap();
+        let terminal = events
+            .iter()
+            .find(|event| event.is_turn_failed())
+            .expect("turn.failed must be delivered");
+        assert_eq!(
+            terminal.turn_failure_kind(),
+            Some(crate::TurnFailureKind::RolloutBudgetExhausted)
+        );
+        assert_eq!(terminal.usage(), None);
+        assert_eq!(crate::QueryResult::from_events(events.clone()).result, "ok");
+    }
+
     #[tokio::test]
     async fn stream_exec_timeout() {
         let codex = Codex::builder()

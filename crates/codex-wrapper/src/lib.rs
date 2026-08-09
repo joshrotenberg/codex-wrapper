@@ -179,6 +179,7 @@ pub mod exec;
 pub mod history;
 pub mod mcp_config;
 pub mod retry;
+pub mod rollout_budget;
 #[cfg(feature = "json")]
 pub mod session;
 #[cfg(feature = "json")]
@@ -228,6 +229,7 @@ pub use exec::CommandOutput;
 pub use history::{SessionFile, SessionLog, SessionMeta, SessionQuery};
 pub use mcp_config::{McpConfigBuilder, McpServerConfig};
 pub use retry::{BackoffStrategy, RetryPolicy};
+pub use rollout_budget::{RolloutBudgetConfig, RolloutBudgetConfigBuilder};
 #[cfg(feature = "json")]
 pub use session::{Session, TurnRecord};
 pub use types::*;

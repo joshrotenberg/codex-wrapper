@@ -4,6 +4,7 @@ use crate::command::CodexCommand;
 use crate::error::Error;
 use crate::error::Result;
 use crate::exec::{self, CommandOutput};
+use crate::rollout_budget::RolloutBudgetConfig;
 use crate::types::{ApprovalPolicyConfig, Color, SandboxMode, WebSearchMode};
 #[cfg(feature = "json")]
 use crate::types::{JsonLineEvent, QueryResult};
@@ -74,6 +75,7 @@ pub struct ExecCommand {
     config_overrides: Vec<String>,
     enabled_features: Vec<String>,
     disabled_features: Vec<String>,
+    rollout_budget: Option<RolloutBudgetConfig>,
     images: Vec<String>,
     model: Option<String>,
     oss: bool,
@@ -110,6 +112,7 @@ impl ExecCommand {
             config_overrides: Vec::new(),
             enabled_features: Vec::new(),
             disabled_features: Vec::new(),
+            rollout_budget: None,
             images: Vec::new(),
             model: None,
             oss: false,
@@ -256,6 +259,22 @@ impl ExecCommand {
     #[must_use]
     pub fn disable(mut self, feature: impl Into<String>) -> Self {
         self.disabled_features.push(feature.into());
+        self
+    }
+
+    /// Enforce a Codex-native weighted-token budget for this execution.
+    ///
+    /// Codex checks the budget at response boundaries, so one response can
+    /// cross the limit before the run stops. The native meter prefers
+    /// provider-supplied rollout units; its fallback weights output and
+    /// non-cached input rather than portable total-token usage. See
+    /// [`RolloutBudgetConfig`] for the exact contract.
+    ///
+    /// This typed override is emitted after raw config and feature switches,
+    /// so they cannot silently disable or widen it.
+    #[must_use]
+    pub fn rollout_budget(mut self, budget: RolloutBudgetConfig) -> Self {
+        self.rollout_budget = Some(budget);
         self
     }
 
@@ -519,6 +538,10 @@ impl CodexCommand for ExecCommand {
         push_repeat(&mut args, "-c", &self.config_overrides);
         push_repeat(&mut args, "--enable", &self.enabled_features);
         push_repeat(&mut args, "--disable", &self.disabled_features);
+        if let Some(budget) = &self.rollout_budget {
+            args.push("-c".into());
+            args.push(budget.config_override());
+        }
         push_repeat(&mut args, "--image", &self.images);
 
         if let Some(model) = &self.model {
@@ -619,6 +642,7 @@ pub struct ExecResumeCommand {
     config_overrides: Vec<String>,
     enabled_features: Vec<String>,
     disabled_features: Vec<String>,
+    rollout_budget: Option<RolloutBudgetConfig>,
     images: Vec<String>,
     model: Option<String>,
     strict_config: bool,
@@ -649,6 +673,7 @@ impl ExecResumeCommand {
             config_overrides: Vec::new(),
             enabled_features: Vec::new(),
             disabled_features: Vec::new(),
+            rollout_budget: None,
             images: Vec::new(),
             model: None,
             strict_config: false,
@@ -787,6 +812,18 @@ impl ExecResumeCommand {
     #[must_use]
     pub fn disable(mut self, feature: impl Into<String>) -> Self {
         self.disabled_features.push(feature.into());
+        self
+    }
+
+    /// Enforce a Codex-native weighted-token budget for this resumed execution.
+    ///
+    /// The meter and response-boundary overshoot are identical to
+    /// [`ExecCommand::rollout_budget`]. Emitting the same config on resume is
+    /// required: a budget applied only to the opening process does not carry
+    /// into a later `codex exec resume` process.
+    #[must_use]
+    pub fn rollout_budget(mut self, budget: RolloutBudgetConfig) -> Self {
+        self.rollout_budget = Some(budget);
         self
     }
 
@@ -933,6 +970,10 @@ impl CodexCommand for ExecResumeCommand {
         push_repeat(&mut args, "-c", &self.config_overrides);
         push_repeat(&mut args, "--enable", &self.enabled_features);
         push_repeat(&mut args, "--disable", &self.disabled_features);
+        if let Some(budget) = &self.rollout_budget {
+            args.push("-c".into());
+            args.push(budget.config_override());
+        }
         if self.last {
             args.push("--last".into());
         }
@@ -1184,6 +1225,45 @@ mod tests {
             .position(|a| a == "approval_policy=\"untrusted\"")
             .unwrap();
         assert!(typed < raw, "raw override must win: {args:?}");
+    }
+
+    #[test]
+    fn native_rollout_budget_is_identical_and_final_on_open_and_resume() {
+        let budget = RolloutBudgetConfig::builder(10_000)
+            .reminder_at_remaining_tokens([5_000, 1_000])
+            .sampling_token_weight(1.0)
+            .prefill_token_weight(0.25)
+            .build()
+            .expect("valid budget");
+        let expected = budget.config_override();
+        let opening = ExecCommand::new("hi")
+            .rollout_budget(budget.clone())
+            .config("features.rollout_budget=false")
+            .disable("rollout_budget")
+            .args();
+        let resumed = ExecResumeCommand::new()
+            .session_id("thread")
+            .rollout_budget(budget)
+            .config("features.rollout_budget=false")
+            .disable("rollout_budget")
+            .args();
+
+        for args in [opening, resumed] {
+            let budget_at = args.iter().position(|arg| arg == &expected).unwrap();
+            let raw_at = args
+                .iter()
+                .position(|arg| arg == "features.rollout_budget=false")
+                .unwrap();
+            let disabled_at = args.iter().position(|arg| arg == "rollout_budget").unwrap();
+            assert!(
+                raw_at < budget_at,
+                "native budget must beat raw config: {args:?}"
+            );
+            assert!(
+                disabled_at < budget_at,
+                "native budget must beat feature disable: {args:?}"
+            );
+        }
     }
 
     /// #55: `--full-auto` is hidden and deprecated on the exec family.

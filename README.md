@@ -724,7 +724,38 @@ The resolution was read off `codex doctor` on 0.145.0 rather than assumed, inclu
 where both a stored login and an env key are present, which the CLI itself flags as "mixed auth
 signals" and resolves in favour of the environment key.
 
-## Token Budgets
+## Native Rollout Budgets
+
+Bound one `codex exec` process with Codex's native rollout budget:
+
+```rust
+use codex_wrapper::{ExecCommand, ExecResumeCommand, RolloutBudgetConfig};
+
+let budget = RolloutBudgetConfig::builder(200_000)
+    .reminder_at_remaining_tokens([100_000, 25_000])
+    .sampling_token_weight(1.0)
+    .prefill_token_weight(0.25)
+    .build()?;
+
+let opening = ExecCommand::new("implement the change")
+    .rollout_budget(budget.clone());
+let resumed = ExecResumeCommand::new()
+    .session_id("thread-id")
+    .prompt("continue")
+    .rollout_budget(budget);
+```
+
+The limit is native weighted units, not portable total tokens. Codex uses a provider-reported
+`codex_rollout_budget_units` value when one is available. Otherwise it counts output tokens times
+`sampling_token_weight` plus non-cached input tokens times `prefill_token_weight`; cached input is
+excluded from that fallback. Enforcement happens after each completed response, so one response
+can overshoot the configured limit. Subagents within that CLI execution share the same budget.
+
+The wrapper emits the typed table after raw config and feature switches, so those cannot silently
+disable it. A separate CLI process, including a later resume, needs the config again. This is why
+both exec builders expose the same method.
+
+## Post-turn Token Budgets
 
 Cap what a session may consume. The ceiling is in tokens, not dollars, because the CLI reports
 token counts and no monetary cost:
