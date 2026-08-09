@@ -751,9 +751,10 @@ The limit is native weighted units, not portable total tokens. Codex uses a prov
 excluded from that fallback. Enforcement happens after each completed response, so one response
 can overshoot the configured limit. Subagents within that CLI execution share the same budget.
 
-The wrapper emits the typed table after raw config and feature switches, so those cannot silently
-disable it. A separate CLI process, including a later resume, needs the config again. This is why
-both exec builders expose the same method.
+The wrapper emits the typed table after raw config and suppresses conflicting `rollout_budget`
+feature toggles. Codex applies feature toggles after every config override regardless of argv order,
+so retaining one would silently disable or replace the table. A separate CLI process, including a
+later resume, needs the config again. This is why both exec builders expose the same method.
 
 ## Post-turn Token Budgets
 

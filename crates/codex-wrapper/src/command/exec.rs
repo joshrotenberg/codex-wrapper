@@ -270,8 +270,10 @@ impl ExecCommand {
     /// non-cached input rather than portable total-token usage. See
     /// [`RolloutBudgetConfig`] for the exact contract.
     ///
-    /// This typed override is emitted after raw config and feature switches,
-    /// so they cannot silently disable or widen it.
+    /// This typed override is emitted after raw config, and conflicting
+    /// `rollout_budget` feature toggles are suppressed. Codex applies feature
+    /// toggles after every `-c` value regardless of argv order, so retaining
+    /// either toggle would otherwise disable or replace this table.
     #[must_use]
     pub fn rollout_budget(mut self, budget: RolloutBudgetConfig) -> Self {
         self.rollout_budget = Some(budget);
@@ -536,8 +538,12 @@ impl CodexCommand for ExecCommand {
 
         push_typed_config(&mut args, self.approval_policy, self.web_search);
         push_repeat(&mut args, "-c", &self.config_overrides);
-        push_repeat(&mut args, "--enable", &self.enabled_features);
-        push_repeat(&mut args, "--disable", &self.disabled_features);
+        push_feature_toggles(
+            &mut args,
+            &self.enabled_features,
+            &self.disabled_features,
+            self.rollout_budget.is_some(),
+        );
         if let Some(budget) = &self.rollout_budget {
             args.push("-c".into());
             args.push(budget.config_override());
@@ -968,8 +974,12 @@ impl CodexCommand for ExecResumeCommand {
             ));
         }
         push_repeat(&mut args, "-c", &self.config_overrides);
-        push_repeat(&mut args, "--enable", &self.enabled_features);
-        push_repeat(&mut args, "--disable", &self.disabled_features);
+        push_feature_toggles(
+            &mut args,
+            &self.enabled_features,
+            &self.disabled_features,
+            self.rollout_budget.is_some(),
+        );
         if let Some(budget) = &self.rollout_budget {
             args.push("-c".into());
             args.push(budget.config_override());
@@ -1035,6 +1045,23 @@ fn push_repeat(args: &mut Vec<String>, flag: &str, values: &[String]) {
     for value in values {
         args.push(flag.into());
         args.push(value.clone());
+    }
+}
+
+fn push_feature_toggles(
+    args: &mut Vec<String>,
+    enabled: &[String],
+    disabled: &[String],
+    protects_rollout_budget: bool,
+) {
+    let keep = |feature: &&String| !protects_rollout_budget || feature.as_str() != "rollout_budget";
+    for feature in enabled.iter().filter(keep) {
+        args.push("--enable".into());
+        args.push(feature.clone());
+    }
+    for feature in disabled.iter().filter(keep) {
+        args.push("--disable".into());
+        args.push(feature.clone());
     }
 }
 
@@ -1239,13 +1266,19 @@ mod tests {
         let opening = ExecCommand::new("hi")
             .rollout_budget(budget.clone())
             .config("features.rollout_budget=false")
+            .enable("rollout_budget")
             .disable("rollout_budget")
+            .enable("keep-enabled")
+            .disable("keep-disabled")
             .args();
         let resumed = ExecResumeCommand::new()
             .session_id("thread")
             .rollout_budget(budget)
             .config("features.rollout_budget=false")
+            .enable("rollout_budget")
             .disable("rollout_budget")
+            .enable("keep-enabled")
+            .disable("keep-disabled")
             .args();
 
         for args in [opening, resumed] {
@@ -1254,14 +1287,24 @@ mod tests {
                 .iter()
                 .position(|arg| arg == "features.rollout_budget=false")
                 .unwrap();
-            let disabled_at = args.iter().position(|arg| arg == "rollout_budget").unwrap();
             assert!(
                 raw_at < budget_at,
                 "native budget must beat raw config: {args:?}"
             );
             assert!(
-                disabled_at < budget_at,
-                "native budget must beat feature disable: {args:?}"
+                !args.windows(2).any(|pair| {
+                    matches!(pair[0].as_str(), "--enable" | "--disable")
+                        && pair[1] == "rollout_budget"
+                }),
+                "native budget must suppress conflicting feature toggles: {args:?}"
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--enable", "keep-enabled"])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--disable", "keep-disabled"])
             );
         }
     }
