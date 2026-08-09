@@ -53,7 +53,7 @@ use std::process::Command;
 
 use codex_wrapper::{
     ApprovalPolicy, ApprovalPolicyConfig, CodexCommand, Color, ExecCommand, ExecResumeCommand,
-    ForkCommand, ResumeCommand, ReviewCommand, SandboxMode, WebSearchMode,
+    ForkCommand, ResumeCommand, ReviewCommand, RolloutBudgetConfig, SandboxMode, WebSearchMode,
 };
 
 /// Value used to force a config-key probe to fail. Must never be a valid
@@ -218,6 +218,35 @@ fn probe_config_key(subcommand: &[String], key: &str) -> Result<BTreeSet<String>
         .collect())
 }
 
+/// Probe the generated rollout-budget table with a valid value and no prompt.
+///
+/// Unlike the enum keys, this config is a free-form table. A valid table gets
+/// as far as the CLI's empty-prompt refusal, which is after strict config load
+/// but before authentication or any provider request.
+fn probe_rollout_budget_config(subcommand: &[String], value: &str) -> Result<(), String> {
+    let mut args = subcommand.to_vec();
+    args.push("--strict-config".into());
+    args.push("-c".into());
+    args.push(format!("features.rollout_budget={value}"));
+    let output = run_codex(&args);
+
+    if output.contains("Error loading config.toml")
+        || output.contains("unknown configuration field")
+        || output.contains("features.rollout_budget.")
+    {
+        return Err(format!(
+            "generated rollout-budget config was rejected: {}",
+            output.lines().next().unwrap_or("").trim()
+        ));
+    }
+    if !output.contains("No prompt provided") {
+        return Err(format!(
+            "rollout-budget probe did not stop at the empty prompt; refusing a probe that might run a session. Output:\n{output}"
+        ));
+    }
+    Ok(())
+}
+
 /// Assert every flag and config key a builder emits is still accepted.
 fn assert_contract(label: &str, args: Vec<String>, subcommand_len: usize) {
     let emitted = split(&args, subcommand_len);
@@ -235,6 +264,12 @@ fn assert_contract(label: &str, args: Vec<String>, subcommand_len: usize) {
     }
 
     for (key, value) in &emitted.config_keys {
+        if key == "features.rollout_budget" {
+            if let Err(message) = probe_rollout_budget_config(&emitted.subcommand, value) {
+                drift.push(message);
+            }
+            continue;
+        }
         if !ENUM_CONFIG_KEYS.contains(&key.as_str()) {
             drift.push(format!(
                 "config key `{key}` has no probe policy; add it to ENUM_CONFIG_KEYS \
@@ -278,11 +313,17 @@ fn assert_contract(label: &str, args: Vec<String>, subcommand_len: usize) {
 #[test]
 #[ignore]
 fn exec_contract() {
+    let rollout_budget = RolloutBudgetConfig::builder(100_000)
+        .reminder_at_remaining_tokens([50_000, 10_000])
+        .prefill_token_weight(0.25)
+        .build()
+        .expect("valid contract budget");
     let args = ExecCommand::new("probe")
         .approval_policy(ApprovalPolicyConfig::Granular)
         .search_mode(WebSearchMode::Live)
         .enable("feature")
         .disable("other")
+        .rollout_budget(rollout_budget)
         .image("/tmp/a.png")
         .model("o3")
         .oss()
@@ -317,6 +358,11 @@ fn exec_full_auto_contract() {
 #[test]
 #[ignore]
 fn exec_resume_contract() {
+    let rollout_budget = RolloutBudgetConfig::builder(100_000)
+        .reminder_at_remaining_tokens([50_000, 10_000])
+        .prefill_token_weight(0.25)
+        .build()
+        .expect("valid contract budget");
     let args = ExecResumeCommand::new()
         .last()
         .prompt("probe")
@@ -324,6 +370,7 @@ fn exec_resume_contract() {
         .search_mode(WebSearchMode::Cached)
         .enable("feature")
         .disable("other")
+        .rollout_budget(rollout_budget)
         .image("/tmp/a.png")
         .model("o3")
         .strict_config()

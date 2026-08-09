@@ -99,6 +99,13 @@ pub enum Error {
         max_tokens: u64,
     },
 
+    /// A native rollout-budget configuration was invalid before launch.
+    #[error("invalid Codex rollout budget: {message}")]
+    InvalidRolloutBudget {
+        /// The failed invariant.
+        message: String,
+    },
+
     /// A file on disk could not be parsed.
     ///
     /// Distinct from [`Error::Config`], which is the CLI rejecting a

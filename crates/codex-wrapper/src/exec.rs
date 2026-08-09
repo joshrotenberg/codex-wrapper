@@ -264,7 +264,30 @@ pub async fn run_codex_with_retry(
 /// [`CodexCommand::to_command_string`]: crate::command::CodexCommand::to_command_string
 pub(crate) fn assemble_args(codex: &Codex, args: Vec<String>) -> Vec<String> {
     let mut command_args = Vec::with_capacity(codex.global_args.len() + args.len());
-    command_args.extend(codex.global_args.iter().cloned());
+    let protects_rollout_budget = args
+        .windows(2)
+        .any(|pair| pair[0] == "-c" && crate::RolloutBudgetConfig::is_config_override(&pair[1]));
+    let mut global_args = codex.global_args.iter().peekable();
+    while let Some(arg) = global_args.next() {
+        if protects_rollout_budget
+            && matches!(arg.as_str(), "--enable" | "--disable")
+            && global_args
+                .peek()
+                .is_some_and(|feature| feature.as_str() == "rollout_budget")
+        {
+            global_args.next();
+            continue;
+        }
+        if protects_rollout_budget
+            && matches!(
+                arg.as_str(),
+                "--enable=rollout_budget" | "--disable=rollout_budget"
+            )
+        {
+            continue;
+        }
+        command_args.push(arg.clone());
+    }
     command_args.extend(args);
     command_args
 }
@@ -667,6 +690,66 @@ async fn run_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CodexCommand;
+
+    #[test]
+    fn typed_rollout_budget_suppresses_conflicting_client_global_toggles() {
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .config("features.rollout_budget=false")
+            .enable("rollout_budget")
+            .disable("rollout_budget")
+            .arg("--enable=rollout_budget")
+            .arg("--disable=rollout_budget")
+            .arg("--disable")
+            .arg("rollout_budget")
+            .enable("keep-enabled")
+            .disable("keep-disabled")
+            .build()
+            .expect("echo must exist");
+        let budget = crate::RolloutBudgetConfig::builder(10_000)
+            .build()
+            .expect("valid budget");
+        let expected = budget.config_override();
+        let opening = crate::ExecCommand::new("hi")
+            .rollout_budget(budget.clone())
+            .args();
+        let resumed = crate::ExecResumeCommand::new()
+            .session_id("thread")
+            .rollout_budget(budget)
+            .args();
+
+        for args in [opening, resumed] {
+            let assembled = assemble_args(&codex, args);
+            assert!(assembled.iter().any(|arg| arg == &expected));
+            assert!(
+                !assembled.windows(2).any(|pair| {
+                    matches!(pair[0].as_str(), "--enable" | "--disable")
+                        && pair[1] == "rollout_budget"
+                }),
+                "typed budget must suppress paired client toggles: {assembled:?}"
+            );
+            assert!(
+                !assembled.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--enable=rollout_budget" | "--disable=rollout_budget"
+                    )
+                }),
+                "typed budget must suppress equals-form client toggles: {assembled:?}"
+            );
+            assert!(
+                assembled
+                    .windows(2)
+                    .any(|pair| pair == ["--enable", "keep-enabled"])
+            );
+            assert!(
+                assembled
+                    .windows(2)
+                    .any(|pair| pair == ["--disable", "keep-disabled"])
+            );
+        }
+    }
 
     fn make_output(stdout: &str, stderr: &str) -> CommandOutput {
         CommandOutput {

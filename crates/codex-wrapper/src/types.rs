@@ -26,6 +26,10 @@
 //!   `type` of `agent_message` and its text in a `text` field. A review's
 //!   diff-reading steps arrive as `command_execution` items on the same event.
 //! - A review's `turn.completed` reports a usage object of all zeros.
+//! - Exhausting the native rollout budget emits an `error` event followed by
+//!   `turn.failed`, both with `shared rollout token budget exhausted`. The
+//!   terminal event carries no usage object on 0.145.0 even though Codex used
+//!   its internal meter to make the decision.
 //!
 //! - The stream carries **no incremental text**. Three captured runs, a
 //!   one-word exec, a four-sentence exec, and a review, each delivered the
@@ -253,6 +257,22 @@ pub struct JsonLineEvent {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+/// A terminal `turn.failed` classification from the Codex JSONL stream.
+///
+/// Codex does not currently emit a machine-readable error code, so the one
+/// typed class here is pinned to the stable message captured from 0.145.0.
+/// Unknown failures remain distinguishable rather than being forced into the
+/// budget class.
+#[cfg(feature = "json")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TurnFailureKind {
+    /// Codex stopped after exhausting its native shared rollout budget.
+    RolloutBudgetExhausted,
+    /// A terminal failure not classified by this wrapper.
+    Other,
+}
+
 #[cfg(feature = "json")]
 impl JsonLineEvent {
     /// Returns the `session_id` field, if present and a string.
@@ -277,6 +297,35 @@ impl JsonLineEvent {
     #[must_use]
     pub fn is_turn_failed(&self) -> bool {
         self.event_type == "turn.failed"
+    }
+
+    /// The message carried by a terminal `turn.failed` event.
+    ///
+    /// The captured CLI shape nests it under `error.message`.
+    #[must_use]
+    pub fn turn_failure_message(&self) -> Option<&str> {
+        if !self.is_turn_failed() {
+            return None;
+        }
+        self.extra
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// Classify a terminal `turn.failed` event without downstream string matching.
+    #[must_use]
+    pub fn turn_failure_kind(&self) -> Option<TurnFailureKind> {
+        self.is_turn_failed().then(|| {
+            if self
+                .turn_failure_message()
+                .is_some_and(|message| message.contains("shared rollout token budget exhausted"))
+            {
+                TurnFailureKind::RolloutBudgetExhausted
+            } else {
+                TurnFailureKind::Other
+            }
+        })
     }
 
     /// Token counts reported by a `turn.completed` event.
@@ -399,8 +448,9 @@ impl JsonLineEvent {
 pub struct QueryResult {
     /// Assistant text, concatenated from the turn's agent-message items.
     ///
-    /// Empty when the turn produced no agent message, which includes every
-    /// failed turn.
+    /// Empty when the turn produced no agent message. A failed turn can still
+    /// carry text produced before its terminal failure; native rollout-budget
+    /// exhaustion is one observed example.
     pub result: String,
     /// The `session_id` captured from the event stream, if any.
     ///
@@ -737,6 +787,40 @@ mod tests {
         // The pre-#73 parser matched this. The CLI has never emitted it.
         let bogus: JsonLineEvent = serde_json::from_str(r#"{"type":"completed"}"#).unwrap();
         assert!(!bogus.is_turn_completed());
+    }
+
+    /// Transcribed from a paid `codex-cli` 0.145.0 run with a one-unit native
+    /// rollout budget. The CLI exposes the limit decision but no usage object.
+    #[cfg(feature = "json")]
+    #[test]
+    fn classifies_captured_rollout_budget_terminal_without_inventing_usage() {
+        let failed: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"turn.failed","error":{"message":"shared rollout token budget exhausted"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            failed.turn_failure_kind(),
+            Some(TurnFailureKind::RolloutBudgetExhausted)
+        );
+        assert_eq!(failed.usage(), None);
+
+        let other: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"turn.failed","error":{"message":"tool policy rejected"}}"#,
+        )
+        .unwrap();
+        assert_eq!(other.turn_failure_kind(), Some(TurnFailureKind::Other));
+
+        let missing_message: JsonLineEvent =
+            serde_json::from_str(r#"{"type":"turn.failed"}"#).unwrap();
+        assert_eq!(
+            missing_message.turn_failure_kind(),
+            Some(TurnFailureKind::Other)
+        );
+
+        let nonterminal: JsonLineEvent =
+            serde_json::from_str(r#"{"type":"turn.started"}"#).unwrap();
+        assert_eq!(nonterminal.turn_failure_kind(), None);
     }
 
     #[cfg(feature = "json")]
