@@ -301,8 +301,7 @@ impl JsonLineEvent {
 
     /// The message carried by a terminal `turn.failed` event.
     ///
-    /// The captured CLI shape nests it under `error.message`. A string-valued
-    /// `error` and a top-level `message` are accepted as compatible variants.
+    /// The captured CLI shape nests it under `error.message`.
     #[must_use]
     pub fn turn_failure_message(&self) -> Option<&str> {
         if !self.is_turn_failed() {
@@ -310,29 +309,23 @@ impl JsonLineEvent {
         }
         self.extra
             .get("error")
-            .and_then(|error| {
-                error
-                    .as_str()
-                    .or_else(|| error.get("message").and_then(serde_json::Value::as_str))
-            })
-            .or_else(|| {
-                self.extra
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-            })
+            .and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str)
     }
 
     /// Classify a terminal `turn.failed` event without downstream string matching.
     #[must_use]
     pub fn turn_failure_kind(&self) -> Option<TurnFailureKind> {
-        let message = self.turn_failure_message()?;
-        Some(
-            if message.contains("shared rollout token budget exhausted") {
+        self.is_turn_failed().then(|| {
+            if self
+                .turn_failure_message()
+                .is_some_and(|message| message.contains("shared rollout token budget exhausted"))
+            {
                 TurnFailureKind::RolloutBudgetExhausted
             } else {
                 TurnFailureKind::Other
-            },
-        )
+            }
+        })
     }
 
     /// Token counts reported by a `turn.completed` event.
@@ -817,6 +810,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(other.turn_failure_kind(), Some(TurnFailureKind::Other));
+
+        let missing_message: JsonLineEvent =
+            serde_json::from_str(r#"{"type":"turn.failed"}"#).unwrap();
+        assert_eq!(
+            missing_message.turn_failure_kind(),
+            Some(TurnFailureKind::Other)
+        );
+
+        let nonterminal: JsonLineEvent =
+            serde_json::from_str(r#"{"type":"turn.started"}"#).unwrap();
+        assert_eq!(nonterminal.turn_failure_kind(), None);
     }
 
     #[cfg(feature = "json")]
