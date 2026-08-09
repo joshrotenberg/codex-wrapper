@@ -332,6 +332,7 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                     &codex.binary,
                     &command_args,
                     &codex.env,
+                    codex.clear_env,
                     codex.working_dir.as_deref(),
                     timeout,
                     codex.process_group,
@@ -343,6 +344,7 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                     &codex.binary,
                     &command_args,
                     &codex.env,
+                    codex.clear_env,
                     codex.working_dir.as_deref(),
                     codex.process_group,
                 )
@@ -392,6 +394,7 @@ where
                 binary: &codex.binary,
                 args: &command_args,
                 env: &codex.env,
+                clear_env: codex.clear_env,
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: None,
                 process_group: codex.process_group,
@@ -481,6 +484,7 @@ pub async fn run_codex_with_stdin_prompt(
                 binary: &codex.binary,
                 args: &command_args,
                 env: &codex.env,
+                clear_env: codex.clear_env,
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: Some(prompt),
                 process_group: codex.process_group,
@@ -509,6 +513,7 @@ async fn run_internal(
     binary: &std::path::Path,
     args: &[String],
     env: &std::collections::HashMap<String, String>,
+    clear_env: bool,
     working_dir: Option<&std::path::Path>,
     process_group: bool,
 ) -> Result<CommandOutput> {
@@ -517,6 +522,7 @@ async fn run_internal(
             binary,
             args,
             env,
+            clear_env,
             working_dir,
             stdin_prompt: None,
             process_group,
@@ -534,6 +540,8 @@ struct SpawnSpec<'a> {
     binary: &'a std::path::Path,
     args: &'a [String],
     env: &'a std::collections::HashMap<String, String>,
+    /// Whether the child starts without the wrapper's ambient environment.
+    clear_env: bool,
     working_dir: Option<&'a std::path::Path>,
     /// A prompt to deliver on stdin, for `codex exec -`.
     stdin_prompt: Option<&'a str>,
@@ -550,6 +558,7 @@ async fn run_internal_inner(
         binary,
         args,
         env,
+        clear_env,
         working_dir,
         stdin_prompt,
         process_group,
@@ -575,9 +584,7 @@ async fn run_internal_inner(
         cmd.current_dir(dir);
     }
 
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
+    apply_child_environment(&mut cmd, clear_env, env);
 
     // Always spawn rather than using `Command::output`: the pid is needed to
     // signal the process group, and `output` does not surrender it. It also
@@ -669,17 +676,33 @@ async fn run_internal_inner(
     })
 }
 
+/// Apply the client environment policy to a direct child process.
+///
+/// Kept in one helper because buffered and streaming execution construct
+/// separate commands. Clearing must happen before explicit values are added.
+pub(crate) fn apply_child_environment(
+    cmd: &mut Command,
+    clear_env: bool,
+    env: &std::collections::HashMap<String, String>,
+) {
+    if clear_env {
+        cmd.env_clear();
+    }
+    cmd.envs(env);
+}
+
 async fn run_with_timeout(
     binary: &std::path::Path,
     args: &[String],
     env: &std::collections::HashMap<String, String>,
+    clear_env: bool,
     working_dir: Option<&std::path::Path>,
     timeout: Duration,
     process_group: bool,
 ) -> Result<CommandOutput> {
     tokio::time::timeout(
         timeout,
-        run_internal(binary, args, env, working_dir, process_group),
+        run_internal(binary, args, env, clear_env, working_dir, process_group),
     )
     .await
     .map_err(|_| Error::Timeout {
@@ -799,6 +822,135 @@ mod tests {
         let debug = format!("{output:?}");
         assert!(debug.contains("... (300 bytes total)"));
         assert!(!debug.contains(&long));
+    }
+
+    /// Compatibility is explicit: callers that do not opt in keep the
+    /// ambient environment they relied on before `clear_env` existed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_environment_is_inherited_by_default() {
+        let capture = crate::test_support::EnvCapture::new("env-default");
+        let codex = crate::test_support::env_capturing_codex(&capture)
+            .build()
+            .expect("bash must exist");
+
+        crate::ExecCommand::new("probe")
+            .execute(&codex)
+            .await
+            .unwrap();
+
+        let environment = capture.read();
+        assert_eq!(
+            environment.get("PATH"),
+            Some(&std::env::var("PATH").expect("test process must have PATH"))
+        );
+    }
+
+    /// The timeout and ordinary buffered paths use different wrapper entry
+    /// points. Opening and resume both have to reach the same environment
+    /// policy, and explicit values on either side of `clear_env` must survive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleared_environment_reaches_buffered_open_and_resume() {
+        let capture = crate::test_support::EnvCapture::new("env-buffered");
+        let opening_client = crate::test_support::env_capturing_codex(&capture)
+            .clear_env()
+            .env("CODEX_WRAPPER_EXPLICIT", "opening")
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("bash must exist");
+
+        crate::ExecCommand::new("probe")
+            .execute(&opening_client)
+            .await
+            .unwrap();
+        let opening_environment = capture.read();
+        assert!(!opening_environment.contains_key("PATH"));
+        assert_eq!(
+            opening_environment
+                .get("CODEX_WRAPPER_EXPLICIT")
+                .map(String::as_str),
+            Some("opening")
+        );
+        assert!(opening_environment.contains_key("CODEX_WRAPPER_ENV_CAPTURE"));
+
+        let resume_client = crate::test_support::env_capturing_codex(&capture)
+            .clear_env()
+            .env("CODEX_WRAPPER_EXPLICIT", "resume")
+            .build()
+            .expect("bash must exist");
+        crate::ExecResumeCommand::new()
+            .last()
+            .execute(&resume_client)
+            .await
+            .unwrap();
+        let resume_environment = capture.read();
+        assert!(!resume_environment.contains_key("PATH"));
+        assert_eq!(
+            resume_environment
+                .get("CODEX_WRAPPER_EXPLICIT")
+                .map(String::as_str),
+            Some("resume")
+        );
+    }
+
+    /// Stdin delivery and graceful cancellation each construct their own
+    /// spawn specification, so cover both instead of treating the buffered
+    /// test as proof for them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleared_environment_reaches_stdin_and_cancellable_runs() {
+        let capture = crate::test_support::EnvCapture::new("env-specialized");
+        let codex = crate::test_support::env_capturing_codex(&capture)
+            .env("CODEX_WRAPPER_EXPLICIT", "specialized")
+            .clear_env()
+            .build()
+            .expect("bash must exist");
+
+        crate::ExecCommand::new("stdin prompt")
+            .prompt_via_stdin()
+            .execute(&codex)
+            .await
+            .unwrap();
+        let stdin_environment = capture.read();
+        assert!(!stdin_environment.contains_key("PATH"));
+        assert_eq!(
+            stdin_environment
+                .get("CODEX_WRAPPER_EXPLICIT")
+                .map(String::as_str),
+            Some("specialized")
+        );
+
+        let never = std::future::pending::<()>();
+        run_codex_cancellable(&codex, crate::ExecCommand::new("cancellable").args(), never)
+            .await
+            .unwrap();
+        let cancellable_environment = capture.read();
+        assert!(!cancellable_environment.contains_key("PATH"));
+        assert_eq!(
+            cancellable_environment
+                .get("CODEX_WRAPPER_EXPLICIT")
+                .map(String::as_str),
+            Some("specialized")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn environment_values_do_not_leak_into_spawn_errors() {
+        let secret = "spawn-error-must-not-leak-this";
+        let codex = Codex::builder()
+            .binary("/codex-wrapper/this-binary-does-not-exist")
+            .clear_env()
+            .env("CODEX_WRAPPER_SECRET", secret)
+            .build()
+            .unwrap();
+
+        let error = run_codex(&codex, vec!["exec".into()])
+            .await
+            .expect_err("the fake path must not spawn");
+        assert!(!error.to_string().contains(secret));
+        assert!(!format!("{error:?}").contains(secret));
     }
 
     /// A wrapper timeout drops `run_internal`'s future. Without

@@ -82,6 +82,14 @@
 //! # }
 //! ```
 //!
+//! # Child Environment Policy
+//!
+//! Child processes inherit the wrapper process's environment by default.
+//! [`CodexBuilder::clear_env`] opts into clearing that environment before
+//! applying entries from [`CodexBuilder::env`] and [`CodexBuilder::envs`].
+//! The setting controls the direct child's environment, not same-user access
+//! to files, process metadata, sockets, or other OS resources.
+//!
 //! # Available Commands
 //!
 //! | Command | CLI equivalent |
@@ -190,6 +198,7 @@ pub mod types;
 pub mod version;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -254,11 +263,12 @@ pub use version::{
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Codex {
     pub(crate) binary: PathBuf,
     pub(crate) working_dir: Option<PathBuf>,
     pub(crate) env: HashMap<String, String>,
+    pub(crate) clear_env: bool,
     pub(crate) global_args: Vec<String>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) termination_grace: Duration,
@@ -294,26 +304,25 @@ impl Codex {
         clone
     }
 
-    /// Query the installed Codex CLI version.
     /// Read `config.toml` for this client's `CODEX_HOME`.
+    ///
+    /// Uses the same effective environment as spawned commands. A client
+    /// built with [`clear_env`](CodexBuilder::clear_env) does not fall back to
+    /// ambient `CODEX_HOME` or `HOME` values.
     ///
     /// `Ok(None)` when there is no config file. Requires the `config` feature.
     /// See [`crate::config`] for what is typed and what stays raw.
     #[cfg(feature = "config")]
     pub fn config(&self) -> Result<Option<crate::config::CodexConfig>> {
-        let home = crate::codex_home::resolve(&|key| {
-            self.env
-                .get(key)
-                .cloned()
-                .or_else(|| std::env::var(key).ok())
-        });
+        let home = crate::codex_home::resolve(&|key| self.environment_value(key));
         crate::config::load_from_home(home)
     }
 
     /// Which credential this client's CLI would use, without spawning it.
     ///
     /// Honors a `CODEX_HOME` set on this client via
-    /// [`env`](CodexBuilder::env), falling back to the process environment.
+    /// [`env`](CodexBuilder::env), falling back to the process environment
+    /// unless [`clear_env`](CodexBuilder::clear_env) was selected.
     /// See [`crate::auth`] for what the strategies mean and how they were
     /// determined.
     ///
@@ -331,11 +340,20 @@ impl Codex {
     #[cfg(feature = "json")]
     #[must_use]
     pub fn auth_status(&self) -> crate::auth::AuthStatus {
-        crate::auth::detect_with(|key| {
-            self.env
-                .get(key)
-                .cloned()
-                .or_else(|| std::env::var(key).ok())
+        crate::auth::detect_with(|key| self.environment_value(key))
+    }
+
+    /// Resolve one variable exactly as this client's direct child will see
+    /// it. Read-side helpers use the same policy as process spawning so a
+    /// preflight cannot report credentials or config excluded from the child.
+    #[cfg(any(feature = "json", feature = "config"))]
+    fn environment_value(&self, key: &str) -> Option<String> {
+        self.env.get(key).cloned().or_else(|| {
+            if self.clear_env {
+                None
+            } else {
+                std::env::var(key).ok()
+            }
         })
     }
 
@@ -415,6 +433,26 @@ impl Codex {
     }
 }
 
+impl fmt::Debug for Codex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut env_keys: Vec<&str> = self.env.keys().map(String::as_str).collect();
+        env_keys.sort_unstable();
+
+        f.debug_struct("Codex")
+            .field("binary", &self.binary)
+            .field("working_dir", &self.working_dir)
+            .field("env_keys", &env_keys)
+            .field("clear_env", &self.clear_env)
+            .field("global_args", &self.global_args)
+            .field("timeout", &self.timeout)
+            .field("termination_grace", &self.termination_grace)
+            .field("process_group", &self.process_group)
+            .field("retry_policy", &self.retry_policy)
+            .field("tested_cli_version_range", &self.tested_cli_version_range)
+            .finish()
+    }
+}
+
 fn warn_on_drift(status: &CliVersionStatus) {
     match status {
         CliVersionStatus::Tested => {}
@@ -441,11 +479,12 @@ fn warn_on_drift(status: &CliVersionStatus) {
 ///
 /// All options are optional. By default the builder discovers the `codex`
 /// binary via `PATH`.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct CodexBuilder {
     binary: Option<PathBuf>,
     working_dir: Option<PathBuf>,
     env: HashMap<String, String>,
+    clear_env: bool,
     global_args: Vec<String>,
     timeout: Option<Duration>,
     termination_grace: Option<Duration>,
@@ -496,6 +535,22 @@ impl CodexBuilder {
         for (key, value) in vars {
             self.env.insert(key.into(), value.into());
         }
+        self
+    }
+
+    /// Clear the inherited environment before applying variables supplied by
+    /// [`env`](Self::env) and [`envs`](Self::envs).
+    ///
+    /// By default, child processes inherit the wrapper process's environment.
+    /// This opt-in is call-order independent: explicit variables survive
+    /// whether they are added before or after `clear_env`.
+    ///
+    /// This controls the direct Codex child's environment. It is not OS or
+    /// same-user isolation: the child can still access files, process metadata,
+    /// sockets, and other resources allowed to its user and sandbox.
+    #[must_use]
+    pub fn clear_env(mut self) -> Self {
+        self.clear_env = true;
         self
     }
 
@@ -609,6 +664,7 @@ impl CodexBuilder {
             binary,
             working_dir: self.working_dir,
             env: self.env,
+            clear_env: self.clear_env,
             global_args: self.global_args,
             termination_grace: self
                 .termination_grace
@@ -621,6 +677,26 @@ impl CodexBuilder {
                 version::TESTED_CLI_VERSION_MAX,
             )),
         })
+    }
+}
+
+impl fmt::Debug for CodexBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut env_keys: Vec<&str> = self.env.keys().map(String::as_str).collect();
+        env_keys.sort_unstable();
+
+        f.debug_struct("CodexBuilder")
+            .field("binary", &self.binary)
+            .field("working_dir", &self.working_dir)
+            .field("env_keys", &env_keys)
+            .field("clear_env", &self.clear_env)
+            .field("global_args", &self.global_args)
+            .field("timeout", &self.timeout)
+            .field("termination_grace", &self.termination_grace)
+            .field("process_group", &self.process_group)
+            .field("retry_policy", &self.retry_policy)
+            .field("tested_cli_version_range", &self.tested_cli_version_range)
+            .finish()
     }
 }
 
@@ -639,7 +715,73 @@ mod tests {
 
         assert_eq!(codex.binary, PathBuf::from("/usr/local/bin/codex"));
         assert_eq!(codex.env.get("FOO").unwrap(), "bar");
+        assert!(!codex.clear_env);
         assert_eq!(codex.timeout, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn clear_env_is_opt_in_and_keeps_explicit_entries() {
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .env("BEFORE_CLEAR", "one")
+            .clear_env()
+            .env("AFTER_CLEAR", "two")
+            .build()
+            .unwrap();
+
+        assert!(codex.clear_env);
+        assert_eq!(
+            codex.env.get("BEFORE_CLEAR").map(String::as_str),
+            Some("one")
+        );
+        assert_eq!(
+            codex.env.get("AFTER_CLEAR").map(String::as_str),
+            Some("two")
+        );
+    }
+
+    #[test]
+    fn client_and_builder_debug_hide_environment_values() {
+        let builder = Codex::builder()
+            .binary("/bin/echo")
+            .env("CODEX_WRAPPER_SECRET", "debug-must-not-leak-this");
+
+        let builder_debug = format!("{builder:?}");
+        assert!(builder_debug.contains("CODEX_WRAPPER_SECRET"));
+        assert!(!builder_debug.contains("debug-must-not-leak-this"));
+
+        let codex = builder.build().unwrap();
+        let client_debug = format!("{codex:?}");
+        assert!(client_debug.contains("CODEX_WRAPPER_SECRET"));
+        assert!(!client_debug.contains("debug-must-not-leak-this"));
+    }
+
+    /// Read-side helpers must answer from the environment the child receives,
+    /// not from ambient values that `clear_env` removes at spawn time.
+    #[cfg(any(feature = "json", feature = "config"))]
+    #[test]
+    fn effective_environment_lookup_obeys_clear_env() {
+        let ambient_path = std::env::var("PATH").expect("test process must have PATH");
+        let inherited = Codex::builder().binary("/bin/echo").build().unwrap();
+        assert_eq!(inherited.environment_value("PATH"), Some(ambient_path));
+
+        let cleared = Codex::builder()
+            .binary("/bin/echo")
+            .clear_env()
+            .build()
+            .unwrap();
+        assert_eq!(cleared.environment_value("PATH"), None);
+
+        let explicit = Codex::builder()
+            .binary("/bin/echo")
+            .clear_env()
+            .env("PATH", "/intentional/bin")
+            .build()
+            .unwrap();
+        assert_eq!(
+            explicit.environment_value("PATH").as_deref(),
+            Some("/intentional/bin")
+        );
     }
 
     #[test]
@@ -732,5 +874,17 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn auth_status_does_not_fall_back_to_ambient_home_when_cleared() {
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .clear_env()
+            .build()
+            .unwrap();
+
+        assert_eq!(codex.auth_status().codex_home, PathBuf::from(".codex"));
     }
 }

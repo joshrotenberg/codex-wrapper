@@ -110,9 +110,7 @@ where
     if let Some(dir) = &codex.working_dir {
         child_cmd.current_dir(dir);
     }
-    for (key, value) in &codex.env {
-        child_cmd.env(key, value);
-    }
+    crate::exec::apply_child_environment(&mut child_cmd, codex.clear_env, &codex.env);
 
     let mut child = child_cmd.spawn().map_err(|e| Error::Io {
         message: format!("failed to spawn codex: {e}"),
@@ -344,6 +342,60 @@ mod tests {
 
         let events = events.lock().unwrap();
         assert!(!events.is_empty(), "expected at least one event");
+    }
+
+    /// Streaming owns a separate process builder from buffered execution.
+    /// Cover opening, stdin opening, and resume so none can regress to ambient
+    /// inheritance while the others stay isolated.
+    #[tokio::test]
+    async fn cleared_environment_reaches_every_streaming_variant() {
+        let capture = crate::test_support::EnvCapture::new("env-streaming");
+        let codex = crate::test_support::env_capturing_codex(&capture)
+            .clear_env()
+            .env("CODEX_WRAPPER_EXPLICIT", "streaming")
+            .build()
+            .expect("bash must exist");
+
+        crate::ExecCommand::new("opening")
+            .stream(&codex, |_| {})
+            .await
+            .unwrap();
+        let opening_environment = capture.read();
+        assert!(!opening_environment.contains_key("PATH"));
+        assert_eq!(
+            opening_environment
+                .get("CODEX_WRAPPER_EXPLICIT")
+                .map(String::as_str),
+            Some("streaming")
+        );
+
+        crate::ExecCommand::new("stdin")
+            .prompt_via_stdin()
+            .stream(&codex, |_| {})
+            .await
+            .unwrap();
+        let stdin_environment = capture.read();
+        assert!(!stdin_environment.contains_key("PATH"));
+        assert_eq!(
+            stdin_environment
+                .get("CODEX_WRAPPER_EXPLICIT")
+                .map(String::as_str),
+            Some("streaming")
+        );
+
+        crate::ExecResumeCommand::new()
+            .last()
+            .stream(&codex, |_| {})
+            .await
+            .unwrap();
+        let resume_environment = capture.read();
+        assert!(!resume_environment.contains_key("PATH"));
+        assert_eq!(
+            resume_environment
+                .get("CODEX_WRAPPER_EXPLICIT")
+                .map(String::as_str),
+            Some("streaming")
+        );
     }
 
     /// Contract captured from a paid 0.145.0 run: the callback receives the
