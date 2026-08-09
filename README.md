@@ -745,16 +745,20 @@ let resumed = ExecResumeCommand::new()
     .rollout_budget(budget);
 ```
 
-The limit is native weighted units, not portable total tokens. Codex uses a provider-reported
-`codex_rollout_budget_units` value when one is available. Otherwise it counts output tokens times
-`sampling_token_weight` plus non-cached input tokens times `prefill_token_weight`; cached input is
-excluded from that fallback. Enforcement happens after each completed response, so one response
-can overshoot the configured limit. Subagents within that CLI execution share the same budget.
+The limit is native rollout-budget units, not portable total tokens. Codex 0.145 and 0.146 always
+count output tokens times `sampling_token_weight` plus non-cached input tokens times
+`prefill_token_weight`. Starting with Codex 0.147, a provider-reported
+`codex_rollout_budget_units` value takes precedence when available; the weighted formula remains
+the fallback. Cached input is excluded from that fallback. Provider-reported units may be opaque,
+so hosts must not assume that a CLI upgrade preserves identical meter semantics. Enforcement
+happens after each completed response, so one response can overshoot the configured limit.
+Subagents within that CLI execution share the same budget.
 
 The wrapper emits the typed table after raw config and suppresses conflicting `rollout_budget`
-feature toggles. Codex applies feature toggles after every config override regardless of argv order,
-so retaining one would silently disable or replace the table. A separate CLI process, including a
-later resume, needs the config again. This is why both exec builders expose the same method.
+feature toggles from both the command and its client. Codex applies feature toggles after every
+config override regardless of argv order, so retaining one would silently disable or replace the
+table. A separate CLI process, including a later resume, needs the config again. This is why both
+exec builders expose the same method.
 
 ## Post-turn Token Budgets
 

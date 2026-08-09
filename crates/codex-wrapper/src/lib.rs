@@ -547,6 +547,11 @@ impl CodexBuilder {
     }
 
     /// Append a raw global argument passed before any subcommand.
+    ///
+    /// When an exec command has a typed rollout budget, conflicting global
+    /// `--enable/--disable rollout_budget` arguments are suppressed at final
+    /// assembly. Codex applies feature toggles after config regardless of argv
+    /// order, so retaining one could silently defeat the typed protection.
     #[must_use]
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.global_args.push(arg.into());
@@ -562,6 +567,9 @@ impl CodexBuilder {
     }
 
     /// Enable a feature flag globally (`--enable <name>`).
+    ///
+    /// A `rollout_budget` toggle is suppressed for an exec command that has a
+    /// typed [`RolloutBudgetConfig`].
     #[must_use]
     pub fn enable(mut self, feature: impl Into<String>) -> Self {
         self.global_args.push("--enable".into());
@@ -570,6 +578,9 @@ impl CodexBuilder {
     }
 
     /// Disable a feature flag globally (`--disable <name>`).
+    ///
+    /// A `rollout_budget` toggle is suppressed for an exec command that has a
+    /// typed [`RolloutBudgetConfig`].
     #[must_use]
     pub fn disable(mut self, feature: impl Into<String>) -> Self {
         self.global_args.push("--disable".into());

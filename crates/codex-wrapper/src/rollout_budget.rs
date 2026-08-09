@@ -4,11 +4,14 @@
 //! usage only after a complete CLI turn and can refuse the next turn; this
 //! one asks Codex itself to stop an in-progress `exec` at a response boundary.
 //!
-//! The native meter is not portable total-token usage. Codex prefers a
-//! provider-reported `codex_rollout_budget_units` value. When that is absent,
-//! it computes `output_tokens * sampling_token_weight` plus non-cached input
-//! tokens times `prefill_token_weight`. Cached input is not included in that
-//! fallback. One response can cross the limit before Codex observes it.
+//! The native meter is not portable total-token usage. Codex 0.145 and 0.146
+//! always compute `output_tokens * sampling_token_weight` plus non-cached
+//! input tokens times `prefill_token_weight`. Starting with 0.147, Codex
+//! prefers a provider-reported `codex_rollout_budget_units` value when one is
+//! available and otherwise uses that weighted fallback. Cached input is not
+//! included in the fallback. Provider-reported units may have different,
+//! opaque semantics, so hosts must not treat a CLI upgrade as an unchanged
+//! portable meter. One response can cross the limit before Codex observes it.
 
 use crate::error::{Error, Result};
 
@@ -27,7 +30,7 @@ pub struct RolloutBudgetConfig {
 }
 
 impl RolloutBudgetConfig {
-    /// Start a rollout-budget builder with the native weighted-token limit.
+    /// Start a builder with the native rollout-budget-unit limit.
     #[must_use]
     pub fn builder(limit_tokens: u64) -> RolloutBudgetConfigBuilder {
         RolloutBudgetConfigBuilder {
@@ -38,7 +41,7 @@ impl RolloutBudgetConfig {
         }
     }
 
-    /// The configured native weighted-token limit.
+    /// The configured native rollout-budget-unit limit.
     #[must_use]
     pub fn limit_tokens(&self) -> u64 {
         self.limit_tokens
@@ -74,6 +77,10 @@ impl RolloutBudgetConfig {
             self.limit_tokens, reminders, self.sampling_token_weight, self.prefill_token_weight,
         )
     }
+
+    pub(crate) fn is_config_override(value: &str) -> bool {
+        value.starts_with("features.rollout_budget={enabled=true,limit_tokens=")
+    }
 }
 
 /// Builder for [`RolloutBudgetConfig`].
@@ -86,7 +93,7 @@ pub struct RolloutBudgetConfigBuilder {
 }
 
 impl RolloutBudgetConfigBuilder {
-    /// Replace the remaining-token thresholds that make Codex restate the budget.
+    /// Replace the remaining-unit thresholds that make Codex restate the budget.
     ///
     /// An empty list is valid and disables threshold reminders. Codex still
     /// includes the initial remaining-budget message and enforces the limit.

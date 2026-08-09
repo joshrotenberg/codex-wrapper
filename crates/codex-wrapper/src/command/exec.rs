@@ -262,18 +262,20 @@ impl ExecCommand {
         self
     }
 
-    /// Enforce a Codex-native weighted-token budget for this execution.
+    /// Enforce a Codex-native rollout-unit budget for this execution.
     ///
     /// Codex checks the budget at response boundaries, so one response can
-    /// cross the limit before the run stops. The native meter prefers
-    /// provider-supplied rollout units; its fallback weights output and
-    /// non-cached input rather than portable total-token usage. See
-    /// [`RolloutBudgetConfig`] for the exact contract.
+    /// cross the limit before the run stops. Codex 0.145-0.146 use weighted
+    /// output and non-cached input; starting with 0.147, a provider-supplied
+    /// rollout-unit value takes precedence when available. Neither is
+    /// portable total-token usage. See [`RolloutBudgetConfig`] for the exact
+    /// versioned contract.
     ///
     /// This typed override is emitted after raw config, and conflicting
-    /// `rollout_budget` feature toggles are suppressed. Codex applies feature
-    /// toggles after every `-c` value regardless of argv order, so retaining
-    /// either toggle would otherwise disable or replace this table.
+    /// `rollout_budget` feature toggles from both this command and its
+    /// [`crate::Codex`] client are suppressed. Codex applies feature toggles
+    /// after every `-c` value regardless of argv order, so retaining either
+    /// toggle would otherwise disable or replace this table.
     #[must_use]
     pub fn rollout_budget(mut self, budget: RolloutBudgetConfig) -> Self {
         self.rollout_budget = Some(budget);
@@ -821,7 +823,7 @@ impl ExecResumeCommand {
         self
     }
 
-    /// Enforce a Codex-native weighted-token budget for this resumed execution.
+    /// Enforce a Codex-native rollout-unit budget for this resumed execution.
     ///
     /// The meter and response-boundary overshoot are identical to
     /// [`ExecCommand::rollout_budget`]. Emitting the same config on resume is
