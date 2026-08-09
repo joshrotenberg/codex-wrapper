@@ -47,7 +47,7 @@ impl RolloutBudgetConfig {
         self.limit_tokens
     }
 
-    /// Remaining-token thresholds that make Codex restate the budget.
+    /// Remaining rollout-budget-unit thresholds that make Codex restate the budget.
     #[must_use]
     pub fn reminder_at_remaining_tokens(&self) -> &[u64] {
         &self.reminder_at_remaining_tokens
