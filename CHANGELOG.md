@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.0...v0.4.1) - 2026-08-17
+
+### Fixed
+
+- implement awaited cancellation settlement ([#126](https://github.com/joshrotenberg/codex-wrapper/pull/126))
+
 ## [0.4.0](https://github.com/joshrotenberg/codex-wrapper/compare/v0.3.1...v0.4.0) - 2026-08-17
 
 ### Added
