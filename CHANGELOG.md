@@ -2,66 +2,93 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.4.1](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.0...v0.4.1) - 2026-08-17
+## [0.4.1] - 2026-08-17
 
-### Fixed
+### Bug Fixes
 
-- implement awaited cancellation settlement ([#126](https://github.com/joshrotenberg/codex-wrapper/pull/126))
+- Implement awaited cancellation settlement 
 
-## [0.4.0](https://github.com/joshrotenberg/codex-wrapper/compare/v0.3.1...v0.4.0) - 2026-08-17
+### Miscellaneous
 
-### Added
+- Start awaited cancellation settlement 
+- Release v0.4.1 
 
-- support resume prompts over stdin ([#124](https://github.com/joshrotenberg/codex-wrapper/pull/124))
-- *(process)* support cleared child environments ([#121](https://github.com/joshrotenberg/codex-wrapper/pull/121))
-- *(exec)* type the native rollout budget configuration ([#118](https://github.com/joshrotenberg/codex-wrapper/pull/118))
+## [0.4.0] - 2026-08-17
 
-## [0.3.1](https://github.com/joshrotenberg/codex-wrapper/compare/v0.3.0...v0.3.1) - 2026-08-08
+### Features
 
-### Added
+- *(exec)* Type the native rollout budget configuration 
+- *(process)* Support cleared child environments 
+- Support resume prompts over stdin 
 
-- support env-backed HTTP MCP headers ([#114](https://github.com/joshrotenberg/codex-wrapper/pull/114))
+### Miscellaneous
 
-### Fixed
+- Bump thiserror from 2.0.19 to 2.0.20 
+- Bump libc from 0.2.183 to 0.2.189 
+- Release v0.4.0 
 
-- deliver JSONL events before process exit ([#115](https://github.com/joshrotenberg/codex-wrapper/pull/115))
+## [0.3.1] - 2026-08-09
 
-## [0.3.0](https://github.com/joshrotenberg/codex-wrapper/compare/v0.2.0...v0.3.0) - 2026-08-07
+### Bug Fixes
 
-### Added
+- Deliver JSONL events before process exit 
 
-- catch up to codex-cli 0.147.0 ([#110](https://github.com/joshrotenberg/codex-wrapper/pull/110))
-- make the run's own process group opt-out ([#109](https://github.com/joshrotenberg/codex-wrapper/pull/109))
-- kill the whole process group on cancellation ([#106](https://github.com/joshrotenberg/codex-wrapper/pull/106))
-- per-run MCP server config via -c overrides ([#105](https://github.com/joshrotenberg/codex-wrapper/pull/105))
-- typed accessors for stream items, and record the absent deltas ([#104](https://github.com/joshrotenberg/codex-wrapper/pull/104))
-- gate the safety-bypass flags behind an explicit opt-in ([#103](https://github.com/joshrotenberg/codex-wrapper/pull/103))
-- *(history)* read-side access to on-disk codex session logs ([#102](https://github.com/joshrotenberg/codex-wrapper/pull/102))
-- *(config)* read-side access to ~/.codex/config.toml ([#101](https://github.com/joshrotenberg/codex-wrapper/pull/101))
-- *(auth)* detect which auth strategy the codex CLI will use ([#100](https://github.com/joshrotenberg/codex-wrapper/pull/100))
-- classify command failures into typed error variants ([#99](https://github.com/joshrotenberg/codex-wrapper/pull/99))
-- *(budget)* cumulative token budget tracking across turns ([#98](https://github.com/joshrotenberg/codex-wrapper/pull/98))
-- tracing spans around command execution ([#97](https://github.com/joshrotenberg/codex-wrapper/pull/97))
-- to_command_string() for previewing the argv a builder will spawn ([#93](https://github.com/joshrotenberg/codex-wrapper/pull/93))
-- add ReviewCommand::execute_json, and correct the item schema against real output ([#79](https://github.com/joshrotenberg/codex-wrapper/pull/79))
-- session cost accumulation and streaming turns ([#72](https://github.com/joshrotenberg/codex-wrapper/pull/72))
-- report the installed CLI against a CI-backed tested-version range ([#71](https://github.com/joshrotenberg/codex-wrapper/pull/71))
-- add missing ignore and output-schema flags to exec resume and exec review ([#68](https://github.com/joshrotenberg/codex-wrapper/pull/68))
+### Features
 
-### Fixed
+- Support env-backed HTTP MCP headers 
 
-- [**breaking**] deliver the prompt for ExecCommand::from_stdin ([#96](https://github.com/joshrotenberg/codex-wrapper/pull/96))
-- kill spawned codex processes when the future is dropped ([#77](https://github.com/joshrotenberg/codex-wrapper/pull/77))
-- parse the event schema the CLI actually emits ([#74](https://github.com/joshrotenberg/codex-wrapper/pull/74))
-- stop emitting invalid approval, search, and full-auto arguments ([#64](https://github.com/joshrotenberg/codex-wrapper/pull/64))
+### Miscellaneous
 
-### Other
+- Release v0.3.1 
 
-- lint every target without default features ([#108](https://github.com/joshrotenberg/codex-wrapper/pull/108))
-- add an examples/ directory ([#95](https://github.com/joshrotenberg/codex-wrapper/pull/95))
-- add LICENSE-MIT and LICENSE-APACHE ([#91](https://github.com/joshrotenberg/codex-wrapper/pull/91))
-- record why codex review is not wrapped, and guard the decision ([#69](https://github.com/joshrotenberg/codex-wrapper/pull/69))
-- check emitted flags and config keys against the installed CLI ([#67](https://github.com/joshrotenberg/codex-wrapper/pull/67))
+## [0.3.0] - 2026-08-07
+
+### Bug Fixes
+
+- Stop emitting invalid approval, search, and full-auto arguments 
+- Parse the event schema the CLI actually emits 
+- Kill spawned codex processes when the future is dropped 
+- [**breaking**] Deliver the prompt for ExecCommand::from_stdin 
+
+### Documentation
+
+- Record why codex review is not wrapped, and guard the decision 
+- Add AGENTS.md and CLAUDE.md 
+- Add an examples/ directory 
+
+### Features
+
+- Add missing ignore and output-schema flags to exec resume and exec review 
+- Report the installed CLI against a CI-backed tested-version range 
+- Session cost accumulation and streaming turns 
+- Add ReviewCommand::execute_json, and correct the item schema against real output 
+- To_command_string() for previewing the argv a builder will spawn 
+- Tracing spans around command execution 
+- *(budget)* Cumulative token budget tracking across turns 
+- Classify command failures into typed error variants 
+- *(auth)* Detect which auth strategy the codex CLI will use 
+- *(config)* Read-side access to ~/.codex/config.toml 
+- *(history)* Read-side access to on-disk codex session logs 
+- Gate the safety-bypass flags behind an explicit opt-in 
+- Typed accessors for stream items, and record the absent deltas 
+- Per-run MCP server config via -c overrides 
+- Kill the whole process group on cancellation 
+- Make the run's own process group opt-out 
+- Catch up to codex-cli 0.147.0 
+
+### Miscellaneous
+
+- Bump tokio from 1.52.3 to 1.53.1 in the tokio-ecosystem group 
+- Bump actions/setup-node from 6 to 7 
+- Add LICENSE-MIT and LICENSE-APACHE 
+- Compile and run the tests/ directory in the test job 
+- Lint every target without default features 
+- Update changelog 
+- Release v0.3.0 
+
+### Testing
+
+- Check emitted flags and config keys against the installed CLI 
 
 ## [0.2.0] - 2026-07-24
 
