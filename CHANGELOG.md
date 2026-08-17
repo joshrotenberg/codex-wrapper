@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0](https://github.com/joshrotenberg/codex-wrapper/compare/v0.3.1...v0.4.0) - 2026-08-17
+
+### Added
+
+- support resume prompts over stdin ([#124](https://github.com/joshrotenberg/codex-wrapper/pull/124))
+- *(process)* support cleared child environments ([#121](https://github.com/joshrotenberg/codex-wrapper/pull/121))
+- *(exec)* type the native rollout budget configuration ([#118](https://github.com/joshrotenberg/codex-wrapper/pull/118))
+
 ## [0.3.1](https://github.com/joshrotenberg/codex-wrapper/compare/v0.3.0...v0.3.1) - 2026-08-08
 
 ### Added
