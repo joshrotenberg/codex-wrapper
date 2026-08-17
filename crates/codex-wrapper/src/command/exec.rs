@@ -643,6 +643,7 @@ impl CodexCommand for ExecCommand {
 pub struct ExecResumeCommand {
     session_id: Option<String>,
     prompt: Option<String>,
+    prompt_via_stdin: bool,
     last: bool,
     all: bool,
     approval_policy: Option<ApprovalPolicyConfig>,
@@ -674,6 +675,7 @@ impl ExecResumeCommand {
         Self {
             session_id: None,
             prompt: None,
+            prompt_via_stdin: false,
             last: false,
             all: false,
             approval_policy: None,
@@ -711,6 +713,35 @@ impl ExecResumeCommand {
     pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
         self.prompt = Some(prompt.into());
         self
+    }
+
+    /// Create a resume command whose prompt is delivered on stdin.
+    ///
+    /// The prompt is replaced by `-` in the argument list and written to the
+    /// child's stdin instead. Select the session separately with
+    /// [`session_id`](Self::session_id) or [`last`](Self::last).
+    #[must_use]
+    pub fn from_stdin(prompt: impl Into<String>) -> Self {
+        Self::new().prompt(prompt).prompt_via_stdin()
+    }
+
+    /// Deliver this command's prompt on stdin rather than in argv.
+    ///
+    /// Retry does not apply to a stdin prompt. Any policy set on the command
+    /// or client is ignored because replaying a consumed pipe would not be a
+    /// faithful retry.
+    #[must_use]
+    pub fn prompt_via_stdin(mut self) -> Self {
+        self.prompt_via_stdin = true;
+        self
+    }
+
+    /// The prompt to write to the child's stdin, if this command sends it
+    /// there. `None` when the prompt travels in argv.
+    #[cfg(feature = "json")]
+    pub(crate) fn stdin_prompt(&self) -> Option<&str> {
+        self.prompt_via_stdin
+            .then(|| self.prompt.as_deref().unwrap_or_default())
     }
 
     /// Resume the most recent session (`--last`).
@@ -926,7 +957,12 @@ impl ExecResumeCommand {
             args.push("--json".into());
         }
 
-        let output = exec::run_codex_with_retry(codex, args, self.retry_policy.as_ref()).await?;
+        let output = if self.prompt_via_stdin {
+            let prompt = self.prompt.as_deref().unwrap_or_default();
+            exec::run_codex_with_stdin_prompt(codex, args, prompt).await?
+        } else {
+            exec::run_codex_with_retry(codex, args, self.retry_policy.as_ref()).await?
+        };
         parse_json_lines(&output.stdout)
     }
 
@@ -1032,13 +1068,19 @@ impl CodexCommand for ExecResumeCommand {
         if let Some(session_id) = &self.session_id {
             args.push(session_id.clone());
         }
-        if let Some(prompt) = &self.prompt {
+        if self.prompt_via_stdin {
+            args.push("-".into());
+        } else if let Some(prompt) = &self.prompt {
             args.push(prompt.clone());
         }
         args
     }
 
     async fn execute(&self, codex: &Codex) -> Result<CommandOutput> {
+        if self.prompt_via_stdin {
+            let prompt = self.prompt.as_deref().unwrap_or_default();
+            return exec::run_codex_with_stdin_prompt(codex, self.args(), prompt).await;
+        }
         exec::run_codex_with_retry(codex, self.args(), self.retry_policy.as_ref()).await
     }
 }
@@ -1409,6 +1451,36 @@ mod tests {
         assert_eq!(result.result, prompt);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_stdin_prompt_reaches_the_child_for_raw_execution() {
+        let codex = echoing_stdin_codex();
+        let prompt = "raw resumed stdin prompt";
+
+        let output = ExecResumeCommand::from_stdin(prompt)
+            .session_id("thread-1")
+            .execute(&codex)
+            .await
+            .unwrap();
+
+        assert!(output.stdout.contains(prompt));
+    }
+
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn resume_stdin_prompt_reaches_the_child_for_json_execution() {
+        let codex = echoing_stdin_codex();
+        let prompt = "json resumed stdin prompt";
+
+        let result = ExecResumeCommand::from_stdin(prompt)
+            .session_id("thread-1")
+            .execute_json(&codex)
+            .await
+            .unwrap();
+
+        assert_eq!(result.result, prompt);
+    }
+
     /// The same delivery, on the streaming path, which pipes stdin separately.
     #[cfg(all(unix, feature = "json"))]
     #[tokio::test]
@@ -1419,6 +1491,27 @@ mod tests {
         let sink = std::sync::Arc::clone(&seen);
 
         ExecCommand::from_stdin(prompt)
+            .stream(&codex, move |event| {
+                if let Some(text) = event.agent_message_text() {
+                    sink.lock().unwrap().push(text);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &[prompt.to_string()]);
+    }
+
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn resume_stdin_prompt_reaches_the_child_when_streaming() {
+        let codex = echoing_stdin_codex();
+        let prompt = "streamed resumed stdin prompt";
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+
+        ExecResumeCommand::from_stdin(prompt)
+            .session_id("thread-1")
             .stream(&codex, move |event| {
                 if let Some(text) = event.agent_message_text() {
                     sink.lock().unwrap().push(text);
@@ -1447,7 +1540,7 @@ mod tests {
         assert_eq!(result.result.len(), prompt.len());
     }
 
-    #[cfg(all(unix, feature = "json"))]
+    #[cfg(unix)]
     fn echoing_stdin_codex() -> Codex {
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -1472,5 +1565,25 @@ mod tests {
     fn prompt_via_stdin_converts_an_existing_prompt() {
         let args = ExecCommand::new("hello").prompt_via_stdin().args();
         assert_eq!(args, vec!["exec", "-"]);
+    }
+
+    #[test]
+    fn resume_from_stdin_emits_the_dash_positional_not_the_prompt() {
+        let args = ExecResumeCommand::from_stdin("secret prompt")
+            .session_id("thread-1")
+            .ephemeral()
+            .args();
+        assert_eq!(args, vec!["exec", "resume", "--ephemeral", "thread-1", "-"]);
+        assert!(!args.iter().any(|arg| arg.contains("secret")));
+    }
+
+    #[test]
+    fn resume_prompt_via_stdin_converts_an_existing_prompt() {
+        let args = ExecResumeCommand::new()
+            .session_id("thread-1")
+            .prompt("hello")
+            .prompt_via_stdin()
+            .args();
+        assert_eq!(args, vec!["exec", "resume", "thread-1", "-"]);
     }
 }

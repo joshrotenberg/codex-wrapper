@@ -65,7 +65,7 @@ where
     if !args.contains(&"--json".to_string()) {
         args.push("--json".into());
     }
-    run_streaming(codex, args, None, handler).await
+    run_streaming(codex, args, cmd.stdin_prompt(), handler).await
 }
 
 /// Core streaming implementation shared by both exec variants.
