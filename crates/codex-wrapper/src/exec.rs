@@ -328,14 +328,18 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
         let mut outcome = SpanOutcome::start(outcome_span);
         let result = match codex.timeout {
             Some(timeout) => {
-                run_with_timeout(
-                    &codex.binary,
-                    &command_args,
-                    &codex.env,
-                    codex.clear_env,
-                    codex.working_dir.as_deref(),
-                    timeout,
-                    codex.process_group,
+                run_internal_inner(
+                    SpawnSpec {
+                        binary: &codex.binary,
+                        args: &command_args,
+                        env: &codex.env,
+                        clear_env: codex.clear_env,
+                        working_dir: codex.working_dir.as_deref(),
+                        stdin_prompt: None,
+                        process_group: codex.process_group,
+                    },
+                    Some(timeout_stop(timeout)),
+                    codex.termination_grace,
                 )
                 .await
             }
@@ -389,6 +393,7 @@ where
         debug!(binary = %codex.binary.display(), args = ?command_args, "executing cancellable codex command");
 
         let mut outcome = SpanOutcome::start(outcome_span);
+        let stop = cancellation_or_timeout(cancel, codex.timeout, codex.termination_grace);
         let result = run_internal_inner(
             SpawnSpec {
                 binary: &codex.binary,
@@ -399,7 +404,7 @@ where
                 stdin_prompt: None,
                 process_group: codex.process_group,
             },
-            Some(Box::pin(cancel)),
+            Some(stop),
             codex.termination_grace,
         )
         .await;
@@ -479,7 +484,8 @@ pub async fn run_codex_with_stdin_prompt(
         );
 
         let mut outcome = SpanOutcome::start(outcome_span);
-        let run = run_internal_inner(
+        let stop = codex.timeout.map(timeout_stop);
+        let result = run_internal_inner(
             SpawnSpec {
                 binary: &codex.binary,
                 args: &command_args,
@@ -489,20 +495,63 @@ pub async fn run_codex_with_stdin_prompt(
                 stdin_prompt: Some(prompt),
                 process_group: codex.process_group,
             },
-            None,
-            Duration::from_secs(0),
+            stop,
+            codex.termination_grace,
+        )
+        .await;
+        outcome.settle_from(&result);
+        result
+    }
+    .instrument(span)
+    .await
+}
+
+/// Run a codex command with a stdin prompt and an explicit cancellation signal.
+///
+/// Cancellation and the client's timeout both terminate the owned process
+/// group and await the direct child before returning. Retry does not apply.
+pub async fn run_codex_with_stdin_prompt_cancellable<C>(
+    codex: &Codex,
+    args: Vec<String>,
+    prompt: &str,
+    cancel: C,
+) -> Result<CommandOutput>
+where
+    C: std::future::Future<Output = ()> + Send,
+{
+    let span = command_span("codex.exec", codex, &args);
+    let outcome_span = span.clone();
+    let command_args = assemble_args(codex, args);
+
+    async move {
+        debug!(
+            binary = %codex.binary.display(),
+            args = ?command_args,
+            prompt_bytes = prompt.len(),
+            "executing cancellable codex command with a stdin prompt"
         );
 
-        let result = match codex.timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, run).await {
-                Ok(result) => result,
-                Err(_) => Err(Error::Timeout {
-                    timeout_seconds: timeout.as_secs(),
-                }),
+        let mut outcome = SpanOutcome::start(outcome_span);
+        let stop = cancellation_or_timeout(cancel, codex.timeout, codex.termination_grace);
+        let result = run_internal_inner(
+            SpawnSpec {
+                binary: &codex.binary,
+                args: &command_args,
+                env: &codex.env,
+                clear_env: codex.clear_env,
+                working_dir: codex.working_dir.as_deref(),
+                stdin_prompt: Some(prompt),
+                process_group: codex.process_group,
             },
-            None => run.await,
-        };
-        outcome.settle_from(&result);
+            Some(stop),
+            codex.termination_grace,
+        )
+        .await;
+
+        match &result {
+            Err(Error::Cancelled { .. }) => outcome.settle("cancelled", None),
+            other => outcome.settle_from_ref(other),
+        }
         result
     }
     .instrument(span)
@@ -533,7 +582,59 @@ async fn run_internal(
     .await
 }
 
-type CancelFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+#[derive(Clone, Copy, Debug)]
+enum StopReason {
+    Cancelled { grace_seconds: u64 },
+    Timeout { timeout_seconds: u64 },
+}
+
+impl StopReason {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Cancelled { grace_seconds } => Error::Cancelled { grace_seconds },
+            Self::Timeout { timeout_seconds } => Error::Timeout { timeout_seconds },
+        }
+    }
+}
+
+type StopFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = StopReason> + Send + 'a>>;
+
+fn timeout_stop(timeout: Duration) -> StopFuture<'static> {
+    Box::pin(async move {
+        tokio::time::sleep(timeout).await;
+        StopReason::Timeout {
+            timeout_seconds: timeout.as_secs(),
+        }
+    })
+}
+
+fn cancellation_or_timeout<'a, C>(
+    cancel: C,
+    timeout: Option<Duration>,
+    grace: Duration,
+) -> StopFuture<'a>
+where
+    C: std::future::Future<Output = ()> + Send + 'a,
+{
+    Box::pin(async move {
+        match timeout {
+            Some(timeout) => tokio::select! {
+                () = cancel => StopReason::Cancelled {
+                    grace_seconds: grace.as_secs(),
+                },
+                () = tokio::time::sleep(timeout) => StopReason::Timeout {
+                    timeout_seconds: timeout.as_secs(),
+                },
+            },
+            None => {
+                cancel.await;
+                StopReason::Cancelled {
+                    grace_seconds: grace.as_secs(),
+                }
+            }
+        }
+    })
+}
 
 /// Everything one spawn needs, gathered so the signature stays readable.
 struct SpawnSpec<'a> {
@@ -551,7 +652,7 @@ struct SpawnSpec<'a> {
 
 async fn run_internal_inner(
     spec: SpawnSpec<'_>,
-    cancel: Option<CancelFuture<'_>>,
+    stop: Option<StopFuture<'_>>,
     grace: Duration,
 ) -> Result<CommandOutput> {
     let SpawnSpec {
@@ -604,61 +705,106 @@ async fn run_internal_inner(
     // means signalling it would hit the parent too.
     let mut group = GroupKillGuard::new(process_group.then(|| child.id()).flatten());
     let child_stdin = child.stdin.take();
+    let mut child_stdout = child.stdout.take().expect("stdout was configured as piped");
+    let mut child_stderr = child.stderr.take().expect("stderr was configured as piped");
 
     let write = async move {
         let (Some(prompt), Some(mut stdin)) = (stdin_prompt, child_stdin) else {
             return Ok(());
         };
         use tokio::io::AsyncWriteExt;
-        stdin.write_all(prompt.as_bytes()).await?;
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .map_err(|e| Error::Io {
+                message: format!("failed to write the prompt to codex stdin: {e}"),
+                source: e,
+                working_dir: working_dir.map(|p| p.to_path_buf()),
+            })?;
         // Closing the write half is what tells the CLI the prompt is
         // complete. Without it the child waits for more input.
-        stdin.shutdown().await
+        stdin.shutdown().await.map_err(|e| Error::Io {
+            message: format!("failed to close codex stdin: {e}"),
+            source: e,
+            working_dir: working_dir.map(|p| p.to_path_buf()),
+        })
     };
 
     // Concurrently, not sequentially: a prompt larger than the pipe buffer
     // blocks until the child reads it, and a child that writes to stdout
     // meanwhile blocks until we read that. Waiting for the write to finish
     // before draining stdout would deadlock both.
-    let run = async { tokio::join!(write, child.wait_with_output()) };
+    let read_stdout = async move {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        child_stdout
+            .read_to_end(&mut bytes)
+            .await
+            .map(|_| bytes)
+            .map_err(|e| Error::Io {
+                message: format!("failed to read codex stdout: {e}"),
+                source: e,
+                working_dir: working_dir.map(|p| p.to_path_buf()),
+            })
+    };
+    let read_stderr = async move {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        child_stderr
+            .read_to_end(&mut bytes)
+            .await
+            .map(|_| bytes)
+            .map_err(|e| Error::Io {
+                message: format!("failed to read codex stderr: {e}"),
+                source: e,
+                working_dir: working_dir.map(|p| p.to_path_buf()),
+            })
+    };
+    let wait = async { child.wait().await.map_err(|e| wait_error(e, working_dir)) };
+    let run = async {
+        let ((), stdout, stderr, status) = tokio::try_join!(write, read_stdout, read_stderr, wait)?;
+        Ok::<_, Error>((stdout, stderr, status))
+    };
 
-    let finished = match cancel {
-        None => Some(run.await),
+    let finished = match stop {
+        None => Ok(run.await),
         // Racing the run against the caller's signal. Cancellation here is
         // graceful, which is the whole reason it cannot live in `Drop`:
         // asking a process to stop and then waiting requires awaiting.
-        Some(cancel) => tokio::select! {
-            outcome = run => Some(outcome),
-            () = cancel => None,
+        Some(stop) => tokio::select! {
+            outcome = run => Ok(outcome),
+            reason = stop => Err(reason),
         },
     };
 
-    let Some((write_result, output_result)) = finished else {
-        group.terminate(grace).await;
-        return Err(Error::Cancelled {
-            grace_seconds: grace.as_secs(),
-        });
+    let (stdout, stderr, status) = match finished {
+        Ok(Ok(finished)) => finished,
+        Ok(Err(error)) => {
+            // A stdin or pipe failure can happen while the child continues
+            // running. Treat it as a stop request and settle ownership before
+            // exposing the I/O error.
+            terminate_and_reap(&mut child, &mut group, grace, working_dir).await?;
+            return Err(error);
+        }
+        Err(reason) => {
+            // The run future is gone before this branch executes, returning
+            // ownership of `child` so cleanup can explicitly reap it.
+            // `GroupKillGuard::terminate` reaches descendants on Unix. The
+            // direct-child kill below is the portable fallback and makes the
+            // wait authoritative on every platform.
+            terminate_and_reap(&mut child, &mut group, grace, working_dir).await?;
+            return Err(reason.into_error());
+        }
     };
-
-    write_result.map_err(|e| Error::Io {
-        message: format!("failed to write the prompt to codex stdin: {e}"),
-        source: e,
-        working_dir: working_dir.map(|p| p.to_path_buf()),
-    })?;
-    let output = output_result.map_err(|e| Error::Io {
-        message: format!("failed to wait on codex: {e}"),
-        source: e,
-        working_dir: working_dir.map(|p| p.to_path_buf()),
-    })?;
 
     // Finished on its own, so there is no group left to kill.
     group.disarm();
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    let stderr = String::from_utf8_lossy(&stderr).to_string();
+    let exit_code = status.code().unwrap_or(-1);
 
-    if !output.status.success() {
+    if !status.success() {
         return Err(Error::from_command_failure(
             format!("{} {}", binary.display(), args.join(" ")),
             exit_code,
@@ -676,6 +822,34 @@ async fn run_internal_inner(
     })
 }
 
+async fn terminate_and_reap(
+    child: &mut tokio::process::Child,
+    group: &mut GroupKillGuard,
+    grace: Duration,
+    working_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    group.terminate(grace).await;
+    if child
+        .try_wait()
+        .map_err(|e| wait_error(e, working_dir))?
+        .is_none()
+        && let Err(error) = child.start_kill()
+        && error.kind() != std::io::ErrorKind::InvalidInput
+    {
+        return Err(wait_error(error, working_dir));
+    }
+    child.wait().await.map_err(|e| wait_error(e, working_dir))?;
+    Ok(())
+}
+
+fn wait_error(error: std::io::Error, working_dir: Option<&std::path::Path>) -> Error {
+    Error::Io {
+        message: format!("failed to wait on codex: {error}"),
+        source: error,
+        working_dir: working_dir.map(|p| p.to_path_buf()),
+    }
+}
+
 /// Apply the client environment policy to a direct child process.
 ///
 /// Kept in one helper because buffered and streaming execution construct
@@ -689,25 +863,6 @@ pub(crate) fn apply_child_environment(
         cmd.env_clear();
     }
     cmd.envs(env);
-}
-
-async fn run_with_timeout(
-    binary: &std::path::Path,
-    args: &[String],
-    env: &std::collections::HashMap<String, String>,
-    clear_env: bool,
-    working_dir: Option<&std::path::Path>,
-    timeout: Duration,
-    process_group: bool,
-) -> Result<CommandOutput> {
-    tokio::time::timeout(
-        timeout,
-        run_internal(binary, args, env, clear_env, working_dir, process_group),
-    )
-    .await
-    .map_err(|_| Error::Timeout {
-        timeout_seconds: timeout.as_secs(),
-    })?
 }
 
 #[cfg(test)]
@@ -953,13 +1108,11 @@ mod tests {
         assert!(!format!("{error:?}").contains(secret));
     }
 
-    /// A wrapper timeout drops `run_internal`'s future. Without
-    /// `kill_on_drop`, `Error::Timeout` would mean "we stopped waiting" while
-    /// codex kept running.
+    /// A wrapper timeout is not terminal until the direct child is reaped.
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_the_spawned_process() {
-        use crate::test_support::{PidFile, blocking_codex, wait_until_gone};
+        use crate::test_support::{PidFile, blocking_codex, is_running_for_test};
 
         let pid_file = PidFile::new("exec-timeout");
         let codex = blocking_codex(&pid_file)
@@ -975,7 +1128,7 @@ mod tests {
 
         let pid = pid_file.read_pid().await;
         assert!(
-            wait_until_gone(pid).await,
+            !is_running_for_test(pid),
             "codex ({pid}) survived the timeout"
         );
     }
@@ -1376,7 +1529,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_codex_cancellable_stops_the_group_gracefully() {
-        use crate::test_support::wait_until_gone;
+        use crate::test_support::is_running_for_test;
 
         let (codex, pid_file) = spawning_codex("group-cancel");
         let codex = Codex::builder()
@@ -1407,10 +1560,90 @@ mod tests {
         );
 
         let (parent, child) = read_pids(&pid_file).await;
-        assert!(wait_until_gone(parent).await, "codex ({parent}) survived");
+        assert!(!is_running_for_test(parent), "codex ({parent}) survived");
         assert!(
-            wait_until_gone(child).await,
+            !is_running_for_test(child),
             "the subprocess ({child}) survived cancellation"
+        );
+    }
+
+    /// Buffered timeout uses the same settled process-tree cleanup as an
+    /// explicit cancellation signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_stops_the_group_before_returning() {
+        use crate::test_support::is_running_for_test;
+
+        let pid_file = crate::test_support::PidFile::new("group-timeout-settled");
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex-spawns-child.sh");
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .env(
+                "CODEX_WRAPPER_TEST_PIDFILE",
+                pid_file.path().to_str().unwrap(),
+            )
+            .timeout(Duration::from_millis(300))
+            .termination_grace(Duration::from_millis(10))
+            .build()
+            .unwrap();
+
+        let result = run_codex(&codex, vec!["exec".into()]).await;
+        assert!(
+            matches!(result, Err(Error::Timeout { .. })),
+            "expected a timeout, got: {result:?}"
+        );
+
+        let (parent, child) = read_pids(&pid_file).await;
+        assert!(!is_running_for_test(parent), "codex ({parent}) survived");
+        assert!(
+            !is_running_for_test(child),
+            "the subprocess ({child}) survived the timeout"
+        );
+    }
+
+    /// A broken stdin pipe is terminal only after the process tree has been
+    /// stopped. Returning the write error first would release the caller while
+    /// the provider could still mutate the workspace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_write_failure_stops_and_reaps_before_returning() {
+        use crate::test_support::is_running_for_test;
+
+        let pid_file = crate::test_support::PidFile::new("stdin-write-failure");
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex-closes-stdin-spawns-child.sh");
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .env(
+                "CODEX_WRAPPER_TEST_PIDFILE",
+                pid_file.path().to_str().unwrap(),
+            )
+            .termination_grace(Duration::from_millis(10))
+            .build()
+            .unwrap();
+
+        let prompt = "x".repeat(4 * 1024 * 1024);
+        let result = run_codex_with_stdin_prompt(
+            &codex,
+            crate::ExecCommand::from_stdin(&prompt).args(),
+            &prompt,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::Io { ref message, .. }) if message.contains("stdin")),
+            "expected a stdin error, got: {result:?}"
+        );
+
+        let (parent, child) = read_pids(&pid_file).await;
+        assert!(!is_running_for_test(parent), "codex ({parent}) survived");
+        assert!(
+            !is_running_for_test(child),
+            "the subprocess ({child}) survived the stdin failure"
         );
     }
 
