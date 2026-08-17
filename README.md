@@ -847,7 +847,7 @@ Fields on open: `subcommand`, `binary`, `working_dir`. On close: `outcome`, `dur
 | `ok` | exited zero |
 | `failed` | exited non-zero |
 | `timeout` | hit the client's timeout |
-| `cancelled` | the future was dropped, so the run was abandoned and the process killed |
+| `cancelled` | explicit cancellation settled, or the future was dropped and the run abandoned |
 
 **The prompt is never recorded.** It travels in argv, so recording the arguments would put it in
 the host's logs; the same goes for the environment. Note that the existing `debug!` line does log
@@ -855,38 +855,34 @@ the full argv, prompt included, as a debugging aid at that level.
 
 ## Cancellation
 
-Dropping the future returned by a command kills the spawned `codex` process. That covers a
-timeout, an aborted task, and a caller that stops awaiting during a graceful shutdown:
-cancelling the future cancels the work, rather than leaving codex running and billing with no
-handle left to stop it.
+Use the cancellable exec methods when terminal settlement matters. They accept a future that
+resolves when cancellation is requested. The wrapper sends SIGTERM to the Unix process group,
+waits for `termination_grace`, sends SIGKILL, and awaits the direct child before returning
+`Error::Cancelled`. Buffered client timeouts use the same cleanup path.
 
 ```rust
-use codex_wrapper::{ExecCommand, CodexCommand};
+use codex_wrapper::{Codex, ExecCommand};
 use std::time::Duration;
-
-// The codex process is killed when the timeout drops the future.
-let result = tokio::time::timeout(
-    Duration::from_secs(30),
-    ExecCommand::new("long task").execute(&codex),
-)
-.await;
-```
-
-The whole process group goes, not just the `codex` process: each run is spawned into its own
-group, so the subprocesses codex started for tool use die with it.
-
-`Drop` cannot wait, so that path is an immediate kill. For a graceful stop, cancel explicitly:
-
-```rust
-use codex_wrapper::exec::run_codex_cancellable;
 
 let codex = Codex::builder()
     .termination_grace(Duration::from_secs(5))
     .build()?;
 
 // SIGTERM to the group, then five seconds, then SIGKILL.
-let result = run_codex_cancellable(&codex, args, async { shutdown.await }).await;
+// The direct child has been reaped when this future returns.
+let result = ExecCommand::new("long task")
+    .execute_json_cancellable(&codex, async { shutdown.await })
+    .await;
 ```
+
+`ExecCommand` and `ExecResumeCommand` both provide `execute_cancellable()`,
+`execute_json_lines_cancellable()`, and `execute_json_cancellable()`. Stdin prompts use the same
+path. Retry does not apply because a cancelled attempt is a caller decision, not a transient
+failure.
+
+Dropping an ordinary command future remains an abrupt safety net. `kill_on_drop` stops the direct
+child and a drop guard kills the Unix process group, but `Drop` cannot await reaping. A supervisor
+that needs settlement should signal the cancellable method and keep polling it until it returns.
 
 Groups are on by default, and can be turned off:
 
@@ -900,9 +896,9 @@ terminal-attached host that shells out synchronously and treats the terminal as 
 the default suits a supervisor that cancels programmatically. `claude-wrapper` has the same
 option under the same name.
 
-One limit remains: reaping needs the tokio runtime to still be running, so a future dropped as
-part of runtime shutdown may not get far enough. Process groups are unix-only; elsewhere this
-degrades to killing the direct child.
+Process groups are Unix-only. Elsewhere explicit cancellation kills and awaits the direct child,
+but the wrapper cannot make the same descendant-process guarantee. Reaping also needs the Tokio
+runtime to remain alive; the abrupt dropped-future fallback cannot settle during runtime teardown.
 
 ## Retry Policy
 

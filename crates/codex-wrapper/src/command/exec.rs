@@ -500,6 +500,29 @@ impl ExecCommand {
         crate::streaming::stream_exec(codex, self, handler).await
     }
 
+    /// Execute with an explicit cancellation signal.
+    ///
+    /// When `cancel` resolves, the wrapper terminates the owned process group,
+    /// awaits the direct child, and then returns [`Error::Cancelled`]. The
+    /// client timeout uses the same settled cleanup path. Retry does not
+    /// apply to cancellable execution.
+    pub async fn execute_cancellable<C>(&self, codex: &Codex, cancel: C) -> Result<CommandOutput>
+    where
+        C: std::future::Future<Output = ()> + Send,
+    {
+        if self.prompt_via_stdin {
+            let prompt = self.prompt.as_deref().unwrap_or_default();
+            return exec::run_codex_with_stdin_prompt_cancellable(
+                codex,
+                self.args(),
+                prompt,
+                cancel,
+            )
+            .await;
+        }
+        exec::run_codex_cancellable(codex, self.args(), cancel).await
+    }
+
     /// Execute the command and parse the output as JSON Lines events.
     ///
     /// Automatically appends `--json` if not already set. Requires the `json`
@@ -520,6 +543,33 @@ impl ExecCommand {
         parse_json_lines(&output.stdout)
     }
 
+    /// Execute cancellably and parse the output as JSON Lines events.
+    ///
+    /// Automatically appends `--json` if not already set. Process cleanup is
+    /// complete before a cancellation or timeout error is returned.
+    #[cfg(feature = "json")]
+    pub async fn execute_json_lines_cancellable<C>(
+        &self,
+        codex: &Codex,
+        cancel: C,
+    ) -> Result<Vec<JsonLineEvent>>
+    where
+        C: std::future::Future<Output = ()> + Send,
+    {
+        let mut args = self.args();
+        if !self.json {
+            args.push("--json".into());
+        }
+
+        let output = if self.prompt_via_stdin {
+            let prompt = self.prompt.as_deref().unwrap_or_default();
+            exec::run_codex_with_stdin_prompt_cancellable(codex, args, prompt, cancel).await?
+        } else {
+            exec::run_codex_cancellable(codex, args, cancel).await?
+        };
+        parse_json_lines(&output.stdout)
+    }
+
     /// Execute the command and return a typed [`QueryResult`].
     ///
     /// Assembles the final result text, ids, and token usage from the JSONL
@@ -528,6 +578,19 @@ impl ExecCommand {
     #[cfg(feature = "json")]
     pub async fn execute_json(&self, codex: &Codex) -> Result<QueryResult> {
         let events = self.execute_json_lines(codex).await?;
+        Ok(QueryResult::from_events(events))
+    }
+
+    /// Execute cancellably and return a typed [`QueryResult`].
+    ///
+    /// The wrapper does not return a terminal cancellation or timeout result
+    /// until process cleanup has completed.
+    #[cfg(feature = "json")]
+    pub async fn execute_json_cancellable<C>(&self, codex: &Codex, cancel: C) -> Result<QueryResult>
+    where
+        C: std::future::Future<Output = ()> + Send,
+    {
+        let events = self.execute_json_lines_cancellable(codex, cancel).await?;
         Ok(QueryResult::from_events(events))
     }
 }
@@ -946,6 +1009,29 @@ impl ExecResumeCommand {
         self
     }
 
+    /// Execute this resumed turn with an explicit cancellation signal.
+    ///
+    /// When `cancel` resolves, the wrapper terminates the owned process group,
+    /// awaits the direct child, and then returns [`Error::Cancelled`]. The
+    /// client timeout uses the same settled cleanup path. Retry does not
+    /// apply to cancellable execution.
+    pub async fn execute_cancellable<C>(&self, codex: &Codex, cancel: C) -> Result<CommandOutput>
+    where
+        C: std::future::Future<Output = ()> + Send,
+    {
+        if self.prompt_via_stdin {
+            let prompt = self.prompt.as_deref().unwrap_or_default();
+            return exec::run_codex_with_stdin_prompt_cancellable(
+                codex,
+                self.args(),
+                prompt,
+                cancel,
+            )
+            .await;
+        }
+        exec::run_codex_cancellable(codex, self.args(), cancel).await
+    }
+
     /// Execute the command and parse the output as JSON Lines events.
     ///
     /// Automatically appends `--json` if not already set. Requires the `json`
@@ -966,6 +1052,33 @@ impl ExecResumeCommand {
         parse_json_lines(&output.stdout)
     }
 
+    /// Execute this resumed turn cancellably and parse JSON Lines events.
+    ///
+    /// Automatically appends `--json` if not already set. Process cleanup is
+    /// complete before a cancellation or timeout error is returned.
+    #[cfg(feature = "json")]
+    pub async fn execute_json_lines_cancellable<C>(
+        &self,
+        codex: &Codex,
+        cancel: C,
+    ) -> Result<Vec<JsonLineEvent>>
+    where
+        C: std::future::Future<Output = ()> + Send,
+    {
+        let mut args = self.args();
+        if !self.json {
+            args.push("--json".into());
+        }
+
+        let output = if self.prompt_via_stdin {
+            let prompt = self.prompt.as_deref().unwrap_or_default();
+            exec::run_codex_with_stdin_prompt_cancellable(codex, args, prompt, cancel).await?
+        } else {
+            exec::run_codex_cancellable(codex, args, cancel).await?
+        };
+        parse_json_lines(&output.stdout)
+    }
+
     /// Execute the resume command and return a typed [`QueryResult`].
     ///
     /// Assembles the final result text, ids, and token usage from the JSONL
@@ -973,6 +1086,19 @@ impl ExecResumeCommand {
     #[cfg(feature = "json")]
     pub async fn execute_json(&self, codex: &Codex) -> Result<QueryResult> {
         let events = self.execute_json_lines(codex).await?;
+        Ok(QueryResult::from_events(events))
+    }
+
+    /// Execute this resumed turn cancellably and return a typed [`QueryResult`].
+    ///
+    /// The wrapper does not return a terminal cancellation or timeout result
+    /// until process cleanup has completed.
+    #[cfg(feature = "json")]
+    pub async fn execute_json_cancellable<C>(&self, codex: &Codex, cancel: C) -> Result<QueryResult>
+    where
+        C: std::future::Future<Output = ()> + Send,
+    {
+        let events = self.execute_json_lines_cancellable(codex, cancel).await?;
         Ok(QueryResult::from_events(events))
     }
 
@@ -1430,6 +1556,57 @@ mod tests {
                 "--output-schema",
                 "/tmp/schema.json"
             ]
+        );
+    }
+
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn fresh_json_cancellation_returns_after_reaping() {
+        use crate::test_support::{PidFile, blocking_codex, is_running_for_test};
+
+        let pid_file = PidFile::new("fresh-json-cancellable");
+        let codex = blocking_codex(&pid_file)
+            .termination_grace(std::time::Duration::from_millis(10))
+            .build()
+            .expect("bash must exist");
+
+        let result = ExecCommand::new("probe")
+            .execute_json_cancellable(&codex, async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::Cancelled { .. })));
+        let pid = pid_file.read_pid().await;
+        assert!(
+            !is_running_for_test(pid),
+            "codex ({pid}) survived cancellation"
+        );
+    }
+
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn resumed_stdin_json_cancellation_returns_after_reaping() {
+        use crate::test_support::{PidFile, blocking_codex, is_running_for_test};
+
+        let pid_file = PidFile::new("resume-stdin-json-cancellable");
+        let codex = blocking_codex(&pid_file)
+            .termination_grace(std::time::Duration::from_millis(10))
+            .build()
+            .expect("bash must exist");
+
+        let result = ExecResumeCommand::from_stdin("continue")
+            .session_id("thread-1")
+            .execute_json_cancellable(&codex, async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::Cancelled { .. })));
+        let pid = pid_file.read_pid().await;
+        assert!(
+            !is_running_for_test(pid),
+            "codex ({pid}) survived cancellation"
         );
     }
 

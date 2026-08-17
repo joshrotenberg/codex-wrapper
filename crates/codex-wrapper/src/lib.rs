@@ -153,18 +153,19 @@
 //!
 //! # Cancellation
 //!
-//! Dropping the future returned by a command kills the spawned `codex`
-//! process. That covers a timeout, an aborted task, and a caller that stops
-//! awaiting during a graceful shutdown: cancelling the future cancels the
-//! work, rather than leaving codex running and billing with no handle left to
-//! stop it.
+//! [`ExecCommand::execute_cancellable`] and
+//! [`ExecResumeCommand::execute_cancellable`] accept an explicit cancellation
+//! future. They terminate the owned process group and await the direct child
+//! before returning. Buffered client timeouts use the same settled cleanup
+//! path.
 //!
-//! Two limits are worth knowing:
+//! Dropping an ordinary command future is an abrupt fallback. It kills the
+//! direct child and, on Unix, the owned process group, but `Drop` cannot await
+//! reaping. A supervisor that needs terminal settlement should signal a
+//! cancellable method and keep polling it until it returns.
 //!
-//! - The kill reaps the `codex` process itself. Subprocesses codex spawned for
-//!   tool use are not signalled and can outlive it.
-//! - Reaping needs the tokio runtime to still be running. A future dropped as
-//!   part of runtime shutdown may not get far enough to kill the child.
+//! Process groups are Unix-only. Elsewhere explicit cancellation kills and
+//! awaits the direct child, but cannot guarantee descendant cleanup.
 //!
 //! # Features
 //!
@@ -571,10 +572,10 @@ impl CodexBuilder {
     /// How long a cancelled run's process group gets to exit before it is
     /// killed. Defaults to five seconds.
     ///
-    /// Applies to
-    /// [`run_codex_cancellable`](crate::exec::run_codex_cancellable), which
-    /// sends SIGTERM, waits this long, then sends SIGKILL. A dropped future
-    /// does not use it: `Drop` cannot wait, so it kills immediately.
+    /// Applies to cancellable exec methods and buffered client timeouts. They
+    /// send SIGTERM, wait this long, send SIGKILL, and await the direct child.
+    /// A dropped future does not use it: `Drop` cannot wait, so it kills
+    /// immediately.
     #[must_use]
     pub fn termination_grace(mut self, duration: Duration) -> Self {
         self.termination_grace = Some(duration);
