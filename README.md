@@ -192,14 +192,19 @@ let output = ExecCommand::new("fix the failing tests")
 
 ### Prompts on stdin
 
-For prompts too large or awkward for argv, `ExecCommand::from_stdin` sends the prompt on the
-child's stdin and emits `codex exec -`:
+For prompts too large or awkward for argv, `ExecCommand::from_stdin` and
+`ExecResumeCommand::from_stdin` send the prompt on the child's stdin and emit `-` in its argv:
 
 ```rust
-use codex_wrapper::{CodexCommand, ExecCommand};
+use codex_wrapper::{CodexCommand, ExecCommand, ExecResumeCommand};
 
 let patch = std::fs::read_to_string("huge.patch")?;
 let output = ExecCommand::from_stdin(format!("Review this patch:\n{patch}"))
+    .execute(&codex)
+    .await?;
+
+let resumed = ExecResumeCommand::from_stdin("Now summarize the risky parts")
+    .session_id("thread-id")
     .execute(&codex)
     .await?;
 ```
