@@ -106,6 +106,7 @@ where
     // and codex keeps running with no handle left to stop it.
     child_cmd.kill_on_drop(true);
     crate::exec::own_process_group(&mut child_cmd, codex.process_group);
+    crate::exec::apply_die_with_parent(&mut child_cmd, codex.die_with_parent);
 
     if let Some(dir) = &codex.working_dir {
         child_cmd.current_dir(dir);
@@ -122,7 +123,7 @@ where
     // which reaches the subprocesses codex started for tool use; kill_on_drop
     // alone would leave those running (#78).
     let mut group =
-        crate::exec::GroupKillGuard::new(codex.process_group.then(|| child.id()).flatten());
+        crate::exec::arm_and_notify(codex.process_group, child.id(), codex.on_spawn.as_ref());
 
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
@@ -342,6 +343,35 @@ mod tests {
 
         let events = events.lock().unwrap();
         assert!(!events.is_empty(), "expected at least one event");
+    }
+
+    #[tokio::test]
+    async fn streaming_reports_the_child_before_events_are_delivered() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let spawn_order = Arc::clone(&order);
+        let event_order = Arc::clone(&order);
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex.sh");
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .on_spawn(Arc::new(move |_| spawn_order.lock().unwrap().push("spawn")))
+            .build()
+            .expect("bash must exist");
+
+        crate::ExecCommand::new("probe")
+            .json()
+            .stream(&codex, move |_| {
+                let mut order = event_order.lock().unwrap();
+                if !order.contains(&"event") {
+                    order.push("event");
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(&order.lock().unwrap()[..2], ["spawn", "event"]);
     }
 
     /// Streaming owns a separate process builder from buffered execution.
