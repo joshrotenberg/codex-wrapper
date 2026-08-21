@@ -110,6 +110,78 @@ pub(crate) fn own_process_group(cmd: &mut Command, enabled: bool) {
 #[cfg(not(unix))]
 pub(crate) fn own_process_group(_cmd: &mut Command, _enabled: bool) {}
 
+/// Whether [`CodexBuilder::die_with_parent`](crate::CodexBuilder::die_with_parent)
+/// has a kernel-level effect on this platform.
+///
+/// This is true only on Linux, where `PR_SET_PDEATHSIG` is available. A
+/// supervisor that needs portable containment should use
+/// [`CodexBuilder::on_spawn`](crate::CodexBuilder::on_spawn) to maintain its
+/// own watchdog on other targets.
+#[must_use]
+pub const fn die_with_parent_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// Ask the kernel to SIGKILL the child when its immediate parent dies.
+///
+/// The parent pid is captured before the fork. After arming the signal in the
+/// child, the hook checks it again and exits if the parent changed in the
+/// fork-to-prctl window. Every call here is async-signal-safe because this hook
+/// runs after `fork` and before `exec`.
+#[cfg(unix)]
+fn pdeathsig_hook() -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    let parent = std::process::id();
+    move || {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: prctl, getppid, and _exit are async-signal-safe calls.
+            unsafe {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() as u32 != parent {
+                    libc::_exit(1);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = parent;
+        }
+        Ok(())
+    }
+}
+
+/// Apply the parent-death policy to a spawn command.
+pub(crate) fn apply_die_with_parent(cmd: &mut Command, enabled: bool) {
+    #[cfg(unix)]
+    if enabled {
+        // SAFETY: `pdeathsig_hook` uses only async-signal-safe operations.
+        unsafe {
+            cmd.pre_exec(pdeathsig_hook());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cmd, enabled);
+    }
+}
+
+/// Arm group cleanup and notify the observer from one process receipt.
+pub(crate) fn arm_and_notify(
+    process_group: bool,
+    pid: Option<u32>,
+    on_spawn: Option<&crate::SpawnObserver>,
+) -> GroupKillGuard {
+    if let (Some(pid), Some(observer)) = (pid, on_spawn) {
+        observer(crate::SpawnInfo {
+            pid,
+            pgid: process_group.then_some(pid),
+        });
+    }
+    GroupKillGuard::new(process_group.then_some(pid).flatten())
+}
+
 /// Signal a process group, given the group leader's pid.
 ///
 /// Unix only: there is no non-unix counterpart, because every caller of this
@@ -337,6 +409,8 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                         working_dir: codex.working_dir.as_deref(),
                         stdin_prompt: None,
                         process_group: codex.process_group,
+                        die_with_parent: codex.die_with_parent,
+                        on_spawn: codex.on_spawn.as_ref(),
                     },
                     Some(timeout_stop(timeout)),
                     codex.termination_grace,
@@ -344,13 +418,20 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                 .await
             }
             None => {
-                run_internal(
-                    &codex.binary,
-                    &command_args,
-                    &codex.env,
-                    codex.clear_env,
-                    codex.working_dir.as_deref(),
-                    codex.process_group,
+                run_internal_inner(
+                    SpawnSpec {
+                        binary: &codex.binary,
+                        args: &command_args,
+                        env: &codex.env,
+                        clear_env: codex.clear_env,
+                        working_dir: codex.working_dir.as_deref(),
+                        stdin_prompt: None,
+                        process_group: codex.process_group,
+                        die_with_parent: codex.die_with_parent,
+                        on_spawn: codex.on_spawn.as_ref(),
+                    },
+                    None,
+                    Duration::ZERO,
                 )
                 .await
             }
@@ -403,6 +484,8 @@ where
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: None,
                 process_group: codex.process_group,
+                die_with_parent: codex.die_with_parent,
+                on_spawn: codex.on_spawn.as_ref(),
             },
             Some(stop),
             codex.termination_grace,
@@ -494,6 +577,8 @@ pub async fn run_codex_with_stdin_prompt(
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: Some(prompt),
                 process_group: codex.process_group,
+                die_with_parent: codex.die_with_parent,
+                on_spawn: codex.on_spawn.as_ref(),
             },
             stop,
             codex.termination_grace,
@@ -542,6 +627,8 @@ where
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: Some(prompt),
                 process_group: codex.process_group,
+                die_with_parent: codex.die_with_parent,
+                on_spawn: codex.on_spawn.as_ref(),
             },
             Some(stop),
             codex.termination_grace,
@@ -555,30 +642,6 @@ where
         result
     }
     .instrument(span)
-    .await
-}
-
-async fn run_internal(
-    binary: &std::path::Path,
-    args: &[String],
-    env: &std::collections::HashMap<String, String>,
-    clear_env: bool,
-    working_dir: Option<&std::path::Path>,
-    process_group: bool,
-) -> Result<CommandOutput> {
-    run_internal_inner(
-        SpawnSpec {
-            binary,
-            args,
-            env,
-            clear_env,
-            working_dir,
-            stdin_prompt: None,
-            process_group,
-        },
-        None,
-        Duration::from_secs(0),
-    )
     .await
 }
 
@@ -648,6 +711,10 @@ struct SpawnSpec<'a> {
     stdin_prompt: Option<&'a str>,
     /// Whether the run leads its own process group.
     process_group: bool,
+    /// Whether the child should die with its immediate parent on Linux.
+    die_with_parent: bool,
+    /// Who to notify immediately after a successful spawn.
+    on_spawn: Option<&'a crate::SpawnObserver>,
 }
 
 async fn run_internal_inner(
@@ -663,6 +730,8 @@ async fn run_internal_inner(
         working_dir,
         stdin_prompt,
         process_group,
+        die_with_parent,
+        on_spawn,
     } = spec;
     let mut cmd = Command::new(binary);
     cmd.args(args);
@@ -680,6 +749,7 @@ async fn run_internal_inner(
     // and codex keeps running with no handle left to stop it.
     cmd.kill_on_drop(true);
     own_process_group(&mut cmd, process_group);
+    apply_die_with_parent(&mut cmd, die_with_parent);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -703,7 +773,7 @@ async fn run_internal_inner(
     // group, which is what reaches the subprocesses codex started.
     // Only meaningful when the run leads its own group. Sharing the parent's
     // means signalling it would hit the parent too.
-    let mut group = GroupKillGuard::new(process_group.then(|| child.id()).flatten());
+    let mut group = arm_and_notify(process_group, child.id(), on_spawn);
     let child_stdin = child.stdin.take();
     let mut child_stdout = child.stdout.take().expect("stdout was configured as piped");
     let mut child_stderr = child.stderr.take().expect("stderr was configured as piped");
@@ -1662,6 +1732,131 @@ mod tests {
             .await
             .unwrap();
         assert!(output.success);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_observer_reports_each_buffered_child_before_returning() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .on_spawn(Arc::new(move |info| sink.lock().unwrap().push(info)))
+            .build()
+            .expect("echo must exist");
+
+        let output = run_codex(&codex, vec!["probe".into()]).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].pid > 0);
+        assert_eq!(seen[0].pgid, Some(seen[0].pid));
+        assert!(output.stdout.contains("probe"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_receipt_never_claims_a_shared_group() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .process_group(false)
+            .on_spawn(Arc::new(move |info| sink.lock().unwrap().push(info)))
+            .build()
+            .expect("echo must exist");
+
+        run_codex(&codex, vec!["probe".into()]).await.unwrap();
+        assert_eq!(seen.lock().unwrap()[0].pgid, None);
+    }
+
+    #[test]
+    fn parent_death_support_matches_the_target() {
+        assert_eq!(die_with_parent_supported(), cfg!(target_os = "linux"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parent_death_policy_composes_with_spawn_observation() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .die_with_parent(true)
+            .on_spawn(Arc::new(move |info| sink.lock().unwrap().push(info)))
+            .build()
+            .expect("echo must exist");
+
+        run_codex(&codex, vec!["probe".into()]).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    const PDEATHSIG_HELPER_ENV: &str = "CODEX_WRAPPER_PDEATHSIG_HELPER";
+
+    #[test]
+    fn pdeathsig_helper_process() {
+        if std::env::var(PDEATHSIG_HELPER_ENV).is_err() {
+            return;
+        }
+        use std::io::Write;
+        use std::sync::Arc;
+
+        let codex = Codex::builder()
+            .binary("/bin/sleep")
+            .die_with_parent(true)
+            .on_spawn(Arc::new(|info| {
+                println!("PID {}", info.pid);
+                let _ = std::io::stdout().flush();
+            }))
+            .build()
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = runtime.block_on(run_codex(&codex, vec!["300".into()]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_dies_when_its_parent_is_sigkilled() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let executable = std::env::current_exe().expect("test binary path");
+        let mut helper = Command::new(executable)
+            .args([
+                "--exact",
+                "exec::tests::pdeathsig_helper_process",
+                "--nocapture",
+            ])
+            .env(PDEATHSIG_HELPER_ENV, "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn helper");
+        let stdout = helper.stdout.take().expect("piped stdout");
+        let pid = BufReader::new(stdout)
+            .lines()
+            .map_while(std::result::Result::ok)
+            .find_map(|line| line.strip_prefix("PID ").and_then(|pid| pid.parse().ok()))
+            .expect("helper reported child pid");
+
+        // SAFETY: this deliberately simulates an uncatchable supervisor crash.
+        unsafe { libc::kill(helper.id() as i32, libc::SIGKILL) };
+        let _ = helper.wait();
+
+        for _ in 0..50 {
+            if !crate::test_support::is_running_for_test(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("child {pid} survived its SIGKILLed parent");
     }
 
     /// Opting out is not cosmetic: without a group of its own, cancelling

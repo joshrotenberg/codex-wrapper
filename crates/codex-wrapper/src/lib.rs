@@ -247,6 +247,30 @@ pub use version::{
     CliVersion, CliVersionStatus, TESTED_CLI_VERSION_MAX, TESTED_CLI_VERSION_MIN, VersionParseError,
 };
 
+/// What the crate knows about a child the moment it is spawned.
+///
+/// Delivered to the [`CodexBuilder::on_spawn`] observer before the run can
+/// produce output. This lets a supervisor durably record the child while the
+/// run is still in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpawnInfo {
+    /// The child's process id.
+    pub pid: u32,
+    /// The child's process group id, when it leads its own group.
+    ///
+    /// `None` when [`CodexBuilder::process_group`] is disabled. In that case
+    /// the child shares the parent's group and its pid must not be passed to
+    /// `killpg`, which would signal the caller's own process group.
+    pub pgid: Option<u32>,
+}
+
+/// Called with [`SpawnInfo`] each time the crate spawns a CLI child.
+///
+/// Must not block. It runs inline between `spawn` and the first read of the
+/// child's output.
+pub type SpawnObserver = std::sync::Arc<dyn Fn(SpawnInfo) + Send + Sync>;
+
 /// Shared Codex CLI client configuration.
 ///
 /// Holds the binary path, working directory, environment variables, global
@@ -274,6 +298,8 @@ pub struct Codex {
     pub(crate) timeout: Option<Duration>,
     pub(crate) termination_grace: Duration,
     pub(crate) process_group: bool,
+    pub(crate) die_with_parent: bool,
+    pub(crate) on_spawn: Option<SpawnObserver>,
     pub(crate) retry_policy: Option<RetryPolicy>,
     pub(crate) tested_cli_version_range: (CliVersion, CliVersion),
 }
@@ -448,6 +474,8 @@ impl fmt::Debug for Codex {
             .field("timeout", &self.timeout)
             .field("termination_grace", &self.termination_grace)
             .field("process_group", &self.process_group)
+            .field("die_with_parent", &self.die_with_parent)
+            .field("has_spawn_observer", &self.on_spawn.is_some())
             .field("retry_policy", &self.retry_policy)
             .field("tested_cli_version_range", &self.tested_cli_version_range)
             .finish()
@@ -490,6 +518,8 @@ pub struct CodexBuilder {
     timeout: Option<Duration>,
     termination_grace: Option<Duration>,
     process_group: Option<bool>,
+    die_with_parent: bool,
+    on_spawn: Option<SpawnObserver>,
     retry_policy: Option<RetryPolicy>,
     tested_cli_version_range: Option<(CliVersion, CliVersion)>,
 }
@@ -602,6 +632,39 @@ impl CodexBuilder {
         self
     }
 
+    /// Observe every child this client spawns, at spawn time.
+    ///
+    /// The observer fires before the run produces output, including for
+    /// buffered, streaming, stdin, cancellable, and retried runs. A retry
+    /// fires once per attempt because each attempt is a distinct process.
+    ///
+    /// The observer runs inline on the spawning thread and must not block.
+    /// A supervisor can use it to write a pidfile or send the receipt to a
+    /// channel before the child can be orphaned.
+    #[must_use]
+    pub fn on_spawn(mut self, observer: SpawnObserver) -> Self {
+        self.on_spawn = Some(observer);
+        self
+    }
+
+    /// Ask the kernel to kill spawned children when this process dies.
+    ///
+    /// This uses `PR_SET_PDEATHSIG` on Linux. Check
+    /// [`die_with_parent_supported`](crate::exec::die_with_parent_supported)
+    /// before relying on it; other targets accept the option as a no-op. A
+    /// portable supervisor should combine this with [`on_spawn`](Self::on_spawn)
+    /// and reconcile recorded children after a restart.
+    ///
+    /// The post-fork hook closes the parent-death race by rechecking the
+    /// parent after arming the signal. This is off by default because it is
+    /// appropriate for supervised work but not for deliberately backgrounded
+    /// CLI processes.
+    #[must_use]
+    pub fn die_with_parent(mut self, enabled: bool) -> Self {
+        self.die_with_parent = enabled;
+        self
+    }
+
     /// Append a raw global argument passed before any subcommand.
     ///
     /// When an exec command has a typed rollout budget, conflicting global
@@ -671,6 +734,8 @@ impl CodexBuilder {
                 .termination_grace
                 .unwrap_or_else(|| Duration::from_secs(5)),
             process_group: self.process_group.unwrap_or(true),
+            die_with_parent: self.die_with_parent,
+            on_spawn: self.on_spawn,
             timeout: self.timeout,
             retry_policy: self.retry_policy,
             tested_cli_version_range: self.tested_cli_version_range.unwrap_or((
@@ -695,6 +760,8 @@ impl fmt::Debug for CodexBuilder {
             .field("timeout", &self.timeout)
             .field("termination_grace", &self.termination_grace)
             .field("process_group", &self.process_group)
+            .field("die_with_parent", &self.die_with_parent)
+            .field("has_spawn_observer", &self.on_spawn.is_some())
             .field("retry_policy", &self.retry_policy)
             .field("tested_cli_version_range", &self.tested_cli_version_range)
             .finish()
