@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.1...v0.4.2) - 2026-08-21
+
+### Added
+
+- *(process)* implement durable worker containment ([#129](https://github.com/joshrotenberg/codex-wrapper/pull/129))
+
 ## [0.4.1](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.0...v0.4.1) - 2026-08-17
 
 ### Fixed
