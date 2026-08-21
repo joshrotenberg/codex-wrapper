@@ -1734,6 +1734,7 @@ mod tests {
         assert!(output.success);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_observer_reports_each_buffered_child_before_returning() {
         use std::sync::{Arc, Mutex};
@@ -1754,6 +1755,7 @@ mod tests {
         assert!(output.stdout.contains("probe"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_receipt_never_claims_a_shared_group() {
         use std::sync::{Arc, Mutex};
@@ -1776,6 +1778,7 @@ mod tests {
         assert_eq!(die_with_parent_supported(), cfg!(target_os = "linux"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn parent_death_policy_composes_with_spawn_observation() {
         use std::sync::{Arc, Mutex};
