@@ -1839,7 +1839,7 @@ mod tests {
         let stdout = helper.stdout.take().expect("piped stdout");
         let pid = BufReader::new(stdout)
             .lines()
-            .map_while(Result::ok)
+            .map_while(std::result::Result::ok)
             .find_map(|line| line.strip_prefix("PID ").and_then(|pid| pid.parse().ok()))
             .expect("helper reported child pid");
 
