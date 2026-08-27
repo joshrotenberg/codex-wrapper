@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.3](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.2...v0.4.3) - 2026-08-27
+
+### Added
+
+- *(exec)* bound captured child output by bytes (closes #132) ([#133](https://github.com/joshrotenberg/codex-wrapper/pull/133))
+
 ## [0.4.2](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.1...v0.4.2) - 2026-08-27
 
 ### Added
