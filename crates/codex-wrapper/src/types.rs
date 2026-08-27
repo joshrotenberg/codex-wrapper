@@ -30,6 +30,17 @@
 //!   `turn.failed`, both with `shared rollout token budget exhausted`. The
 //!   terminal event carries no usage object on 0.145.0 even though Codex used
 //!   its internal meter to make the decision.
+//! - An upstream API rejection emits an `error` event followed by
+//!   `turn.failed`, and the CLI exits 1. Verified on 0.149.0 with two
+//!   distinct output-schema rejections. Both terminal events carry the
+//!   upstream error as a JSON **document nested inside the `error.message`
+//!   string**, not as sibling fields: `{"type":"error","error":{"type":
+//!   "invalid_request_error","code":"invalid_json_schema","message":...,
+//!   "param":"text.format.schema"},"status":400}`. The human message differs
+//!   between the two runs; `type`, `code`, and `status` do not. This is why
+//!   [`JsonLineEvent::turn_failure_api_error`] parses the message rather than
+//!   reading a sibling code, and it corrects the earlier note that Codex
+//!   emits no machine-readable error code.
 //!
 //! - The stream carries **no incremental text**. Three captured runs, a
 //!   one-word exec, a four-sentence exec, and a review, each delivered the
@@ -259,18 +270,65 @@ pub struct JsonLineEvent {
 
 /// A terminal `turn.failed` classification from the Codex JSONL stream.
 ///
-/// Codex does not currently emit a machine-readable error code, so the one
-/// typed class here is pinned to the stable message captured from 0.145.0.
-/// Unknown failures remain distinguishable rather than being forced into the
-/// budget class.
+/// Two classes are typed. The budget class is pinned to the stable message
+/// captured from 0.145.0. The API-rejection class reads the machine-readable
+/// code the upstream API supplies, captured from 0.149.0; see
+/// [`ApiFailure`]. Unknown failures remain distinguishable rather than being
+/// forced into either class.
 #[cfg(feature = "json")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TurnFailureKind {
     /// Codex stopped after exhausting its native shared rollout budget.
     RolloutBudgetExhausted,
+    /// The upstream API rejected the request before generation began.
+    ///
+    /// The turn produced no output and had no side effects, so a caller may
+    /// correct the request and try again. [`JsonLineEvent::turn_failure_api_error`]
+    /// carries the code that distinguishes which part of the request was
+    /// rejected.
+    ApiRequestRejected,
     /// A terminal failure not classified by this wrapper.
     Other,
+}
+
+/// A structured API error carried by a terminal `turn.failed` event.
+///
+/// Codex nests the upstream API error as a JSON document inside the
+/// `error.message` string rather than as sibling fields, so reaching the code
+/// means parsing that string. Captured from `codex-cli` 0.149.0:
+///
+/// ```text
+/// {"type":"turn.failed","error":{"message":"{\n  \"type\": \"error\",
+///   \n  \"error\": {\n    \"type\": \"invalid_request_error\",
+///   \n    \"code\": \"invalid_json_schema\", ... },\n  \"status\": 400\n}"}}
+/// ```
+#[cfg(feature = "json")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ApiFailure {
+    /// The API error class, such as `invalid_request_error`.
+    pub error_type: Option<String>,
+    /// The machine-readable code, such as `invalid_json_schema`.
+    pub code: Option<String>,
+    /// The HTTP status the API returned, such as 400.
+    pub status: Option<u64>,
+}
+
+#[cfg(feature = "json")]
+impl ApiFailure {
+    /// Whether the API rejected the request itself, before generation.
+    ///
+    /// A 4xx status other than 429 means the request was refused rather than
+    /// throttled or failed midway.
+    #[must_use]
+    pub fn rejected_request(&self) -> bool {
+        if self.error_type.as_deref() == Some("invalid_request_error") {
+            return true;
+        }
+        self.status
+            .is_some_and(|status| (400..500).contains(&status) && status != 429)
+    }
 }
 
 #[cfg(feature = "json")]
@@ -313,6 +371,30 @@ impl JsonLineEvent {
             .and_then(serde_json::Value::as_str)
     }
 
+    /// The structured API error carried by a terminal `turn.failed` event.
+    ///
+    /// Returns `None` on any other event, and when the failure message is not
+    /// the JSON document the API produces. A local failure such as an
+    /// exhausted rollout budget carries plain prose and yields `None` here.
+    #[must_use]
+    pub fn turn_failure_api_error(&self) -> Option<ApiFailure> {
+        let message = self.turn_failure_message()?;
+        let document: serde_json::Value = serde_json::from_str(message).ok()?;
+        let error = document.get("error")?;
+        let failure = ApiFailure {
+            error_type: error
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            code: error
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            status: document.get("status").and_then(serde_json::Value::as_u64),
+        };
+        (failure != ApiFailure::default()).then_some(failure)
+    }
+
     /// Classify a terminal `turn.failed` event without downstream string matching.
     #[must_use]
     pub fn turn_failure_kind(&self) -> Option<TurnFailureKind> {
@@ -322,6 +404,11 @@ impl JsonLineEvent {
                 .is_some_and(|message| message.contains("shared rollout token budget exhausted"))
             {
                 TurnFailureKind::RolloutBudgetExhausted
+            } else if self
+                .turn_failure_api_error()
+                .is_some_and(|error| error.rejected_request())
+            {
+                TurnFailureKind::ApiRequestRejected
             } else {
                 TurnFailureKind::Other
             }
@@ -821,6 +908,87 @@ mod tests {
         let nonterminal: JsonLineEvent =
             serde_json::from_str(r#"{"type":"turn.started"}"#).unwrap();
         assert_eq!(nonterminal.turn_failure_kind(), None);
+    }
+
+    /// Both lines are transcriptions of captured `codex-cli` 0.149.0 runs:
+    /// an output schema whose property omits `type`, and a root-level
+    /// `anyOf`. The human message differs between them; the code does not.
+    #[cfg(feature = "json")]
+    #[test]
+    fn classifies_an_api_request_rejection() {
+        let missing_type: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"turn.failed","error":{"message":"{\n  \"type\": \"error\",\n  \"error\": {\n    \"type\": \"invalid_request_error\",\n    \"code\": \"invalid_json_schema\",\n    \"message\": \"Invalid schema for response_format 'codex_output_schema': In context=('properties', 'ok'), schema must have a 'type' key.\",\n    \"param\": \"text.format.schema\"\n  },\n  \"status\": 400\n}"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            missing_type.turn_failure_kind(),
+            Some(TurnFailureKind::ApiRequestRejected)
+        );
+        let error = missing_type.turn_failure_api_error().unwrap();
+        assert_eq!(error.code.as_deref(), Some("invalid_json_schema"));
+        assert_eq!(error.error_type.as_deref(), Some("invalid_request_error"));
+        assert_eq!(error.status, Some(400));
+        assert!(error.rejected_request());
+
+        let root_any_of: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"turn.failed","error":{"message":"{\n  \"type\": \"error\",\n  \"error\": {\n    \"type\": \"invalid_request_error\",\n    \"code\": \"invalid_json_schema\",\n    \"message\": \"Invalid schema for response_format 'codex_output_schema': schema must be a JSON Schema of 'type: \\\"object\\\"', got 'type: \\\"None\\\"'.\",\n    \"param\": \"text.format.schema\"\n  },\n  \"status\": 400\n}"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            root_any_of.turn_failure_kind(),
+            Some(TurnFailureKind::ApiRequestRejected)
+        );
+        assert_eq!(
+            root_any_of
+                .turn_failure_api_error()
+                .and_then(|error| error.code),
+            Some("invalid_json_schema".to_string())
+        );
+    }
+
+    /// A local failure carries prose, not the API's JSON document, and must
+    /// not be mistaken for a request rejection.
+    #[cfg(feature = "json")]
+    #[test]
+    fn a_prose_failure_message_carries_no_api_error() {
+        let budget: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"turn.failed","error":{"message":"shared rollout token budget exhausted"}}"#,
+        )
+        .unwrap();
+        assert_eq!(budget.turn_failure_api_error(), None);
+        assert_eq!(
+            budget.turn_failure_kind(),
+            Some(TurnFailureKind::RolloutBudgetExhausted)
+        );
+
+        let other: JsonLineEvent = serde_json::from_str(
+            r#"{"type":"turn.failed","error":{"message":"tool policy rejected"}}"#,
+        )
+        .unwrap();
+        assert_eq!(other.turn_failure_api_error(), None);
+        assert_eq!(other.turn_failure_kind(), Some(TurnFailureKind::Other));
+    }
+
+    /// A server-side or throttling failure is not a rejected request: the
+    /// turn may have done work, so a caller must not treat it as safe to
+    /// replay after editing the request.
+    #[cfg(feature = "json")]
+    #[test]
+    fn server_and_throttling_failures_are_not_request_rejections() {
+        for (status, error_type) in [(500u64, "server_error"), (429, "rate_limit_error")] {
+            let message = format!(
+                r#"{{"type":"error","error":{{"type":"{error_type}","code":"x"}},"status":{status}}}"#
+            );
+            let event = JsonLineEvent {
+                event_type: "turn.failed".to_string(),
+                extra: HashMap::from([(
+                    "error".to_string(),
+                    serde_json::json!({ "message": message }),
+                )]),
+            };
+            assert!(!event.turn_failure_api_error().unwrap().rejected_request());
+            assert_eq!(event.turn_failure_kind(), Some(TurnFailureKind::Other));
+        }
     }
 
     #[cfg(feature = "json")]
