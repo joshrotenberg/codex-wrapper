@@ -144,6 +144,43 @@ Each CLI subcommand is a separate builder:
 | `VersionCommand` | `codex --version` | Get CLI version |
 | `RawCommand` | *(any)* | Escape hatch for arbitrary args |
 
+### Bounding captured output
+
+Both captured streams are read to completion by default, so peak memory for a
+run is whatever the child decides to print. A consumer cannot add this bound
+itself: by the time it holds a `CommandOutput` the bytes are already resident,
+and for a JSONL run already parsed.
+
+```rust
+use codex_wrapper::{Codex, Error, ExecCommand, CodexCommand};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let codex = Codex::builder()
+    .output_limit(8 * 1024 * 1024)
+    .build()?;
+
+match ExecCommand::new("summarize this repository").execute(&codex).await {
+    Ok(result) => println!("{}", result.stdout),
+    Err(Error::OutputLimitExceeded { stream, limit_bytes }) => {
+        eprintln!("codex {stream} passed {limit_bytes} bytes and was stopped");
+    }
+    Err(other) => return Err(other.into()),
+}
+# Ok(())
+# }
+```
+
+With a ceiling set, each buffer stays under it, so a run holds at most twice
+the ceiling across stdout and stderr. Passing it stops the run the way
+cancellation does, rather than letting the child keep writing into a buffer
+nothing will read.
+
+`Error::OutputLimitExceeded` carries no captured bytes. A prefix returned as
+though it were the whole result would be indistinguishable from a genuinely
+short answer, which is the failure this prevents; enough of the prefix to
+identify the runaway is logged at warn instead. The ceiling is off by default,
+so nothing changes until a host opts in.
+
 ## ExecCommand
 
 Full coverage of `codex exec` options:

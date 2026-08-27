@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tracing::{Instrument, Span, debug, field, info_span};
 
 use crate::Codex;
-use crate::error::{Error, Result};
+use crate::error::{Error, OutputStream, Result};
 
 /// Build the span covering one invocation.
 ///
@@ -409,6 +409,7 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                         working_dir: codex.working_dir.as_deref(),
                         stdin_prompt: None,
                         process_group: codex.process_group,
+                        output_limit: codex.output_limit,
                         die_with_parent: codex.die_with_parent,
                         on_spawn: codex.on_spawn.as_ref(),
                     },
@@ -427,6 +428,7 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                         working_dir: codex.working_dir.as_deref(),
                         stdin_prompt: None,
                         process_group: codex.process_group,
+                        output_limit: codex.output_limit,
                         die_with_parent: codex.die_with_parent,
                         on_spawn: codex.on_spawn.as_ref(),
                     },
@@ -484,6 +486,7 @@ where
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: None,
                 process_group: codex.process_group,
+                output_limit: codex.output_limit,
                 die_with_parent: codex.die_with_parent,
                 on_spawn: codex.on_spawn.as_ref(),
             },
@@ -577,6 +580,7 @@ pub async fn run_codex_with_stdin_prompt(
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: Some(prompt),
                 process_group: codex.process_group,
+                output_limit: codex.output_limit,
                 die_with_parent: codex.die_with_parent,
                 on_spawn: codex.on_spawn.as_ref(),
             },
@@ -627,6 +631,7 @@ where
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: Some(prompt),
                 process_group: codex.process_group,
+                output_limit: codex.output_limit,
                 die_with_parent: codex.die_with_parent,
                 on_spawn: codex.on_spawn.as_ref(),
             },
@@ -711,11 +716,79 @@ struct SpawnSpec<'a> {
     stdin_prompt: Option<&'a str>,
     /// Whether the run leads its own process group.
     process_group: bool,
+    /// Stop capturing a stream once it passes this many bytes.
+    output_limit: Option<usize>,
     /// Whether the child should die with its immediate parent on Linux.
     die_with_parent: bool,
     /// Who to notify immediately after a successful spawn.
     on_spawn: Option<&'a crate::SpawnObserver>,
 }
+
+/// Read one captured stream to EOF, or stop once it passes `limit`.
+///
+/// With no limit this is `read_to_end`, unchanged. With one, the buffer never
+/// exceeds the ceiling, so a run holds at most twice it across the two
+/// streams no matter what the child prints.
+///
+/// Exceeding it is an error rather than a truncated success. A prefix
+/// returned as though it were the whole result would be indistinguishable
+/// from a short answer, which is the failure worth preventing. Enough of the
+/// prefix to identify the runaway is logged instead.
+async fn capture<R>(
+    reader: &mut R,
+    limit: Option<usize>,
+    stream: OutputStream,
+    working_dir: Option<&std::path::Path>,
+) -> Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let io_error = |e: std::io::Error| Error::Io {
+        message: format!("failed to read codex {stream}: {e}"),
+        source: e,
+        working_dir: working_dir.map(std::path::Path::to_path_buf),
+    };
+
+    let Some(limit) = limit else {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.map_err(io_error)?;
+        return Ok(bytes);
+    };
+
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; CAPTURE_CHUNK];
+    loop {
+        let read = reader.read(&mut chunk).await.map_err(io_error)?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len() + read > limit {
+            bytes.truncate(BREACH_LOG_BYTES.min(bytes.len()));
+            tracing::warn!(
+                %stream,
+                limit_bytes = limit,
+                head = %String::from_utf8_lossy(&bytes),
+                "codex output exceeded its capture limit; stopping the run"
+            );
+            return Err(Error::OutputLimitExceeded {
+                stream,
+                limit_bytes: limit,
+            });
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Read size for a bounded capture. Large enough not to syscall per line,
+/// small enough that the overshoot before noticing stays trivial.
+const CAPTURE_CHUNK: usize = 8 * 1024;
+
+/// How much of the prefix to log when a stream breaches its ceiling. The
+/// whole point is not to hold the output, but the first few KiB usually name
+/// the runaway.
+const BREACH_LOG_BYTES: usize = 2 * 1024;
 
 async fn run_internal_inner(
     spec: SpawnSpec<'_>,
@@ -730,6 +803,7 @@ async fn run_internal_inner(
         working_dir,
         stdin_prompt,
         process_group,
+        output_limit,
         die_with_parent,
         on_spawn,
     } = spec;
@@ -805,30 +879,22 @@ async fn run_internal_inner(
     // meanwhile blocks until we read that. Waiting for the write to finish
     // before draining stdout would deadlock both.
     let read_stdout = async move {
-        use tokio::io::AsyncReadExt;
-        let mut bytes = Vec::new();
-        child_stdout
-            .read_to_end(&mut bytes)
-            .await
-            .map(|_| bytes)
-            .map_err(|e| Error::Io {
-                message: format!("failed to read codex stdout: {e}"),
-                source: e,
-                working_dir: working_dir.map(|p| p.to_path_buf()),
-            })
+        capture(
+            &mut child_stdout,
+            output_limit,
+            OutputStream::Stdout,
+            working_dir,
+        )
+        .await
     };
     let read_stderr = async move {
-        use tokio::io::AsyncReadExt;
-        let mut bytes = Vec::new();
-        child_stderr
-            .read_to_end(&mut bytes)
-            .await
-            .map(|_| bytes)
-            .map_err(|e| Error::Io {
-                message: format!("failed to read codex stderr: {e}"),
-                source: e,
-                working_dir: working_dir.map(|p| p.to_path_buf()),
-            })
+        capture(
+            &mut child_stderr,
+            output_limit,
+            OutputStream::Stderr,
+            working_dir,
+        )
+        .await
     };
     let wait = async { child.wait().await.map_err(|e| wait_error(e, working_dir)) };
     let run = async {
@@ -1425,6 +1491,104 @@ mod tests {
         assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
 
         assert_eq!(recorder.value("outcome").as_deref(), Some("timeout"));
+    }
+
+    // -----------------------------------------------------------------
+    // Bounded capture (#132)
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn flooding_codex(stream: &str, limit: Option<usize>) -> Codex {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex-floods.sh");
+        let mut builder = Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .env("CODEX_WRAPPER_TEST_FLOOD_STREAM", stream);
+        if let Some(max_bytes) = limit {
+            builder = builder.output_limit(max_bytes);
+        }
+        builder.build().expect("bash must exist")
+    }
+
+    /// The ceiling has to hold on a single unbroken line, or it is really
+    /// just a line-length check that a runaway one-line writer defeats.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_past_the_ceiling_fails_without_carrying_its_bytes() {
+        for stream in ["stdout", "stderr"] {
+            let codex = flooding_codex(stream, Some(64 * 1024));
+            let error = crate::ExecCommand::new("hello")
+                .execute(&codex)
+                .await
+                .expect_err("the flood exceeds the ceiling");
+
+            let Error::OutputLimitExceeded {
+                stream: reported,
+                limit_bytes,
+            } = error
+            else {
+                panic!("expected OutputLimitExceeded for {stream}, got {error:?}");
+            };
+            assert_eq!(reported.to_string(), stream);
+            assert_eq!(limit_bytes, 64 * 1024);
+
+            // The captured bytes must not ride along in the error, or the
+            // ceiling has bounded nothing.
+            let error = Error::OutputLimitExceeded {
+                stream: reported,
+                limit_bytes,
+            };
+            let rendered = format!("{error} {error:?}");
+            assert!(!rendered.contains("xxxxxxxx"), "{rendered}");
+            assert!(rendered.len() < 512, "error text grew with the output");
+        }
+    }
+
+    /// Off by default, so adding the control changes nothing until a host
+    /// asks for it. This is also the measurement of what the ceiling buys:
+    /// the same child hands back a megabyte when nothing bounds it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn without_a_ceiling_the_whole_flood_is_captured() {
+        let codex = flooding_codex("stdout", None);
+        let result = crate::ExecCommand::new("hello")
+            .execute(&codex)
+            .await
+            .expect("an unbounded capture succeeds, however large");
+        assert_eq!(result.stdout.len(), 128 * 8192);
+    }
+
+    /// A run that stays under its ceiling is untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_within_the_ceiling_is_returned_whole() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake-codex-echo-stdin.sh");
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .output_limit(64 * 1024)
+            .build()
+            .expect("bash must exist");
+        let result = crate::ExecCommand::new("a short prompt")
+            .execute(&codex)
+            .await
+            .expect("well under the ceiling");
+        // Whole means whole: the last line of the stream has to survive, not
+        // just the first, or the ceiling is silently truncating.
+        assert!(
+            result.stdout.contains("thread.started"),
+            "{}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("turn.completed"),
+            "{}",
+            result.stdout
+        );
     }
 
     // -----------------------------------------------------------------

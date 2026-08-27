@@ -2,6 +2,25 @@
 
 use std::path::PathBuf;
 
+/// Which of a child's captured streams an [`Error::OutputLimitExceeded`]
+/// refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputStream {
+    /// The child's standard output.
+    Stdout,
+    /// The child's standard error.
+    Stderr,
+}
+
+impl std::fmt::Display for OutputStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        })
+    }
+}
+
 /// Errors returned by `codex-wrapper` operations.
 ///
 /// This enum is `#[non_exhaustive]`: match arms must include a `_` catch-all so
@@ -13,6 +32,26 @@ pub enum Error {
     /// The `codex` binary was not found in PATH.
     #[error("codex binary not found in PATH")]
     NotFound,
+
+    /// A captured stream passed the ceiling set by
+    /// [`CodexBuilder::output_limit`](crate::CodexBuilder::output_limit).
+    ///
+    /// The run is stopped the same way [`Error::Cancelled`] and
+    /// [`Error::Timeout`] stop it, so the child does not keep writing into a
+    /// buffer nothing will read. No captured bytes are carried here: output
+    /// seen before the ceiling tripped is logged at warn instead, because
+    /// returning a prefix as if it were the result is the truncated success
+    /// this exists to prevent.
+    ///
+    /// The ceiling is off by default and this error cannot occur while it is
+    /// unset.
+    #[error("codex {stream} exceeded the {limit_bytes}-byte capture limit")]
+    OutputLimitExceeded {
+        /// Which captured stream exceeded the ceiling.
+        stream: OutputStream,
+        /// The configured ceiling, in bytes, that was exceeded.
+        limit_bytes: usize,
+    },
 
     /// The CLI could not authenticate.
     ///
