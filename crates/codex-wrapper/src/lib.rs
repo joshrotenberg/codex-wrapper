@@ -233,7 +233,7 @@ pub use command::update::UpdateCommand;
 pub use command::version::VersionCommand;
 #[cfg(feature = "config")]
 pub use config::CodexConfig;
-pub use error::{Error, FailureKind, Result};
+pub use error::{Error, FailureKind, OutputStream, Result};
 pub use exec::CommandOutput;
 #[cfg(feature = "json")]
 pub use history::{SessionFile, SessionLog, SessionMeta, SessionQuery};
@@ -298,6 +298,7 @@ pub struct Codex {
     pub(crate) timeout: Option<Duration>,
     pub(crate) termination_grace: Duration,
     pub(crate) process_group: bool,
+    pub(crate) output_limit: Option<usize>,
     pub(crate) die_with_parent: bool,
     pub(crate) on_spawn: Option<SpawnObserver>,
     pub(crate) retry_policy: Option<RetryPolicy>,
@@ -518,6 +519,7 @@ pub struct CodexBuilder {
     timeout: Option<Duration>,
     termination_grace: Option<Duration>,
     process_group: Option<bool>,
+    output_limit: Option<usize>,
     die_with_parent: bool,
     on_spawn: Option<SpawnObserver>,
     retry_policy: Option<RetryPolicy>,
@@ -632,6 +634,28 @@ impl CodexBuilder {
         self
     }
 
+    /// Stop capturing a stream once it passes `max_bytes`.
+    ///
+    /// Without a ceiling both captured streams are read to EOF, so peak
+    /// memory for a run is whatever the child decides to print. A consumer
+    /// cannot add this itself: by the time it holds a result the bytes are
+    /// already resident, and for a JSON run already parsed.
+    ///
+    /// With a ceiling set, each buffer stays under `max_bytes`, so a run
+    /// holds at most twice that across stdout and stderr. Passing it stops
+    /// the run the way cancellation does and fails with
+    /// [`Error::OutputLimitExceeded`], which carries no captured bytes: a
+    /// prefix returned as though it were the whole result is the failure
+    /// this prevents.
+    ///
+    /// Off by default, so existing behavior is unchanged until a host opts
+    /// in.
+    #[must_use]
+    pub fn output_limit(mut self, max_bytes: usize) -> Self {
+        self.output_limit = Some(max_bytes);
+        self
+    }
+
     /// Observe every child this client spawns, at spawn time.
     ///
     /// The observer fires before the run produces output, including for
@@ -734,6 +758,7 @@ impl CodexBuilder {
                 .termination_grace
                 .unwrap_or_else(|| Duration::from_secs(5)),
             process_group: self.process_group.unwrap_or(true),
+            output_limit: self.output_limit,
             die_with_parent: self.die_with_parent,
             on_spawn: self.on_spawn,
             timeout: self.timeout,
