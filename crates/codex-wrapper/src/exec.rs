@@ -958,7 +958,7 @@ async fn run_internal_inner(
     })
 }
 
-async fn terminate_and_reap(
+pub(crate) async fn terminate_and_reap(
     child: &mut tokio::process::Child,
     group: &mut GroupKillGuard,
     grace: Duration,
