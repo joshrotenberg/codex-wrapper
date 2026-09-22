@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.4](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.3...v0.4.4) - 2026-09-22
+
+### Added
+
+- *(streaming)* add cancellable bounded exec streams ([#138](https://github.com/joshrotenberg/codex-wrapper/pull/138))
+
 ## [0.4.3](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.2...v0.4.3) - 2026-08-27
 
 ### Added
