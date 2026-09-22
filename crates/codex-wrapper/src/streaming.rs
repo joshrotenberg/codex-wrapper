@@ -216,11 +216,22 @@ where
     let stdout_task = async {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
+        let mut captured_bytes = 0usize;
         while let Some(line) = lines.next_line().await.map_err(|e| Error::Io {
             message: format!("failed to read stdout line: {e}"),
             source: e,
             working_dir: codex.working_dir.clone(),
         })? {
+            captured_bytes = captured_bytes.saturating_add(line.len().saturating_add(1));
+            if codex
+                .output_limit
+                .is_some_and(|limit| captured_bytes > limit)
+            {
+                return Err(Error::OutputLimitExceeded {
+                    stream: crate::OutputStream::Stdout,
+                    limit_bytes: codex.output_limit.unwrap_or_default(),
+                });
+            }
             if line.trim_start().starts_with('{') {
                 match serde_json::from_str::<JsonLineEvent>(&line) {
                     Ok(event) => handler(event),
@@ -240,11 +251,22 @@ where
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
         let mut collected = String::new();
+        let mut captured_bytes = 0usize;
         while let Some(line) = lines.next_line().await.map_err(|e| Error::Io {
             message: format!("failed to read stderr line: {e}"),
             source: e,
             working_dir: codex.working_dir.clone(),
         })? {
+            captured_bytes = captured_bytes.saturating_add(line.len().saturating_add(1));
+            if codex
+                .output_limit
+                .is_some_and(|limit| captured_bytes > limit)
+            {
+                return Err(Error::OutputLimitExceeded {
+                    stream: crate::OutputStream::Stderr,
+                    limit_bytes: codex.output_limit.unwrap_or_default(),
+                });
+            }
             if !collected.is_empty() {
                 collected.push('\n');
             }
@@ -665,5 +687,27 @@ mod tests {
             matches!(result, Err(Error::Json { .. })),
             "expected json parse error, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_enforces_the_raw_output_ceiling() {
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg("-c")
+            .arg("i=0; while [ $i -lt 4096 ]; do printf x; i=$((i + 1)); done")
+            .output_limit(128)
+            .build()
+            .expect("bash must exist");
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+
+        let result = stream_exec(&codex, &cmd, |_| {}).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::OutputLimitExceeded {
+                stream: crate::OutputStream::Stdout,
+                limit_bytes: 128,
+            })
+        ));
     }
 }
