@@ -48,7 +48,36 @@ where
     if !args.contains(&"--json".to_string()) {
         args.push("--json".into());
     }
-    run_streaming(codex, args, cmd.stdin_prompt(), handler).await
+    run_streaming(
+        codex,
+        args,
+        cmd.stdin_prompt(),
+        handler,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// Stream JSONL events until the command completes or `cancel` resolves.
+///
+/// Cancellation terminates the owned process group, waits through the
+/// client's configured grace period, and reaps the direct child before
+/// returning [`Error::Cancelled`].
+pub async fn stream_exec_cancellable<C, F>(
+    codex: &Codex,
+    cmd: &crate::command::exec::ExecCommand,
+    cancel: C,
+    handler: F,
+) -> Result<()>
+where
+    C: std::future::Future<Output = ()> + Send,
+    F: FnMut(JsonLineEvent),
+{
+    let mut args = cmd.args();
+    if !args.contains(&"--json".to_string()) {
+        args.push("--json".into());
+    }
+    run_streaming(codex, args, cmd.stdin_prompt(), handler, cancel).await
 }
 
 /// Stream JSONL events from `codex exec resume`, invoking `handler` for each
@@ -65,20 +94,50 @@ where
     if !args.contains(&"--json".to_string()) {
         args.push("--json".into());
     }
-    run_streaming(codex, args, cmd.stdin_prompt(), handler).await
+    run_streaming(
+        codex,
+        args,
+        cmd.stdin_prompt(),
+        handler,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// Stream resumed-turn JSONL events until completion or cancellation.
+///
+/// This has the same settled process-cleanup contract as
+/// [`stream_exec_cancellable`].
+pub async fn stream_exec_resume_cancellable<C, F>(
+    codex: &Codex,
+    cmd: &crate::command::exec::ExecResumeCommand,
+    cancel: C,
+    handler: F,
+) -> Result<()>
+where
+    C: std::future::Future<Output = ()> + Send,
+    F: FnMut(JsonLineEvent),
+{
+    let mut args = cmd.args();
+    if !args.contains(&"--json".to_string()) {
+        args.push("--json".into());
+    }
+    run_streaming(codex, args, cmd.stdin_prompt(), handler, cancel).await
 }
 
 /// Core streaming implementation shared by both exec variants.
 ///
 /// `stdin_prompt` carries the prompt for a `codex exec -` run, where it is
 /// delivered on stdin rather than in argv.
-async fn run_streaming<F>(
+async fn run_streaming<C, F>(
     codex: &Codex,
     args: Vec<String>,
     stdin_prompt: Option<&str>,
     mut handler: F,
+    cancel: C,
 ) -> Result<()>
 where
+    C: std::future::Future<Output = ()> + Send,
     F: FnMut(JsonLineEvent),
 {
     let span = crate::exec::command_span("codex.stream", codex, &args);
@@ -155,13 +214,17 @@ where
     };
 
     let stdout_task = async {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        while let Some(line) = lines.next_line().await.map_err(|e| Error::Io {
-            message: format!("failed to read stdout line: {e}"),
-            source: e,
-            working_dir: codex.working_dir.clone(),
-        })? {
+        let mut reader = BufReader::new(stdout);
+        let mut captured_bytes = 0usize;
+        while let Some(line) = read_bounded_line(
+            &mut reader,
+            &mut captured_bytes,
+            codex.output_limit,
+            crate::OutputStream::Stdout,
+            &codex.working_dir,
+        )
+        .await?
+        {
             if line.trim_start().starts_with('{') {
                 match serde_json::from_str::<JsonLineEvent>(&line) {
                     Ok(event) => handler(event),
@@ -178,14 +241,18 @@ where
     };
 
     let stderr_task = async {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
+        let mut reader = BufReader::new(stderr);
         let mut collected = String::new();
-        while let Some(line) = lines.next_line().await.map_err(|e| Error::Io {
-            message: format!("failed to read stderr line: {e}"),
-            source: e,
-            working_dir: codex.working_dir.clone(),
-        })? {
+        let mut captured_bytes = 0usize;
+        while let Some(line) = read_bounded_line(
+            &mut reader,
+            &mut captured_bytes,
+            codex.output_limit,
+            crate::OutputStream::Stderr,
+            &codex.working_dir,
+        )
+        .await?
+        {
             if !collected.is_empty() {
                 collected.push('\n');
             }
@@ -194,34 +261,17 @@ where
         Ok::<String, Error>(collected)
     };
 
-    let stream_future = async {
-        let (stdin_result, stdout_result, stderr_result) =
-            tokio::join!(stdin_task, stdout_task, stderr_task);
-        stdin_result?;
-        stdout_result?;
-        let stderr_output = stderr_result?;
-
-        let status = child.wait().await.map_err(|e| Error::Io {
+    let wait_task = async {
+        child.wait().await.map_err(|e| Error::Io {
             message: format!("failed to wait on codex process: {e}"),
             source: e,
             working_dir: codex.working_dir.clone(),
-        })?;
-
-        let exit_code = status.code().unwrap_or(-1);
-        if !status.success() {
-            outcome.settle("failed", Some(exit_code));
-            return Err(Error::from_command_failure(
-                format!("{} {}", codex.binary.display(), command_args.join(" ")),
-                exit_code,
-                String::new(),
-                stderr_output,
-                codex.working_dir.clone(),
-            ));
-        }
-
-        outcome.settle("ok", Some(exit_code));
-        group.disarm();
-        Ok(())
+        })
+    };
+    let stream_future = async {
+        let ((), (), stderr_output, status) =
+            tokio::try_join!(stdin_task, stdout_task, stderr_task, wait_task)?;
+        Ok::<_, Error>((stderr_output, status))
     };
 
     // Dropped explicitly before awaiting: the guard exists so the span is the
@@ -229,19 +279,133 @@ where
     // across a yield point.
     drop(_span_guard);
 
-    if let Some(timeout) = codex.timeout {
-        // On elapse the stream future is dropped, taking `outcome` with it,
-        // whose drop records the run as cancelled. That is the same path a
-        // caller dropping this future takes.
-        match tokio::time::timeout(timeout, stream_future.instrument(span.clone())).await {
-            Ok(result) => result,
-            Err(_) => Err(Error::Timeout {
-                timeout_seconds: timeout.as_secs(),
-            }),
+    let stop = async {
+        match codex.timeout {
+            Some(timeout) => tokio::select! {
+                () = cancel => StreamStop::Cancelled,
+                () = tokio::time::sleep(timeout) => StreamStop::Timeout(timeout),
+            },
+            None => {
+                cancel.await;
+                StreamStop::Cancelled
+            }
         }
-    } else {
-        stream_future.instrument(span).await
+    };
+    let finished = tokio::select! {
+        result = stream_future.instrument(span) => Ok(result),
+        reason = stop => Err(reason),
+    };
+
+    let (stderr_output, status) = match finished {
+        Ok(Ok(finished)) => finished,
+        Ok(Err(error)) => {
+            crate::exec::terminate_and_reap(
+                &mut child,
+                &mut group,
+                codex.termination_grace,
+                codex.working_dir.as_deref(),
+            )
+            .await?;
+            outcome.settle("failed", None);
+            return Err(error);
+        }
+        Err(reason) => {
+            crate::exec::terminate_and_reap(
+                &mut child,
+                &mut group,
+                codex.termination_grace,
+                codex.working_dir.as_deref(),
+            )
+            .await?;
+            let error = match reason {
+                StreamStop::Cancelled => {
+                    outcome.settle("cancelled", None);
+                    Error::Cancelled {
+                        grace_seconds: codex.termination_grace.as_secs(),
+                    }
+                }
+                StreamStop::Timeout(timeout) => {
+                    outcome.settle("timeout", None);
+                    Error::Timeout {
+                        timeout_seconds: timeout.as_secs(),
+                    }
+                }
+            };
+            return Err(error);
+        }
+    };
+
+    let exit_code = status.code().unwrap_or(-1);
+    if !status.success() {
+        outcome.settle("failed", Some(exit_code));
+        return Err(Error::from_command_failure(
+            format!("{} {}", codex.binary.display(), command_args.join(" ")),
+            exit_code,
+            String::new(),
+            stderr_output,
+            codex.working_dir.clone(),
+        ));
     }
+
+    outcome.settle("ok", Some(exit_code));
+    group.disarm();
+    Ok(())
+}
+
+enum StreamStop {
+    Cancelled,
+    Timeout(std::time::Duration),
+}
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    captured_bytes: &mut usize,
+    output_limit: Option<usize>,
+    stream: crate::OutputStream,
+    working_dir: &Option<std::path::PathBuf>,
+) -> Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(|source| Error::Io {
+            message: format!("failed to read {stream} line: {source}"),
+            source,
+            working_dir: working_dir.clone(),
+        })?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if output_limit.is_some_and(|limit| captured_bytes.saturating_add(take) > limit) {
+            return Err(Error::OutputLimitExceeded {
+                stream,
+                limit_bytes: output_limit.unwrap_or_default(),
+            });
+        }
+        line.extend_from_slice(&available[..take]);
+        *captured_bytes = captured_bytes.saturating_add(take);
+        let complete = line.last() == Some(&b'\n');
+        reader.consume(take);
+        if complete {
+            line.pop();
+            break;
+        }
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|source| Error::Io {
+            message: format!("failed to decode {stream} line"),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+            working_dir: working_dir.clone(),
+        })
 }
 
 #[cfg(all(test, unix))]
@@ -530,6 +694,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_stream_cancellation_reaps_before_returning() {
+        use crate::test_support::{PidFile, blocking_codex, wait_until_gone};
+
+        let pid_file = PidFile::new("stream-explicit-cancel");
+        let codex = blocking_codex(&pid_file).build().expect("bash must exist");
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+        let cancel = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+
+        let result = stream_exec_cancellable(&codex, &cmd, cancel, |_| {}).await;
+        assert!(matches!(result, Err(Error::Cancelled { .. })));
+
+        let pid = pid_file.read_pid().await;
+        assert!(
+            wait_until_gone(pid).await,
+            "codex ({pid}) survived explicit stream cancellation"
+        );
+    }
+
+    #[tokio::test]
     async fn stream_exec_parse_error() {
         let codex = fake_codex("fake-codex-bad-json.sh");
         let cmd = crate::command::exec::ExecCommand::new("test").json();
@@ -539,5 +724,28 @@ mod tests {
             matches!(result, Err(Error::Json { .. })),
             "expected json parse error, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_enforces_the_raw_output_ceiling() {
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg("-c")
+            .arg("for ((i=0; i<4096; i++)); do printf x; done; sleep 3")
+            .output_limit(128)
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .expect("bash must exist");
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+
+        let result = stream_exec(&codex, &cmd, |_| {}).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::OutputLimitExceeded {
+                stream: crate::OutputStream::Stdout,
+                limit_bytes: 128,
+            })
+        ));
     }
 }

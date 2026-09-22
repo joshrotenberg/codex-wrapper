@@ -500,6 +500,19 @@ impl ExecCommand {
         crate::streaming::stream_exec(codex, self, handler).await
     }
 
+    /// Stream JSONL events until completion or an explicit cancellation.
+    ///
+    /// Process-group termination and direct-child reaping complete before a
+    /// cancellation error is returned.
+    #[cfg(feature = "json")]
+    pub async fn stream_cancellable<C, F>(&self, codex: &Codex, cancel: C, handler: F) -> Result<()>
+    where
+        C: std::future::Future<Output = ()> + Send,
+        F: FnMut(JsonLineEvent),
+    {
+        crate::streaming::stream_exec_cancellable(codex, self, cancel, handler).await
+    }
+
     /// Execute with an explicit cancellation signal.
     ///
     /// When `cancel` resolves, the wrapper terminates the owned process group,
@@ -1113,6 +1126,19 @@ impl ExecResumeCommand {
         F: FnMut(JsonLineEvent),
     {
         crate::streaming::stream_exec_resume(codex, self, handler).await
+    }
+
+    /// Stream resumed-turn JSONL events until completion or cancellation.
+    ///
+    /// Process-group termination and direct-child reaping complete before a
+    /// cancellation error is returned.
+    #[cfg(feature = "json")]
+    pub async fn stream_cancellable<C, F>(&self, codex: &Codex, cancel: C, handler: F) -> Result<()>
+    where
+        C: std::future::Future<Output = ()> + Send,
+        F: FnMut(JsonLineEvent),
+    {
+        crate::streaming::stream_exec_resume_cancellable(codex, self, cancel, handler).await
     }
 }
 

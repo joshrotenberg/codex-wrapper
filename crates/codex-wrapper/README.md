@@ -316,6 +316,9 @@ ExecCommand::new("explain this codebase")
 
 Also available on `ExecResumeCommand::stream()`. The child process's stderr
 is drained concurrently; timeout handling mirrors the buffered exec path.
+Use `stream_cancellable()` on either command when a host has an explicit stop
+signal. It returns only after the owned process group has been terminated and
+the direct child reaped.
 
 ## Multi-Turn Sessions
 
