@@ -214,24 +214,17 @@ where
     };
 
     let stdout_task = async {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
+        let mut reader = BufReader::new(stdout);
         let mut captured_bytes = 0usize;
-        while let Some(line) = lines.next_line().await.map_err(|e| Error::Io {
-            message: format!("failed to read stdout line: {e}"),
-            source: e,
-            working_dir: codex.working_dir.clone(),
-        })? {
-            captured_bytes = captured_bytes.saturating_add(line.len().saturating_add(1));
-            if codex
-                .output_limit
-                .is_some_and(|limit| captured_bytes > limit)
-            {
-                return Err(Error::OutputLimitExceeded {
-                    stream: crate::OutputStream::Stdout,
-                    limit_bytes: codex.output_limit.unwrap_or_default(),
-                });
-            }
+        while let Some(line) = read_bounded_line(
+            &mut reader,
+            &mut captured_bytes,
+            codex.output_limit,
+            crate::OutputStream::Stdout,
+            &codex.working_dir,
+        )
+        .await?
+        {
             if line.trim_start().starts_with('{') {
                 match serde_json::from_str::<JsonLineEvent>(&line) {
                     Ok(event) => handler(event),
@@ -248,25 +241,18 @@ where
     };
 
     let stderr_task = async {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
+        let mut reader = BufReader::new(stderr);
         let mut collected = String::new();
         let mut captured_bytes = 0usize;
-        while let Some(line) = lines.next_line().await.map_err(|e| Error::Io {
-            message: format!("failed to read stderr line: {e}"),
-            source: e,
-            working_dir: codex.working_dir.clone(),
-        })? {
-            captured_bytes = captured_bytes.saturating_add(line.len().saturating_add(1));
-            if codex
-                .output_limit
-                .is_some_and(|limit| captured_bytes > limit)
-            {
-                return Err(Error::OutputLimitExceeded {
-                    stream: crate::OutputStream::Stderr,
-                    limit_bytes: codex.output_limit.unwrap_or_default(),
-                });
-            }
+        while let Some(line) = read_bounded_line(
+            &mut reader,
+            &mut captured_bytes,
+            codex.output_limit,
+            crate::OutputStream::Stderr,
+            &codex.working_dir,
+        )
+        .await?
+        {
             if !collected.is_empty() {
                 collected.push('\n');
             }
@@ -369,6 +355,57 @@ where
 enum StreamStop {
     Cancelled,
     Timeout(std::time::Duration),
+}
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    captured_bytes: &mut usize,
+    output_limit: Option<usize>,
+    stream: crate::OutputStream,
+    working_dir: &Option<std::path::PathBuf>,
+) -> Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(|source| Error::Io {
+            message: format!("failed to read {stream} line: {source}"),
+            source,
+            working_dir: working_dir.clone(),
+        })?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if output_limit.is_some_and(|limit| captured_bytes.saturating_add(take) > limit) {
+            return Err(Error::OutputLimitExceeded {
+                stream,
+                limit_bytes: output_limit.unwrap_or_default(),
+            });
+        }
+        line.extend_from_slice(&available[..take]);
+        *captured_bytes = captured_bytes.saturating_add(take);
+        let complete = line.last() == Some(&b'\n');
+        reader.consume(take);
+        if complete {
+            line.pop();
+            break;
+        }
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|source| Error::Io {
+            message: format!("failed to decode {stream} line"),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+            working_dir: working_dir.clone(),
+        })
 }
 
 #[cfg(all(test, unix))]
@@ -694,8 +731,9 @@ mod tests {
         let codex = Codex::builder()
             .binary("/bin/bash")
             .arg("-c")
-            .arg("i=0; while [ $i -lt 4096 ]; do printf x; i=$((i + 1)); done")
+            .arg("for ((i=0; i<4096; i++)); do printf x; done; sleep 3")
             .output_limit(128)
+            .timeout(std::time::Duration::from_secs(1))
             .build()
             .expect("bash must exist");
         let cmd = crate::command::exec::ExecCommand::new("probe").json();
