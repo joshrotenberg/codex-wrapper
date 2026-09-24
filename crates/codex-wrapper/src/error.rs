@@ -188,6 +188,33 @@ pub enum Error {
         source: serde_json::Error,
     },
 
+    /// The installed CLI version does not meet the minimum requirement.
+    #[error("CLI version {found} does not meet minimum requirement {minimum}")]
+    VersionMismatch {
+        found: crate::version::CliVersion,
+        minimum: crate::version::CliVersion,
+    },
+
+    /// The installed CLI is outside the wrapper's tested-against range.
+    ///
+    /// Only returned by
+    /// [`Codex::ensure_tested_cli_version`](crate::Codex::ensure_tested_cli_version).
+    /// The default path reports drift as a
+    /// [`CliVersionStatus`](crate::CliVersionStatus) rather than an error.
+    #[error("CLI version {found} is outside the tested range {tested_min}..={tested_max}")]
+    UntestedCliVersion {
+        found: crate::version::CliVersion,
+        tested_min: crate::version::CliVersion,
+        tested_max: crate::version::CliVersion,
+    },
+
+    // Add new variants at the end of the enum, below the last one. The enum has no
+    // `#[repr]`, so inserting a variant earlier shifts the implicit
+    // discriminant of every variant after it, which `cargo-semver-checks`
+    // reports as a breaking change (`enum_no_repr_variant_discriminant_changed`)
+    // and which makes release-plz propose a major version. `Error` carries
+    // data, so no caller can read those values with `as`; the lint is stricter
+    // than it needs to be, and it still decides the version.
     /// `codex app-server` answered a request with a JSON-RPC error.
     ///
     /// `code` and `message` are the server's own. `method` is the request that
@@ -216,26 +243,6 @@ pub enum Error {
     AppServerProtocol {
         /// What went wrong.
         message: String,
-    },
-
-    /// The installed CLI version does not meet the minimum requirement.
-    #[error("CLI version {found} does not meet minimum requirement {minimum}")]
-    VersionMismatch {
-        found: crate::version::CliVersion,
-        minimum: crate::version::CliVersion,
-    },
-
-    /// The installed CLI is outside the wrapper's tested-against range.
-    ///
-    /// Only returned by
-    /// [`Codex::ensure_tested_cli_version`](crate::Codex::ensure_tested_cli_version).
-    /// The default path reports drift as a
-    /// [`CliVersionStatus`](crate::CliVersionStatus) rather than an error.
-    #[error("CLI version {found} is outside the tested range {tested_min}..={tested_max}")]
-    UntestedCliVersion {
-        found: crate::version::CliVersion,
-        tested_min: crate::version::CliVersion,
-        tested_max: crate::version::CliVersion,
     },
 }
 
