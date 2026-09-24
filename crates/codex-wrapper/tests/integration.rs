@@ -497,3 +497,182 @@ async fn history_reads_every_real_session() {
         &empty[..empty.len().min(3)]
     );
 }
+
+// ---------------------------------------------------------------------------
+// app-server
+//
+// These run a real turn, so they need an authenticated `codex` and spend a few
+// thousand tokens each.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "app-server")]
+mod app_server {
+    use std::time::Duration;
+
+    use codex_wrapper::app_server::{
+        AppServer, ServerMessage, ThreadStartParams, TurnCompleted, TurnStartParams, TurnStatus,
+        UserInput,
+    };
+    use codex_wrapper::{ApprovalPolicy, SandboxMode};
+
+    const WAIT: Duration = Duration::from_secs(120);
+
+    /// Start a server, and a read-only turn that runs `sleep` so there is time
+    /// to act on it.
+    async fn running_turn(
+        seconds: u32,
+    ) -> (
+        AppServer,
+        codex_wrapper::app_server::Thread,
+        codex_wrapper::app_server::Turn,
+    ) {
+        let dir = std::env::temp_dir().join(format!("codex-wrapper-it-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut server = AppServer::builder(&super::codex()).start().await.unwrap();
+        let thread = server
+            .thread_start(
+                ThreadStartParams::new()
+                    .cwd(&dir)
+                    .ephemeral(true)
+                    .approval_policy(ApprovalPolicy::Never)
+                    .sandbox(SandboxMode::ReadOnly),
+            )
+            .await
+            .unwrap();
+        let turn = server
+            .turn_start(
+                TurnStartParams::text(
+                    &thread.id,
+                    format!("Run the shell command `sleep {seconds}` and then reply with the single word DONE."),
+                )
+                .effort("low"),
+            )
+            .await
+            .unwrap();
+        // Wait for the command itself to start, so the action lands mid-turn.
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let message = server.next_message().await.unwrap().expect("server closed");
+                if let ServerMessage::Notification(n) = message
+                    && n.method == "item/started"
+                    && n.params.pointer("/item/type") == Some(&"commandExecution".into())
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the command never started");
+        (server, thread, turn)
+    }
+
+    async fn completion(server: &mut AppServer) -> (TurnCompleted, Vec<ServerMessage>) {
+        tokio::time::timeout(WAIT, async {
+            let mut seen = Vec::new();
+            loop {
+                let message = server.next_message().await.unwrap().expect("server closed");
+                let done = match &message {
+                    ServerMessage::Notification(n) => n.turn_completed(),
+                    _ => None,
+                };
+                seen.push(message);
+                if let Some(done) = done {
+                    return (done, seen);
+                }
+            }
+        })
+        .await
+        .expect("the turn never completed")
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn steering_a_real_turn_delivers_the_text() {
+        let (mut server, thread, turn) = running_turn(8).await;
+
+        let landed = server
+            .turn_steer(
+                &thread.id,
+                &turn.id,
+                vec![UserInput::text("Also append the word STEERED after DONE.")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(landed, turn.id);
+
+        let (done, seen) = completion(&mut server).await;
+        assert_eq!(done.turn.status, TurnStatus::Completed);
+        // The answer comes from the item stream: 0.145.0 sends no items in
+        // `turn/completed`.
+        let answer = seen.iter().rev().find_map(|message| match message {
+            ServerMessage::Notification(n) => n.agent_message().filter(|m| m.is_final_answer()),
+            _ => None,
+        });
+        assert!(answer.is_some(), "the turn produced no final answer");
+        // The server records the steered text as a user message on the turn,
+        // which is deterministic where the model's reply is not.
+        let recorded = seen.iter().any(|message| match message {
+            ServerMessage::Notification(n) => {
+                n.method == "item/completed"
+                    && n.params
+                        .pointer("/item/content/0/text")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| t.contains("STEERED"))
+            }
+            _ => false,
+        });
+        assert!(recorded, "the steered text never reached the turn");
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn interrupting_a_real_turn_ends_it_as_interrupted() {
+        let (mut server, thread, turn) = running_turn(30).await;
+
+        server.turn_interrupt(&thread.id, &turn.id).await.unwrap();
+
+        let (done, _) = completion(&mut server).await;
+        assert_eq!(done.turn.status, TurnStatus::Interrupted);
+        assert_eq!(done.turn.final_message(), None);
+        server.shutdown().await.unwrap();
+    }
+
+    /// Whether a `sleep` with exactly this duration is running anywhere.
+    fn sleep_running(seconds: u32) -> bool {
+        let table = std::process::Command::new("ps")
+            .args(["-axo", "command="])
+            .output()
+            .expect("ps must be available");
+        String::from_utf8_lossy(&table.stdout).lines().any(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            words.len() == 2
+                && words[0].rsplit('/').next() == Some("sleep")
+                && words[1] == seconds.to_string()
+        })
+    }
+
+    /// The server starts shell commands in process groups of their own, so
+    /// signalling its group does not stop them. Closing its stdin does.
+    #[tokio::test]
+    #[ignore]
+    async fn shutdown_stops_a_command_the_turn_is_running() {
+        // Distinctive, so a `sleep` from anything else cannot be mistaken.
+        let seconds = 4000 + std::process::id() % 1000;
+        let (server, _thread, _turn) = running_turn(seconds).await;
+        assert!(sleep_running(seconds), "the command was not running");
+
+        server.shutdown().await.unwrap();
+
+        // The server reaps its command as it exits.
+        let mut gone = false;
+        for _ in 0..50 {
+            if !sleep_running(seconds) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(gone, "`sleep {seconds}` outlived shutdown");
+    }
+}
