@@ -18,6 +18,8 @@
 #                  under --strict-config
 #   exit-on-turn   exits without answering `turn/start`
 #   exit-clean     exits 0 before answering `initialize`
+#   close-stdin    closes its stdin at once, so the client's first write fails,
+#                  then fails as `exit-on-start` does a moment later
 #   bad-init       answers `initialize` with a line that is not valid JSON
 #   no-result      answers `thread/start` with an id and neither result nor error
 #   flood          sends one very long notification after `initialized`
@@ -44,6 +46,13 @@ CWD=/tmp/fixture
 
 if [ "$mode" = exit-clean ]; then
   exit 0
+fi
+
+if [ "$mode" = close-stdin ]; then
+  exec 0<&-
+  sleep 0.3
+  echo 'Error: unknown configuration field `bogus_key` in -c/--config override' >&2
+  exit 1
 fi
 
 if [ "$mode" = exit-on-start ]; then

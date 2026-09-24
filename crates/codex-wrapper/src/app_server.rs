@@ -183,8 +183,8 @@ use std::time::Duration;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{Instrument, debug, warn};
 
@@ -894,7 +894,8 @@ impl AppServerHandle {
         match reason {
             Some(reason) => self.shared.error_for(&reason, method),
             None => Error::AppServerProtocol {
-                message: "the app-server session is not accepting messages".into(),
+                message: "codex app-server is no longer accepting messages (its stdin is closed)"
+                    .into(),
             },
         }
     }
@@ -1458,8 +1459,8 @@ async fn drain_stderr(mut stderr: ChildStderr, shared: Arc<Shared>) {
 ///
 /// Writing happens here, not in the request future, so a request that is
 /// dropped part way through cannot leave half a line on the wire.
-async fn write_stdin(
-    mut stdin: ChildStdin,
+async fn write_stdin<W: AsyncWrite + Unpin>(
+    mut stdin: W,
     mut lines: mpsc::UnboundedReceiver<Outgoing>,
     shared: Arc<Shared>,
 ) {
@@ -1472,9 +1473,19 @@ async fn write_stdin(
                 }
                 .await;
                 if let Err(error) = written {
-                    shared.fail(Closed::Broken(format!(
-                        "failed to write to codex app-server stdin: {error}"
-                    )));
+                    if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        // The server closed its input, which it does by
+                        // exiting. Its output closes with it, and the reader
+                        // reports that together with the server's stderr and,
+                        // at startup, its exit status. Failing the session
+                        // here first would hide all of that behind "broken
+                        // pipe", and which one wins is a race.
+                        debug!("codex app-server closed its stdin");
+                    } else {
+                        shared.fail(Closed::Broken(format!(
+                            "failed to write to codex app-server stdin: {error}"
+                        )));
+                    }
                     break;
                 }
             }
@@ -2387,6 +2398,59 @@ mod tests {
         assert!(error.to_string().contains("bogus_key"), "{error}");
     }
 
+    /// A server that dies at startup can be noticed by the client's write (the
+    /// pipe is closed, EPIPE) before its read (the stream has ended). Either
+    /// way the server went away by itself, and what says why is its stderr and
+    /// exit status, which the reader reports at the end of the stream. A write
+    /// error must not become the session's failure and hide that; this was
+    /// seen as a flaky failure on Linux CI.
+    ///
+    /// An in-memory pipe stands in for the child's stdin. A real one made this
+    /// test hang under load: on macOS a pipe's close-on-exec flag is set after
+    /// it is created, so a process forked by a concurrent test can inherit the
+    /// read end, and then the write never fails.
+    #[tokio::test]
+    async fn a_broken_stdin_pipe_leaves_the_verdict_to_the_reader() {
+        let (stdin, server_end) = tokio::io::duplex(64);
+        drop(server_end);
+
+        let (events, _received) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared::new(events, None));
+        let (lines, receiver) = mpsc::unbounded_channel();
+        lines.send(Outgoing::Line(b"{}\n".to_vec())).unwrap();
+
+        // Ends by itself when the write fails. If it did not fail, `lines` is
+        // still open and this would wait forever, so bound it.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            write_stdin(stdin, receiver, Arc::clone(&shared)),
+        )
+        .await
+        .expect("the write to a closed pipe did not fail");
+
+        assert!(
+            locked(&shared.state).closed.is_none(),
+            "a write to a closed pipe was recorded as the session's failure"
+        );
+        drop(lines);
+    }
+
+    /// End to end: a server that closes its input and then fails is reported
+    /// by its exit status and stderr. The race that once made this flaky on
+    /// Linux CI is pinned by `a_broken_stdin_pipe_leaves_the_verdict_to_the_reader`.
+    #[tokio::test]
+    async fn a_server_that_closes_its_input_and_then_fails_is_reported_by_its_exit_status() {
+        let codex = fake("close-stdin").build().unwrap();
+        let error = AppServer::builder(&codex).start().await.unwrap_err();
+        assert_eq!(error.exit_code(), Some(1), "{error:?}");
+        assert_eq!(
+            error.failure_kind(),
+            Some(crate::FailureKind::Config),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("bogus_key"), "{error}");
+    }
+
     /// The server writes about 500 KB to stderr before its first answer. An
     /// undrained pipe holds about 64 KB, so this hangs if stderr is not read.
     #[tokio::test]
@@ -2494,6 +2558,9 @@ mod tests {
                 "CODEX_WRAPPER_TEST_PIDFILE",
                 pid_file.path().to_str().unwrap(),
             )
+            // Long enough for the fixture's SIGTERM handler to run on a
+            // loaded machine, so the marker below means what it says.
+            .termination_grace(Duration::from_secs(1))
             .build()
             .unwrap();
         let server = AppServer::builder(&codex).start().await.unwrap();
@@ -2502,12 +2569,14 @@ mod tests {
 
         server.terminate().await.unwrap();
 
+        // The direct child has been reaped. Its subprocess got SIGKILL at the
+        // same moment, but nothing waits for it, so allow it a moment to die.
         assert!(
-            !is_running_for_test(parent),
+            wait_until_gone(parent).await,
             "the server ({parent}) survived"
         );
         assert!(
-            !is_running_for_test(child),
+            wait_until_gone(child).await,
             "the server's subprocess ({child}) survived terminate"
         );
         // The fixture writes this marker only if it is asked to stop with
@@ -2574,6 +2643,9 @@ mod tests {
                 "CODEX_WRAPPER_TEST_PIDFILE",
                 pid_file.path().to_str().unwrap(),
             )
+            // Long enough for the fixture's SIGTERM handler to run on a
+            // loaded machine, so the marker below means what it says.
+            .termination_grace(Duration::from_secs(1))
             .build()
             .unwrap();
         let server = AppServer::builder(&codex).start().await.unwrap();
@@ -2590,11 +2662,11 @@ mod tests {
         let _ = std::fs::remove_file(marker);
 
         assert!(
-            !is_running_for_test(parent),
+            wait_until_gone(parent).await,
             "the server ({parent}) survived"
         );
         assert!(
-            !is_running_for_test(child),
+            wait_until_gone(child).await,
             "the server's subprocess ({child}) survived shutdown"
         );
     }
@@ -2619,7 +2691,8 @@ mod tests {
     }
 
     async fn read_pids(pid_file: &PidFile) -> (u32, u32) {
-        for _ in 0..100 {
+        // Up to ten seconds: starting bash can be slow on a loaded machine.
+        for _ in 0..1000 {
             if let Ok(contents) = std::fs::read_to_string(pid_file.path()) {
                 let field = |key: &str| {
                     contents
@@ -2638,22 +2711,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_that_times_out_leaves_the_session_usable_and_no_entry_behind() {
-        let codex = fake("mute-after-init")
-            .timeout(Duration::from_millis(150))
-            .build()
-            .unwrap();
-        let server = AppServer::builder(&codex).start().await.unwrap();
+        // The short timeout is for the requests below, not the handshake,
+        // which has to be allowed to take as long as a loaded machine needs.
+        let server = started("mute-after-init").await;
+        let mut handle = server.handle();
+        handle.timeout = Some(Duration::from_millis(150));
 
         for _ in 0..2 {
-            let error = server.request("thread/start", json!({})).await.unwrap_err();
+            let error = handle.request("thread/start", json!({})).await.unwrap_err();
             assert!(matches!(error, Error::Timeout { .. }), "{error:?}");
         }
         assert!(
-            locked(&server.handle.shared.state).pending.is_empty(),
+            locked(&handle.shared.state).pending.is_empty(),
             "a timed-out request left its slot behind"
         );
         // A timeout is a verdict on one request, not on the session.
-        assert!(server.notify("initialized", Value::Null).is_ok());
+        assert!(handle.notify("initialized", Value::Null).is_ok());
         server.terminate().await.unwrap();
     }
 
@@ -2706,10 +2779,12 @@ mod tests {
             .unwrap();
 
         // Poll with a timeout that keeps expiring, so the future is dropped
-        // over and over while messages arrive.
+        // over and over while messages arrive. Bounded by time, not by the
+        // number of polls, so a slow machine only makes it take longer.
         let mut seen = Vec::new();
         let mut finished = false;
-        for _ in 0..2000 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
             if let Ok(next) =
                 tokio::time::timeout(Duration::from_micros(200), server.next_message()).await
             {
