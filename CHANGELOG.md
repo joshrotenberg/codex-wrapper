@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.5](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.4...v0.4.5) - 2026-09-24
+
+### Added
+
+- *(app-server)* JSON-RPC client for codex app-server (closes #140) ([#141](https://github.com/joshrotenberg/codex-wrapper/pull/141))
+
+### Fixed
+
+- *(error)* append the app-server variants so existing discriminants keep their values ([#144](https://github.com/joshrotenberg/codex-wrapper/pull/144))
+
 ## [0.4.4](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.3...v0.4.4) - 2026-09-22
 
 ### Added
