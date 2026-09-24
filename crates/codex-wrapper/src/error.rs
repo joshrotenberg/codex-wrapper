@@ -188,6 +188,36 @@ pub enum Error {
         source: serde_json::Error,
     },
 
+    /// `codex app-server` answered a request with a JSON-RPC error.
+    ///
+    /// `code` and `message` are the server's own. `method` is the request that
+    /// failed, for example `turn/steer`.
+    #[cfg(feature = "app-server")]
+    #[error("codex app-server rejected `{method}`: {message} (code {code})")]
+    AppServerRpc {
+        /// The request method that was rejected.
+        method: String,
+        /// The JSON-RPC error code.
+        code: i64,
+        /// The server's error message.
+        message: String,
+        /// Additional error data, when the server sent any.
+        data: Option<serde_json::Value>,
+    },
+
+    /// The connection to `codex app-server` failed, or the server sent
+    /// something that is not valid JSON-RPC.
+    ///
+    /// Covers the server exiting or being stopped while a request was waiting,
+    /// a session that has already ended, and a stream that could not be read or
+    /// written. When the server wrote to stderr, the last lines are included.
+    #[cfg(feature = "app-server")]
+    #[error("codex app-server protocol error: {message}")]
+    AppServerProtocol {
+        /// What went wrong.
+        message: String,
+    },
+
     /// The installed CLI version does not meet the minimum requirement.
     #[error("CLI version {found} does not meet minimum requirement {minimum}")]
     VersionMismatch {

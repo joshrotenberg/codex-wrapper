@@ -167,10 +167,20 @@
 //! Process groups are Unix-only. Elsewhere explicit cancellation kills and
 //! awaits the direct child, but cannot guarantee descendant cleanup.
 //!
+//! # Steering a running turn
+//!
+//! `codex exec` cannot change a turn that is already running. With the
+//! `app-server` feature, `AppServer` drives `codex app-server` so a caller can
+//! add input to a turn (`turn_steer`) or stop it (`turn_interrupt`) while it
+//! reads the turn's events. See the `app_server` module.
+//!
 //! # Features
 //!
 //! - `json` *(enabled by default)* - JSONL output parsing via `serde_json`
+//! - `app-server` - a JSON-RPC client for `codex app-server`; implies `json`
 
+#[cfg(feature = "app-server")]
+pub mod app_server;
 #[cfg(feature = "json")]
 pub mod auth;
 #[cfg(feature = "json")]
@@ -203,6 +213,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(feature = "app-server")]
+pub use app_server::{AppServer, AppServerBuilder, AppServerHandle};
 #[cfg(feature = "json")]
 pub use auth::{AuthStatus, AuthStrategy};
 #[cfg(feature = "json")]
