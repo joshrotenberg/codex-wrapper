@@ -56,6 +56,16 @@ jobs:
       - name: Build the config feature alone
         run: cargo build --no-default-features --features config
 
+      # `app-server` implies `json` and adds tokio's `rt` and `sync`. Build it
+      # without the other optional features, so nothing quietly depends on
+      # `config`, and run the unit tests there too: the client's tests drive a
+      # fake server and need no CLI.
+      - name: Build the app-server feature alone
+        run: cargo build --no-default-features --features app-server
+
+      - name: Unit tests with the app-server feature alone
+        run: cargo test --lib --no-default-features --features app-server
+
       # The lib builds and tests without default features, and every target
       # builds with all of them, but nothing checked the intersection: a test
       # naming a json-only API compiles under --all-features and breaks here.

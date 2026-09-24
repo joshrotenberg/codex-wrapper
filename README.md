@@ -940,6 +940,50 @@ Process groups are Unix-only. Elsewhere explicit cancellation kills and awaits t
 but the wrapper cannot make the same descendant-process guarantee. Reaping also needs the Tokio
 runtime to remain alive; the abrupt dropped-future fallback cannot settle during runtime teardown.
 
+## Steering a Running Turn
+
+`codex exec` takes one prompt per process and cannot change a turn once it is running. The
+optional `app-server` feature adds `AppServer`, a client for `codex app-server` (JSON-RPC over
+stdio), which can: `turn_steer` adds input to the active turn and `turn_interrupt` stops it.
+
+```toml
+codex-wrapper = { version = "0.4", features = ["app-server"] }
+```
+
+```rust
+use codex_wrapper::app_server::{AppServer, ServerMessage, ThreadStartParams, TurnStartParams, UserInput};
+
+let mut server = AppServer::builder(&codex).start().await?;
+let thread = server.thread_start(ThreadStartParams::new().ephemeral(true)).await?;
+let turn = server.turn_start(TurnStartParams::text(&thread.id, "refactor the parser")).await?;
+
+// Later, or from another task holding `server.handle()`:
+server.turn_steer(&thread.id, &turn.id, vec![UserInput::text("keep the public API")]).await?;
+
+while let Some(message) = server.next_message().await? {
+    if let ServerMessage::Notification(n) = message {
+        if n.turn_completed().is_some() { break; }
+    }
+}
+server.shutdown().await?;
+```
+
+The steered text reaches the model at the next item boundary, so a long tool call delays it.
+Requests the server sends back, such as approvals, arrive from `next_message` as
+`ServerMessage::Request` and must be answered with `respond` or `respond_error`, or the turn waits.
+
+The CLI marks `app-server` experimental, so the client wraps the transport and four methods
+(`thread/start`, `turn/start`, `turn/steer`, `turn/interrupt`) with typed helpers. Any other method
+is reachable through `request`. A contract check compares the method names against the protocol
+schema the installed CLI prints.
+
+Stop with `shutdown()`: it closes the server's stdin, and the server stops its running commands and
+exits. `terminate()` and dropping the client signal only the server's process group, and shell
+commands the server started run in groups of their own, so they keep running. `turn_interrupt`
+ends the turn but not the command it is running. `CodexBuilder::timeout` applies to each request,
+and `output_limit` to the total stdout read over the session. The module documentation lists
+what was verified against the CLI and on which versions.
+
 ## Retry Policy
 
 Configure automatic retries for transient failures:
@@ -984,6 +1028,7 @@ let output = RawCommand::new("cloud")
 |---------|---------|-------------|
 | `json` | Yes | JSONL output parsing via `serde_json` -- enables `execute_json_lines()`, `execute_json()`, `stream()`, `Session`, `QueryResult`, `JsonLineEvent` and typed accessors |
 | `config` | No | Read `~/.codex/config.toml` via the `toml` crate -- enables `codex.config()` and the `config` module |
+| `app-server` | No | A JSON-RPC client for `codex app-server` (steer or interrupt a running turn) -- enables `AppServer` and the `app_server` module; implies `json` |
 
 To disable default features:
 
@@ -1006,9 +1051,11 @@ cargo run --example session        # multi-turn via exec resume
 cargo run --example review         # code review, text and typed
 cargo run --example mcp_servers    # add / list / inspect / remove MCP servers
 cargo run --example health_check   # installed CLI vs the tested version range
+cargo run --example app_server --features app-server  # steer a running turn
 ```
 
-All but `oneshot` and `health_check` need the `json` feature, which is on by default. Each is
+All but `oneshot` and `health_check` need the `json` feature, which is on by default
+(`app_server` needs `app-server`). Each is
 declared with its `required-features` in the manifest, so a reduced-feature build skips it
 rather than failing.
 
