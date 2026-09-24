@@ -357,7 +357,7 @@ enum StreamStop {
     Timeout(std::time::Duration),
 }
 
-async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+pub(crate) async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     captured_bytes: &mut usize,
     output_limit: Option<usize>,

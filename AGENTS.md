@@ -26,6 +26,7 @@ crates/codex-wrapper/
     command/         one builder per subcommand, all implementing CodexCommand
     exec.rs          process execution: spawn, timeout, retry, argv assembly
     streaming.rs     JSONL streaming via piped stdout        (json feature)
+    app_server.rs    JSON-RPC client for `codex app-server`  (app-server feature)
     session.rs       multi-turn sessions over exec resume    (json feature)
     types.rs         JSONL event types, enums, version parsing
     version.rs       tested CLI version range
@@ -33,6 +34,7 @@ crates/codex-wrapper/
     contract.rs      drift guard, checks emitted flags against the real CLI
     integration.rs   end-to-end, needs a real authenticated codex
     fake-codex*.sh   fixtures for unit tests
+    fake-app-server.sh  fixture for the app-server client, transcribed from captured sessions
 ```
 
 ## Build and test
@@ -107,6 +109,10 @@ The rules that follow from it:
 `default = ["json"]`. The `json` feature gates `session`, `streaming`, and the event types in
 `types.rs` (`JsonLineEvent`, `QueryResult`, `TokenUsage`).
 
+`app-server` (off by default, implies `json`) gates `app_server` and the two `Error` variants it
+returns. It also turns on tokio's `rt` and `sync`, which the client's reader tasks need and the
+rest of the crate does not. CI builds and unit-tests it without the other optional features.
+
 Test code needs the same gating as the code it tests. A test naming a json-only type compiles
 under `--all-features` and breaks the `--no-default-features` build, which is why both test
 commands are in the list above and in CI (#80).
@@ -142,12 +148,15 @@ against the real CLI. If a change is larger than the issue asked for, say so and
 - **Top-level `codex review`.** Same command as `codex exec review` but accepting a strict subset
   of its flags, missing `--json` among ten others, so a builder on it could not offer typed
   output. The rationale is on `ReviewCommand` and a contract check guards it.
-- **`app-server`, `remote-control`, `app`, `debug`, `exec-server`.** Interactive or experimental,
-  no clear programmatic use.
+- **`remote-control`, `app`, `debug`, `exec-server`.** Interactive or experimental, no clear
+  programmatic use.
 - **`cloud`.** Held while it is experimental upstream (#47).
-- **Duplex or conversation mode.** The codex CLI is exec-oneshot plus resume with no
-  streaming-stdin equivalent, so this stays a `claude-wrapper` capability rather than being
-  forced into the shared trait.
+- **Duplex or conversation mode over `codex exec`.** `exec` is one prompt per process plus resume,
+  with no streaming-stdin equivalent, so it stays out of the shared trait. The one route to
+  mid-turn input is `codex app-server`, which is wrapped as a transport client behind the
+  `app-server` feature (`AppServer`): it is a different command with its own protocol, not a mode
+  of `exec`. It wraps the connection and four methods, and leaves the rest of the protocol to
+  `request`; do not grow it into a typed catalog of the protocol.
 
 Use `RawCommand` for anything unwrapped rather than adding a builder for it.
 

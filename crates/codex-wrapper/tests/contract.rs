@@ -813,3 +813,77 @@ fn approve_for_me_contract() {
         1,
     );
 }
+
+// ---------------------------------------------------------------------------
+// app-server
+// ---------------------------------------------------------------------------
+
+/// The flags the app-server client passes are still accepted.
+#[cfg(feature = "app-server")]
+#[test]
+#[ignore]
+fn app_server_contract() {
+    let codex = codex_wrapper::Codex::builder()
+        .build()
+        .expect("codex binary must be in PATH");
+    let args = codex_wrapper::AppServer::builder(&codex).args();
+    assert_contract("app-server", args, 1);
+}
+
+/// The JSON-RPC methods the client sends, and the notification it decodes,
+/// are still in the protocol the installed CLI reports.
+///
+/// The flag checks above cannot see this: the methods are values in a JSON-RPC
+/// stream, not arguments. The CLI can print its own protocol schema, and no
+/// session or authentication is involved.
+#[cfg(feature = "app-server")]
+#[test]
+#[ignore]
+fn app_server_protocol_methods_contract() {
+    let dir = std::env::temp_dir().join(format!(
+        "codex-wrapper-contract-app-server-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let output = run_codex(&[
+        "app-server".into(),
+        "generate-json-schema".into(),
+        "--out".into(),
+        dir.to_str().expect("temp dir is utf-8").into(),
+    ]);
+
+    let read = |name: &str| {
+        std::fs::read_to_string(dir.join(name)).unwrap_or_else(|error| {
+            panic!(
+                "`codex app-server generate-json-schema` did not produce {name} ({error}) on {}. \
+                 Output:\n{output}",
+                cli_version()
+            )
+        })
+    };
+    let requests = read("ClientRequest.json");
+    let notifications = read("ServerNotification.json");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut drift = Vec::new();
+    for method in [
+        "initialize",
+        "thread/start",
+        "turn/start",
+        "turn/steer",
+        "turn/interrupt",
+    ] {
+        if !requests.contains(&format!("\"{method}\"")) {
+            drift.push(format!("request `{method}` is no longer in ClientRequest"));
+        }
+    }
+    if !notifications.contains("\"turn/completed\"") {
+        drift.push("notification `turn/completed` is no longer in ServerNotification".into());
+    }
+    assert!(
+        drift.is_empty(),
+        "the app-server protocol has drifted from the client ({}):\n  - {}",
+        cli_version(),
+        drift.join("\n  - ")
+    );
+}
