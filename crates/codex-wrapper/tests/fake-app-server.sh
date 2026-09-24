@@ -17,6 +17,9 @@
 #   exit-on-start  fails before serving, as the CLI does for an unknown `-c` key
 #                  under --strict-config
 #   exit-on-turn   exits without answering `turn/start`
+#   exit-clean     exits 0 before answering `initialize`
+#   bad-init       answers `initialize` with a line that is not valid JSON
+#   no-result      answers `thread/start` with an id and neither result nor error
 #   flood          sends one very long notification after `initialized`
 #   bad-json       sends a line that starts like JSON but is not
 #   spawns-child   as `turn`, and records its pid and a child's, like
@@ -38,6 +41,10 @@ mode="${FAKE_APP_SERVER_MODE:-turn}"
 THREAD=01a0d1a2-5f2e-7263-a97b-cabf3e78caff
 TURN=01a0d1a2-5f9f-75c1-9305-fa382e7b37bc
 CWD=/tmp/fixture
+
+if [ "$mode" = exit-clean ]; then
+  exit 0
+fi
 
 if [ "$mode" = exit-on-start ]; then
   echo 'Error: unknown configuration field `bogus_key` in -c/--config override' >&2
@@ -159,6 +166,10 @@ while IFS= read -r line; do
       continue
     fi
     [ "$mode" = silent ] && continue
+    if [ "$mode" = bad-init ]; then
+      emit '{"id":'"$id"',"result": oops'
+      continue
+    fi
     if [ "$mode" = noisy-stderr ]; then
       for _ in $(seq 1 2000); do
         printf '\033[2m2026-09-24T04:17:33.188167Z\033[0m \033[31mERROR\033[0m \033[2mrmcp::transport::worker\033[0m\033[2m:\033[0m worker quit with fatal: Transport channel closed, when Client(HttpRequest(HttpRequest("http/request failed: error sending request for url (http://127.0.0.1:3001/)")))\n' >&2
@@ -176,6 +187,10 @@ while IFS= read -r line; do
 
   case "$method" in
     thread/start)
+      if [ "$mode" = no-result ]; then
+        emit '{"id":'"$id"'}'
+        continue
+      fi
       result "$id" '{"thread":'"$THREAD_JSON"',"model":"gpt-5.6-sol","modelProvider":"openai","serviceTier":"default","cwd":"'$CWD'","runtimeWorkspaceRoots":["'$CWD'"],"instructionSources":[],"approvalPolicy":"never","approvalsReviewer":"auto_review","sandbox":{"type":"readOnly","networkAccess":false},"activePermissionProfile":null,"reasoningEffort":"medium","multiAgentMode":"explicitRequestOnly"}'
       notify thread/started '{"thread":'"$THREAD_JSON"'}'
       ;;

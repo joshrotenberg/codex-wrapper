@@ -95,17 +95,24 @@
 //! [`AppServerHandle::turn_interrupt`] ends the turn, not the command it is
 //! running.
 //! - A failure that leaves the stream unusable (the output limit, or a line
-//!   that is not JSON) kills the child. The error is returned from
-//!   [`AppServer::next_message`] and from any request still waiting.
+//!   that starts with `{` but is not valid JSON) kills the child: on Unix as
+//!   soon as it is detected, elsewhere when [`AppServer::next_message`] returns
+//!   the error. The error also reaches any request still waiting.
 //!
 //! # Limits
 //!
 //! [`CodexBuilder::output_limit`](crate::CodexBuilder::output_limit) caps the
 //! total bytes read from stdout over the life of the session, as it does for
 //! streaming. [`CodexBuilder::timeout`](crate::CodexBuilder::timeout) applies
-//! to each request, including the handshake, and not to the session. The
-//! server's stderr is drained continuously and the last 16 KiB is kept for
-//! error messages.
+//! to each request, including the handshake, and not to the session; without
+//! it a request waits until the server answers or exits. The server's stderr is
+//! drained continuously and the last 16 KiB is kept for error messages.
+//!
+//! Messages wait in an unbounded queue until [`AppServer::next_message`]
+//! returns them, so a caller that does not read them, or reads more slowly than
+//! the server writes, holds them in memory. `output_limit` bounds the total.
+//! Streaming deltas are most of the volume, and
+//! [`AppServerBuilder::opt_out_notification`] stops the server sending them.
 //!
 //! # Verified against codex-cli 0.149.0
 //!
@@ -640,6 +647,8 @@ enum Closed {
 enum Reply {
     Result(Value),
     Rpc(RpcFailure),
+    /// A response with neither `result` nor `error`.
+    Malformed,
     Closed(Closed),
 }
 
@@ -670,6 +679,10 @@ struct Shared {
     /// end of file, so its last lines are in `stderr_tail`.
     stderr_done: AtomicBool,
     stderr_finished: Notify,
+    /// What the reader task may kill when the stream breaks. Taken away, under
+    /// this lock, before the client reaps the child, so the reader can never
+    /// signal a pid that has been released.
+    kill: Mutex<Option<KillTarget>>,
     events: mpsc::UnboundedSender<Event>,
 }
 
@@ -698,7 +711,7 @@ impl Shared {
         let _ = self.events.send(Event::Closed(reason));
     }
 
-    fn new(events: mpsc::UnboundedSender<Event>) -> Self {
+    fn new(events: mpsc::UnboundedSender<Event>, kill: Option<KillTarget>) -> Self {
         Self {
             state: Mutex::new(State {
                 pending: HashMap::new(),
@@ -708,8 +721,25 @@ impl Shared {
             stderr_tail: Mutex::new(Vec::new()),
             stderr_done: AtomicBool::new(false),
             stderr_finished: Notify::new(),
+            kill: Mutex::new(kill),
             events,
         }
+    }
+
+    /// Kill the server, if the reader still has the authority to. Called when
+    /// the stream is unusable and nothing will read what the server writes.
+    fn fire_kill(&self) {
+        // Held across the signal, so `revoke_kill` cannot return while one is
+        // being sent.
+        if let Some(target) = *locked(&self.kill) {
+            target.signal();
+        }
+    }
+
+    /// Take away the reader's authority to kill. Must be called before the
+    /// child is reaped: from then on the pid may belong to another process.
+    fn revoke_kill(&self) {
+        *locked(&self.kill) = None;
     }
 
     /// Wait, for a short while, until the stderr reader has read everything
@@ -925,6 +955,11 @@ impl AppServerHandle {
                 code: failure.code,
                 message: failure.message,
                 data: failure.data,
+            }),
+            Ok(Reply::Malformed) => Err(Error::AppServerProtocol {
+                message: format!(
+                    "codex app-server answered `{method}` with neither result nor error"
+                ),
             }),
             Ok(Reply::Closed(reason)) => Err(self.shared.error_for(&reason, Some(method))),
             Err(_) => Err(self.closed_error(Some(method))),
@@ -1161,17 +1196,19 @@ impl<'a> AppServerBuilder<'a> {
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (writer_tx, writer_rx) = mpsc::unbounded_channel();
-        let shared = Arc::new(Shared::new(events_tx));
+        let shared = Arc::new(Shared::new(
+            events_tx,
+            Some(KillTarget {
+                pid,
+                group: codex.process_group,
+            }),
+        ));
 
         tokio::spawn(read_stdout(
             stdout,
             Arc::clone(&shared),
             codex.output_limit,
             codex.working_dir.clone(),
-            KillTarget {
-                pid,
-                group: codex.process_group,
-            },
         ));
         tokio::spawn(drain_stderr(stderr, Arc::clone(&shared)));
         tokio::spawn(write_stdin(stdin, writer_rx, Arc::clone(&shared)));
@@ -1240,7 +1277,10 @@ struct KillTarget {
 impl KillTarget {
     /// Stop the server now. The stream is unusable and nothing will read what
     /// the server writes next, so leaving it running would only fill the pipe.
-    fn kill(self) {
+    ///
+    /// Unix only: there is nothing to signal elsewhere, where
+    /// [`AppServer::next_message`] kills the child when it returns the error.
+    fn signal(self) {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
             if self.group {
@@ -1254,8 +1294,10 @@ impl KillTarget {
                 }
             }
         }
+        // Read on every platform, so the fields are not dead code where there
+        // is no signal to send.
         #[cfg(not(unix))]
-        let _ = self;
+        let _ = (self.pid, self.group);
     }
 }
 
@@ -1266,7 +1308,6 @@ async fn read_stdout(
     shared: Arc<Shared>,
     output_limit: Option<usize>,
     working_dir: Option<PathBuf>,
-    kill: KillTarget,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut captured = 0usize;
@@ -1286,11 +1327,11 @@ async fn read_stdout(
                 break Closed::Eof;
             }
             Err(Error::OutputLimitExceeded { limit_bytes, .. }) => {
-                kill.kill();
+                shared.fire_kill();
                 break Closed::OutputLimit { limit_bytes };
             }
             Err(error) => {
-                kill.kill();
+                shared.fire_kill();
                 break Closed::Broken(error.to_string());
             }
         };
@@ -1302,7 +1343,7 @@ async fn read_stdout(
             continue;
         }
         if let Err(reason) = route(&line, &shared) {
-            kill.kill();
+            shared.fire_kill();
             break reason;
         }
     };
@@ -1343,6 +1384,20 @@ fn route(line: &str, shared: &Shared) -> std::result::Result<(), Closed> {
         }
         (None, Some(id)) if value.get("result").is_some() || value.get("error").is_some() => {
             deliver_answer(&value, id, shared);
+        }
+        (None, Some(id)) => {
+            // Shaped like an answer, but neither a result nor an error. If it
+            // names a waiting request, fail that request rather than leave it
+            // waiting for an answer that will not come.
+            let waiter = id
+                .as_i64()
+                .and_then(|id| locked(&shared.state).pending.remove(&id));
+            match waiter {
+                Some(waiter) => {
+                    let _ = waiter.send(Reply::Malformed);
+                }
+                None => warn!("ignoring an answer with neither result nor error"),
+            }
         }
         _ => warn!("ignoring a JSON object from codex app-server that is not a message"),
     }
@@ -1523,7 +1578,13 @@ impl AppServer {
                 self.finished = true;
                 match reason {
                     Closed::Eof | Closed::Terminated => Ok(None),
-                    reason => Err(self.handle.shared.error_for(&reason, None)),
+                    reason => {
+                        // Already killed on Unix, where the reader signals
+                        // the group as soon as the stream fails. This covers
+                        // the platforms that cannot.
+                        let _ = self.child.start_kill();
+                        Err(self.handle.shared.error_for(&reason, None))
+                    }
                 }
             }
             None => {
@@ -1546,6 +1607,9 @@ impl AppServer {
     /// classified from its stderr like any failed command
     /// ([`Error::CommandFailed`] and its refinements).
     pub async fn shutdown(mut self) -> Result<()> {
+        // The child is about to be reaped, after which its pid is not ours to
+        // signal.
+        self.handle.shared.revoke_kill();
         let _ = self.handle.writer.send(Outgoing::Close);
         match tokio::time::timeout(self.termination_grace, self.child.wait()).await {
             Ok(Ok(status)) => {
@@ -1588,6 +1652,7 @@ impl AppServer {
     ///
     /// [`Error::Io`] if the child cannot be waited on.
     pub async fn terminate(mut self) -> Result<()> {
+        self.handle.shared.revoke_kill();
         self.handle.shared.fail(Closed::Terminated);
         let result = crate::exec::terminate_and_reap(
             &mut self.child,
@@ -1602,29 +1667,49 @@ impl AppServer {
 
     /// Clean up after a failed handshake and choose the error to report.
     async fn abandon(mut self, error: Error) -> Error {
-        // A server that rejects its arguments or config exits before it can
-        // answer. Its exit status and stderr say more than "closed its output".
-        if matches!(error, Error::AppServerProtocol { .. })
-            && let Ok(Ok(status)) = tokio::time::timeout(STARTUP_EXIT_WAIT, self.child.wait()).await
-            && !status.success()
-        {
-            self.group.disarm();
-            self.handle.shared.stderr_settled().await;
-            let code = status.code().unwrap_or(-1);
-            self.outcome.settle("failed", Some(code));
-            return Error::from_command_failure(
-                self.command.clone(),
-                code,
-                String::new(),
-                self.handle.shared.stderr_summary(),
-                self.working_dir.clone(),
-            );
-        }
+        self.handle.shared.revoke_kill();
         let outcome = if matches!(error, Error::Timeout { .. }) {
             "timeout"
         } else {
             "failed"
         };
+        // Only a server that closed its own output has failed by itself. When
+        // the reader gave up on the stream it killed the child, so the exit
+        // status says nothing and the error already says what happened.
+        let by_server = matches!(locked(&self.handle.shared.state).closed, Some(Closed::Eof));
+
+        // Has the child already ended? One that closed its output is given a
+        // moment to finish exiting. Otherwise only look, so a server that is
+        // merely silent is not waited on.
+        let ended = if by_server {
+            tokio::time::timeout(STARTUP_EXIT_WAIT, self.child.wait())
+                .await
+                .ok()
+        } else {
+            self.child.try_wait().transpose()
+        };
+        if let Some(Ok(status)) = ended {
+            // Reaped: nothing is left to terminate, and its pid is no longer
+            // ours to signal.
+            self.group.disarm();
+            self.handle.shared.stderr_settled().await;
+            let code = status.code().unwrap_or(-1);
+            self.outcome.settle(outcome, Some(code));
+            if by_server && !status.success() {
+                // A server that rejects its arguments or config exits before
+                // it can answer. Its exit status and stderr say more than
+                // "closed its output".
+                return Error::from_command_failure(
+                    self.command.clone(),
+                    code,
+                    String::new(),
+                    self.handle.shared.stderr_summary(),
+                    self.working_dir.clone(),
+                );
+            }
+            return error;
+        }
+
         self.handle.shared.fail(Closed::Terminated);
         let _ = crate::exec::terminate_and_reap(
             &mut self.child,
@@ -1635,6 +1720,14 @@ impl AppServer {
         .await;
         self.outcome.settle(outcome, None);
         error
+    }
+}
+
+impl Drop for AppServer {
+    fn drop(&mut self) {
+        // The fields that follow kill the group and let tokio reap the child.
+        // After that the reader task must not signal the pid.
+        self.handle.shared.revoke_kill();
     }
 }
 
@@ -2118,6 +2211,130 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// A server that exits 0 before it answers has been reaped by the time the
+    /// failure is reported, so there is nothing left to terminate. Waiting out
+    /// the grace period (and signalling a pid that is no longer ours) is the
+    /// failure this guards.
+    #[tokio::test]
+    async fn a_server_that_exits_cleanly_before_answering_fails_the_start_without_waiting() {
+        let codex = fake("exit-clean")
+            .termination_grace(Duration::from_secs(4))
+            .build()
+            .unwrap();
+        let started_at = std::time::Instant::now();
+        let error = AppServer::builder(&codex).start().await.unwrap_err();
+        assert!(
+            matches!(error, Error::AppServerProtocol { .. }),
+            "{error:?}"
+        );
+        assert!(
+            started_at.elapsed() < Duration::from_secs(3),
+            "start waited out the grace period for a server that had already exited"
+        );
+    }
+
+    /// The reader kills the server when the stream breaks. That must not be
+    /// mistaken for the server failing by itself, or the useful message is
+    /// replaced by an exit status.
+    #[tokio::test]
+    async fn invalid_json_during_the_handshake_is_reported_as_invalid_json() {
+        let codex = fake("bad-init").build().unwrap();
+        let error = AppServer::builder(&codex).start().await.unwrap_err();
+        assert!(
+            matches!(&error, Error::AppServerProtocol { message } if message.contains("invalid JSON")),
+            "{error:?}"
+        );
+        assert_eq!(error.exit_code(), None);
+    }
+
+    /// A response that names a waiting request but has neither `result` nor
+    /// `error` is not a valid answer. Ignoring it would leave the request
+    /// waiting for one that will never come.
+    #[tokio::test]
+    async fn a_response_with_neither_result_nor_error_fails_the_request_it_names() {
+        let server = started("no-result").await;
+        let error = server
+            .thread_start(ThreadStartParams::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::AppServerProtocol { message }
+                if message.contains("neither result nor error") && message.contains("thread/start")),
+            "{error:?}"
+        );
+        // The session itself is still usable.
+        assert!(server.notify("initialized", Value::Null).is_ok());
+        server.shutdown().await.unwrap();
+    }
+
+    /// The reader task holds a way to kill the server. It must stop being able
+    /// to once the client is done with the child: after that the pid may
+    /// belong to someone else.
+    #[tokio::test]
+    async fn the_readers_kill_switch_is_revoked_when_the_client_is_done_with_the_child() {
+        // Never signals this process: the target is a `sleep` started here.
+        let sleeper = |seconds: &str| {
+            std::process::Command::new("sleep")
+                .arg(seconds)
+                .spawn()
+                .unwrap()
+        };
+        let (events, _received) = mpsc::unbounded_channel();
+
+        let mut live = sleeper("60");
+        let shared = Shared::new(
+            events.clone(),
+            Some(KillTarget {
+                pid: Some(live.id()),
+                group: false,
+            }),
+        );
+        shared.fire_kill();
+        assert!(
+            live.wait().unwrap().code().is_none(),
+            "the switch should have killed the process it was armed with"
+        );
+
+        let mut revoked = sleeper("60");
+        let shared = Shared::new(
+            events,
+            Some(KillTarget {
+                pid: Some(revoked.id()),
+                group: false,
+            }),
+        );
+        shared.revoke_kill();
+        shared.fire_kill();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            revoked.try_wait().unwrap().is_none(),
+            "a revoked switch still killed the process"
+        );
+        revoked.kill().unwrap();
+        revoked.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_way_of_ending_the_session_revokes_the_kill_switch() {
+        let armed = |shared: &Shared| locked(&shared.kill).is_some();
+
+        let server = started("turn").await;
+        let shared = Arc::clone(&server.handle.shared);
+        assert!(armed(&shared));
+        server.shutdown().await.unwrap();
+        assert!(!armed(&shared), "shutdown left the switch armed");
+
+        let server = started("turn").await;
+        let shared = Arc::clone(&server.handle.shared);
+        server.terminate().await.unwrap();
+        assert!(!armed(&shared), "terminate left the switch armed");
+
+        let server = started("turn").await;
+        let shared = Arc::clone(&server.handle.shared);
+        drop(server);
+        assert!(!armed(&shared), "dropping left the switch armed");
     }
 
     #[test]
@@ -2655,7 +2872,7 @@ mod tests {
     #[test]
     fn a_line_that_is_not_a_message_is_ignored_and_bad_json_is_fatal() {
         let (events, mut received) = mpsc::unbounded_channel();
-        let shared = Shared::new(events);
+        let shared = Shared::new(events, None);
         assert!(route(r#"{"unrelated":true}"#, &shared).is_ok());
         assert!(
             route(
