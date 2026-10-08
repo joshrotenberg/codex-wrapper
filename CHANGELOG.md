@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.5] - 2026-10-08
+
+### Bug Fixes
+
+- *(error)* Append the app-server variants so existing discriminants keep their values 
+- Make shutdown cancellation safe and prepare release workflows 
+
+### Features
+
+- *(app-server)* JSON-RPC client for codex app-server  
+
+
+
 ## [0.4.4](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.3...v0.4.4) - 2026-09-22
 
 ### Added
