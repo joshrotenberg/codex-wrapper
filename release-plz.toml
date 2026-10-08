@@ -1,5 +1,7 @@
 [workspace]
 changelog_update = true
+# Release notes and the preview workflow share the same grouping rules.
+changelog_config = "cliff.toml"
 git_release_enable = true
 git_tag_enable = true
 pr_labels = ["release"]
@@ -18,4 +20,3 @@ git_tag_enable = true
 git_tag_name = "v{{ version }}"
 changelog_update = true
 changelog_path = "CHANGELOG.md"
-

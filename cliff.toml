@@ -38,6 +38,11 @@ commit_parsers = [
     { message = "^style", group = "Style" },
     { message = "^test", group = "Testing" },
     { message = "^chore\\(release\\)", skip = true },
+    # release-plz and Dependabot use unscoped messages in this repository.
+    # Keep release commits and dependency bumps out of the release notes.
+    { message = "^chore: release", skip = true },
+    { message = "^chore: bump", skip = true },
+    { message = "^ci: bump", skip = true },
     { message = "^chore\\(deps\\)", skip = true },
     { message = "^chore\\(version\\)", skip = true },
     { message = "^chore\\(pr\\)", skip = true },
@@ -48,4 +53,3 @@ filter_commits = false
 tag_pattern = "v[0-9].*"
 topo_order = false
 sort_commits = "oldest"
-

@@ -140,8 +140,11 @@ against the real CLI. If a change is larger than the issue asked for, say so and
 
 ## Release process
 
-`release-plz` handles version bumps and publishing. `cliff.toml` plus
-`.github/workflows/changelog.yml` generate the changelog from conventional commits.
+`release-plz` handles version bumps, changelog updates, and publishing. It reads the
+conventional-commit grouping rules from `cliff.toml`, configured in `release-plz.toml`.
+`.github/workflows/changelog.yml` previews the unreleased section in the job summary when
+those rules change or the workflow is run manually; it does not write `CHANGELOG.md` or
+open a separate changelog PR. Keep release-plz as the only changelog writer.
 
 ## What is deliberately not wrapped
 

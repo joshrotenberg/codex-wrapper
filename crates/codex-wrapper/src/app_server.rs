@@ -2590,6 +2590,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_during_app_server_termination_grace_kills_the_group() {
+        let fixture = crate::test_support::GracePeriodFixture::new("app-server-grace-drop");
+        let codex = fixture.configure(fake("ignores-eof")).build().unwrap();
+        let server = AppServer::builder(&codex).start().await.unwrap();
+        fixture.assert_drop_during_grace(server.terminate()).await;
+    }
+
+    #[tokio::test]
     async fn dropping_the_client_kills_the_process_group() {
         let pid_file = PidFile::new("app-server-drop");
         let codex = fake("spawns-child")
