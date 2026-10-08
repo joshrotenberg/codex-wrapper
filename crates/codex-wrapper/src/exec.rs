@@ -227,12 +227,15 @@ impl GroupKillGuard {
     /// Async, so it can wait, which is why it cannot live in `Drop`.
     #[cfg(unix)]
     pub(crate) async fn terminate(&mut self, grace: Duration) {
-        let Some(pid) = self.pid.take() else {
+        let Some(pid) = self.pid else {
             return;
         };
         signal_group(pid, libc::SIGTERM);
+        // Keep drop cleanup armed while this await can be cancelled. Once
+        // SIGKILL is sent, disarm before the caller can reap the child.
         tokio::time::sleep(grace).await;
         signal_group(pid, libc::SIGKILL);
+        self.disarm();
     }
 
     /// No process groups here, so there is nothing to ask politely. The
@@ -1799,6 +1802,34 @@ mod tests {
             !is_running_for_test(child),
             "the subprocess ({child}) survived cancellation"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_during_cancellation_grace_kills_the_group() {
+        let fixture = crate::test_support::GracePeriodFixture::new("buffered-cancel-grace-drop");
+        let codex = fixture.builder().build().unwrap();
+        fixture
+            .assert_drop_during_grace(run_codex_cancellable(
+                &codex,
+                vec!["exec".into()],
+                fixture.ready(),
+            ))
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_during_timeout_grace_kills_the_group() {
+        let fixture = crate::test_support::GracePeriodFixture::new("buffered-timeout-grace-drop");
+        let codex = fixture
+            .builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        fixture
+            .assert_drop_during_grace(run_codex(&codex, vec!["exec".into()]))
+            .await;
     }
 
     /// Buffered timeout uses the same settled process-tree cleanup as an

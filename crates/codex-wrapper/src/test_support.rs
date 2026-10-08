@@ -7,6 +7,7 @@
 //! watches it disappear.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::{Codex, CodexBuilder};
@@ -116,6 +117,116 @@ pub(crate) fn blocking_codex(pid_file: &PidFile) -> CodexBuilder {
             "CODEX_WRAPPER_TEST_PIDFILE",
             pid_file.path().to_str().expect("pid file path is utf-8"),
         )
+}
+
+/// A process group whose descendant survives SIGTERM, with markers that let
+/// tests drop the owning future only after graceful termination has started.
+pub(crate) struct GracePeriodFixture {
+    pid_file: PidFile,
+    cleanup_armed: AtomicBool,
+}
+
+impl GracePeriodFixture {
+    pub(crate) fn new(label: &str) -> Self {
+        let fixture = Self {
+            pid_file: PidFile::new(label),
+            cleanup_armed: AtomicBool::new(true),
+        };
+        for suffix in [".ready", ".term"] {
+            let _ = std::fs::remove_file(fixture.marker(suffix));
+        }
+        fixture
+    }
+
+    fn marker(&self, suffix: &str) -> PathBuf {
+        let mut path = self.pid_file.path().as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    pub(crate) fn configure(&self, builder: CodexBuilder) -> CodexBuilder {
+        builder
+            .env(
+                "CODEX_WRAPPER_TEST_PIDFILE",
+                self.pid_file.path().to_str().unwrap(),
+            )
+            .env("CODEX_WRAPPER_TEST_IGNORE_TERM", "1")
+            // The marker, rather than a guessed delay, determines when to
+            // drop. This leaves ample time even on a loaded CI worker.
+            .termination_grace(Duration::from_secs(30))
+    }
+
+    pub(crate) fn builder(&self) -> CodexBuilder {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-codex-spawns-child.sh");
+        self.configure(
+            Codex::builder()
+                .binary("/bin/bash")
+                .arg(script.to_str().unwrap()),
+        )
+    }
+
+    fn pids(&self) -> Option<(u32, u32)> {
+        let contents = std::fs::read_to_string(self.pid_file.path()).ok()?;
+        let field = |key: &str| {
+            contents
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .and_then(|value| value.parse().ok())
+        };
+        Some((field("parent=")?, field("child=")?))
+    }
+
+    pub(crate) async fn ready(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.pids().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fixture never recorded its ready process group");
+    }
+
+    pub(crate) async fn assert_drop_during_grace(&self, run: impl std::future::Future) {
+        let mut run = Box::pin(run);
+        let term = self.marker(".term");
+        tokio::select! {
+            _ = &mut run => panic!("the run finished before its grace period was observed"),
+            observed = tokio::time::timeout(Duration::from_secs(10), async {
+                while !term.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => observed.expect("the fixture never received SIGTERM"),
+        }
+        let (parent, child) = self.pids().expect("the fixture recorded its process group");
+        assert!(is_running(child), "the descendant must survive SIGTERM");
+        drop(run);
+
+        let (parent_gone, child_gone) =
+            tokio::join!(wait_until_gone(parent), wait_until_gone(child));
+        if parent_gone && child_gone {
+            self.cleanup_armed.store(false, Ordering::Relaxed);
+        }
+        assert!(parent_gone, "the direct child ({parent}) survived the drop");
+        assert!(
+            child_gone,
+            "the SIGTERM-ignoring descendant ({child}) survived dropping during grace"
+        );
+    }
+}
+
+impl Drop for GracePeriodFixture {
+    fn drop(&mut self) {
+        // Regression failures must not leave the deliberately stubborn
+        // process behind. Also clean up when an earlier assertion panics.
+        if self.cleanup_armed.load(Ordering::Relaxed)
+            && let Some((parent, _)) = self.pids()
+        {
+            crate::exec::signal_group(parent, libc::SIGKILL);
+        }
+        for suffix in [".ready", ".term"] {
+            let _ = std::fs::remove_file(self.marker(suffix));
+        }
+    }
 }
 
 /// Wait for `pid` to stop running, up to five seconds.

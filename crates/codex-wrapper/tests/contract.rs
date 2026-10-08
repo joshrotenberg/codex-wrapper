@@ -13,8 +13,11 @@
 //! Run it with a `codex` binary in PATH:
 //!
 //! ```sh
-//! cargo test --test contract -- --ignored
+//! CODEX_WRAPPER_ALLOW_DANGEROUS=1 cargo test --test contract -- --ignored
 //! ```
+//!
+//! The opt-in lets the harness construct the guarded bypass flags for their
+//! help checks. The suite never starts a model session.
 //!
 //! # How the two halves work
 //!

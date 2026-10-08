@@ -61,8 +61,15 @@ if [ "$mode" = exit-on-start ]; then
 fi
 
 if [ "$mode" = spawns-child ] || [ "$mode" = ignores-eof ]; then
-  sleep 60 &
+  if [ "${CODEX_WRAPPER_TEST_IGNORE_TERM:-}" = 1 ]; then
+    sh -c 'trap "" TERM; touch "$CODEX_WRAPPER_TEST_PIDFILE.ready"; exec sleep 60' &
+  else
+    sleep 60 &
+  fi
   child=$!
+  if [ "${CODEX_WRAPPER_TEST_IGNORE_TERM:-}" = 1 ]; then
+    while [ ! -f "$CODEX_WRAPPER_TEST_PIDFILE.ready" ]; do sleep 0.01; done
+  fi
   {
     echo "parent=$$"
     echo "child=$child"

@@ -41,4 +41,8 @@ jobs:
         run: codex --version
 
       - name: Check emitted flags against the CLI
+        # As in the pinned job, this unlocks help-only coverage of the two
+        # bypass flags. No model runs or permissions are bypassed here.
+        env:
+          CODEX_WRAPPER_ALLOW_DANGEROUS: "1"
         run: cargo test --test contract --all-features -- --ignored

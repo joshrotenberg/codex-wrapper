@@ -715,6 +715,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_during_stream_cancellation_grace_kills_the_group() {
+        let fixture = crate::test_support::GracePeriodFixture::new("stream-cancel-grace-drop");
+        let codex = fixture.builder().build().unwrap();
+        let cmd = crate::ExecCommand::new("probe").json();
+        fixture
+            .assert_drop_during_grace(stream_exec_cancellable(
+                &codex,
+                &cmd,
+                fixture.ready(),
+                |_| {},
+            ))
+            .await;
+    }
+
+    #[tokio::test]
     async fn stream_exec_parse_error() {
         let codex = fake_codex("fake-codex-bad-json.sh");
         let cmd = crate::command::exec::ExecCommand::new("test").json();
