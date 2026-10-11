@@ -1011,7 +1011,33 @@ let output = ExecCommand::new("flaky task")
 
 ## Escape Hatch: RawCommand
 
-For subcommands or flags not yet covered by typed builders:
+For native exec flags not yet covered by typed setters, `ExecCommand` and
+`ExecResumeCommand` accept `extra_arg` and `extra_args`:
+
+```rust
+use codex_wrapper::{ExecCommand, ExecResumeCommand};
+
+let command = ExecCommand::from_stdin("Summarize this repository")
+    .model("gpt-5")
+    .extra_arg("-c")
+    .extra_arg("personality=\"concise\"");
+
+let resumed = ExecResumeCommand::from_stdin("Focus on the API changes")
+    .session_id("thread-id")
+    .extra_args(["-c", "personality=\"concise\""]);
+```
+
+Each value is one argv element; no shell parsing or word splitting occurs. Extra arguments
+retain call order and appear after generated options, before the session ID, prompt, or stdin
+marker. This differs from `CodexBuilder::arg`, which adds a global argument before the
+subcommand. JSON, stdin, streaming, and cancellation APIs use the same extra arguments.
+
+The wrapper does not validate extra arguments or resolve conflicts with typed options. The
+caller and native CLI own those choices; arguments that alter output format can invalidate
+JSON parsing. Extra arguments can also override typed settings, including safety controls
+and rollout budgets, so callers exposing passthrough should apply their own policy.
+
+For other subcommands, use `RawCommand`:
 
 ```rust
 use codex_wrapper::RawCommand;
