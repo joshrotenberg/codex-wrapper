@@ -229,6 +229,115 @@ impl Drop for GracePeriodFixture {
     }
 }
 
+/// A signal-aware fake CLI with a detached cooperative tool or a stubborn
+/// same-group tool. Cleanup on assertion failure covers both topologies.
+pub(crate) struct InterruptFixture {
+    pid_file: PidFile,
+    cleanup_armed: AtomicBool,
+}
+
+impl InterruptFixture {
+    pub(crate) fn new(label: &str) -> Self {
+        let fixture = Self {
+            pid_file: PidFile::new(label),
+            cleanup_armed: AtomicBool::new(true),
+        };
+        for suffix in [".ready", ".int", ".term", ".cleaned"] {
+            let _ = std::fs::remove_file(fixture.marker(suffix));
+        }
+        fixture
+    }
+
+    pub(crate) fn marker(&self, suffix: &str) -> PathBuf {
+        let mut path = self.pid_file.path().as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    pub(crate) fn builder(&self) -> CodexBuilder {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-codex-interrupt.sh");
+        Codex::builder()
+            .binary("/bin/bash")
+            .arg(script.to_str().unwrap())
+            .env(
+                "CODEX_WRAPPER_TEST_PIDFILE",
+                self.pid_file.path().to_str().unwrap(),
+            )
+            .termination_grace(Duration::from_secs(1))
+    }
+
+    pub(crate) fn pids(&self) -> Option<(u32, u32)> {
+        let contents = std::fs::read_to_string(self.pid_file.path()).ok()?;
+        let field = |key: &str| {
+            contents
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .and_then(|value| value.parse().ok())
+        };
+        Some((field("parent=")?, field("child=")?))
+    }
+
+    pub(crate) async fn ready(&self) {
+        self.wait_for(".ready").await;
+        assert!(self.pids().is_some(), "ready requires recorded process IDs");
+    }
+
+    pub(crate) async fn wait_for(&self, suffix: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !self.marker(suffix).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fixture never reached its marker");
+    }
+
+    pub(crate) async fn detached_ready(&self) {
+        self.ready().await;
+        let (parent, child) = self.pids().unwrap();
+        // SAFETY: getpgid only queries processes owned by this fixture.
+        let (parent_group, child_group) =
+            unsafe { (libc::getpgid(parent as i32), libc::getpgid(child as i32)) };
+        assert!(parent_group > 0 && child_group > 0);
+        assert_ne!(
+            parent_group, child_group,
+            "the tool must escape the CLI group"
+        );
+    }
+
+    pub(crate) async fn assert_stopped(&self) {
+        let (parent, child) = self.pids().unwrap();
+        let (parent_gone, child_gone) =
+            tokio::join!(wait_until_gone(parent), wait_until_gone(child),);
+        assert!(parent_gone, "the direct child survived shutdown");
+        assert!(child_gone, "the tool survived shutdown");
+        self.cleanup_armed.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Drop for InterruptFixture {
+    fn drop(&mut self) {
+        if self.cleanup_armed.load(Ordering::Relaxed)
+            && let Some((parent, child)) = self.pids()
+        {
+            // Only signal the recorded parent's group while it still owns
+            // that identity. The opt-out fixture never leads its own group.
+            // SAFETY: getpgid only queries the recorded fixture process.
+            if unsafe { libc::getpgid(parent as i32) } == parent as i32 {
+                crate::exec::signal_group(parent, libc::SIGKILL);
+            }
+            // The cooperative test's tool is deliberately outside that group.
+            // SAFETY: this is a positive PID recorded by the owned fixture.
+            unsafe {
+                libc::kill(child as i32, libc::SIGKILL);
+            }
+        }
+        for suffix in [".ready", ".int", ".term", ".cleaned"] {
+            let _ = std::fs::remove_file(self.marker(suffix));
+        }
+    }
+}
+
 /// Wait for `pid` to stop running, up to five seconds.
 ///
 /// Checks the process state rather than `kill -0`: a killed child lingers as a

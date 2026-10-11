@@ -94,12 +94,9 @@ impl Drop for SpanOutcome {
     }
 }
 
-/// Put the child in its own process group, so the whole run can be signalled
-/// as a unit.
-///
-/// `kill_on_drop` reaps the direct child only, and codex spawns its own
-/// subprocesses for tool use. Without a group of its own, cancelling leaves
-/// those running (#78).
+/// Put the child in its own process group so signals also reach descendants
+/// that stay in that group. Tools that detach require cooperative CLI cleanup;
+/// `kill_on_drop` alone only reaches the direct child.
 #[cfg(unix)]
 pub(crate) fn own_process_group(cmd: &mut Command, enabled: bool) {
     if enabled {
@@ -170,6 +167,7 @@ pub(crate) fn apply_die_with_parent(cmd: &mut Command, enabled: bool) {
 /// Arm group cleanup and notify the observer from one process receipt.
 pub(crate) fn arm_and_notify(
     process_group: bool,
+    termination_signal: crate::TerminationSignal,
     pid: Option<u32>,
     on_spawn: Option<&crate::SpawnObserver>,
 ) -> GroupKillGuard {
@@ -179,7 +177,7 @@ pub(crate) fn arm_and_notify(
             pgid: process_group.then_some(pid),
         });
     }
-    GroupKillGuard::new(process_group.then_some(pid).flatten())
+    GroupKillGuard::new(process_group.then_some(pid).flatten(), termination_signal)
 }
 
 /// Signal a process group, given the group leader's pid.
@@ -195,8 +193,8 @@ pub(crate) fn signal_group(pid: u32, signal: i32) {
     let Ok(pid) = i32::try_from(pid) else {
         return;
     };
-    // SAFETY: `kill` with a negative pid signals a process group. Passing a
-    // pid the OS has already reaped is defined and simply fails.
+    // SAFETY: `kill` with a negative pid signals a process group. Callers must
+    // retain ownership of the group leader until their final signal is sent.
     unsafe {
         libc::kill(-pid, signal);
     }
@@ -205,16 +203,18 @@ pub(crate) fn signal_group(pid: u32, signal: i32) {
 /// SIGKILLs the run's process group when dropped.
 ///
 /// `kill_on_drop` handles the direct child; this is what reaches the
-/// subprocesses codex started. Drop cannot await, so this is the abrupt path.
+/// descendants that remain in the group. Detached tools require CLI cooperation.
+/// Drop cannot await, so this is the abrupt path.
 /// For a graceful one, see
 /// [`ExecCommand::execute_cancellable`](crate::ExecCommand::execute_cancellable).
 pub(crate) struct GroupKillGuard {
     pid: Option<u32>,
+    signal: crate::TerminationSignal,
 }
 
 impl GroupKillGuard {
-    pub(crate) fn new(pid: Option<u32>) -> Self {
-        Self { pid }
+    pub(crate) fn new(pid: Option<u32>, signal: crate::TerminationSignal) -> Self {
+        Self { pid, signal }
     }
 
     /// Stop killing on drop, once the run has finished on its own.
@@ -230,7 +230,7 @@ impl GroupKillGuard {
         let Some(pid) = self.pid else {
             return;
         };
-        signal_group(pid, libc::SIGTERM);
+        signal_group(pid, self.signal.as_raw());
         // Keep drop cleanup armed while this await can be cancelled. Once
         // SIGKILL is sent, disarm before the caller can reap the child.
         tokio::time::sleep(grace).await;
@@ -242,7 +242,7 @@ impl GroupKillGuard {
     /// child still dies with the dropped future via `kill_on_drop`.
     #[cfg(not(unix))]
     pub(crate) async fn terminate(&mut self, _grace: Duration) {
-        let _ = self.pid.take();
+        let _ = (self.pid.take(), self.signal);
     }
 }
 
@@ -412,6 +412,7 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                         working_dir: codex.working_dir.as_deref(),
                         stdin_prompt: None,
                         process_group: codex.process_group,
+                        termination_signal: codex.termination_signal,
                         output_limit: codex.output_limit,
                         die_with_parent: codex.die_with_parent,
                         on_spawn: codex.on_spawn.as_ref(),
@@ -431,6 +432,7 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
                         working_dir: codex.working_dir.as_deref(),
                         stdin_prompt: None,
                         process_group: codex.process_group,
+                        termination_signal: codex.termination_signal,
                         output_limit: codex.output_limit,
                         die_with_parent: codex.die_with_parent,
                         on_spawn: codex.on_spawn.as_ref(),
@@ -450,14 +452,18 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
 
 /// Run a codex command, stopping it gracefully if `cancel` resolves first.
 ///
-/// On cancellation the run's process group is sent SIGTERM, given the client's
-/// [`termination_grace`](crate::CodexBuilder::termination_grace), then killed.
-/// Signalling the group rather than the pid is what reaches the subprocesses
-/// codex started for tool use; killing only the direct child leaves those
-/// running (#78).
+/// On cancellation the run's process group is sent the configured signal,
+/// given the client's [`termination_grace`](crate::CodexBuilder::termination_grace),
+/// then killed.
+/// This reaches descendants in the owned group. Detached tools require the
+/// CLI's cooperation; [`TerminationSignal::Interrupt`](crate::TerminationSignal::Interrupt)
+/// lets its interrupt handler run before the hard fallback. Output during
+/// shutdown is drained and discarded, and the cancellation reason stays latched
+/// even if the CLI exits successfully. A cleanup I/O failure is logged without
+/// replacing the original stop reason.
 ///
-/// Dropping the future instead is still safe, and still kills the group, but
-/// abruptly: `Drop` cannot wait out a grace period.
+/// Dropping the future instead kills the owned group abruptly: `Drop` cannot
+/// wait out a grace period or allow cooperative cleanup of detached tools.
 ///
 /// Retry does not apply. A cancelled run is a decision, not a transient
 /// failure.
@@ -489,6 +495,7 @@ where
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: None,
                 process_group: codex.process_group,
+                termination_signal: codex.termination_signal,
                 output_limit: codex.output_limit,
                 die_with_parent: codex.die_with_parent,
                 on_spawn: codex.on_spawn.as_ref(),
@@ -583,6 +590,7 @@ pub async fn run_codex_with_stdin_prompt(
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: Some(prompt),
                 process_group: codex.process_group,
+                termination_signal: codex.termination_signal,
                 output_limit: codex.output_limit,
                 die_with_parent: codex.die_with_parent,
                 on_spawn: codex.on_spawn.as_ref(),
@@ -634,6 +642,7 @@ where
                 working_dir: codex.working_dir.as_deref(),
                 stdin_prompt: Some(prompt),
                 process_group: codex.process_group,
+                termination_signal: codex.termination_signal,
                 output_limit: codex.output_limit,
                 die_with_parent: codex.die_with_parent,
                 on_spawn: codex.on_spawn.as_ref(),
@@ -719,6 +728,7 @@ struct SpawnSpec<'a> {
     stdin_prompt: Option<&'a str>,
     /// Whether the run leads its own process group.
     process_group: bool,
+    termination_signal: crate::TerminationSignal,
     /// Stop capturing a stream once it passes this many bytes.
     output_limit: Option<usize>,
     /// Whether the child should die with its immediate parent on Linux.
@@ -806,6 +816,7 @@ async fn run_internal_inner(
         working_dir,
         stdin_prompt,
         process_group,
+        termination_signal,
         output_limit,
         die_with_parent,
         on_spawn,
@@ -847,10 +858,10 @@ async fn run_internal_inner(
     })?;
 
     // Armed for the whole run. If this future is dropped, its Drop signals the
-    // group, which is what reaches the subprocesses codex started.
+    // group, which also reaches descendants still in that group.
     // Only meaningful when the run leads its own group. Sharing the parent's
     // means signalling it would hit the parent too.
-    let mut group = arm_and_notify(process_group, child.id(), on_spawn);
+    let mut group = arm_and_notify(process_group, termination_signal, child.id(), on_spawn);
     let child_stdin = child.stdin.take();
     let mut child_stdout = child.stdout.take().expect("stdout was configured as piped");
     let mut child_stderr = child.stderr.take().expect("stderr was configured as piped");
@@ -881,7 +892,7 @@ async fn run_internal_inner(
     // blocks until the child reads it, and a child that writes to stdout
     // meanwhile blocks until we read that. Waiting for the write to finish
     // before draining stdout would deadlock both.
-    let read_stdout = async move {
+    let read_stdout = async {
         capture(
             &mut child_stdout,
             output_limit,
@@ -890,7 +901,7 @@ async fn run_internal_inner(
         )
         .await
     };
-    let read_stderr = async move {
+    let read_stderr = async {
         capture(
             &mut child_stderr,
             output_limit,
@@ -899,9 +910,11 @@ async fn run_internal_inner(
         )
         .await
     };
-    let wait = async { child.wait().await.map_err(|e| wait_error(e, working_dir)) };
     let run = async {
-        let ((), stdout, stderr, status) = tokio::try_join!(write, read_stdout, read_stderr, wait)?;
+        let ((), stdout, stderr) = tokio::try_join!(write, read_stdout, read_stderr)?;
+        // Do not reap while pipes are still open: if cancellation wins then,
+        // delayed group signaling must not target a recycled group-leader PID.
+        let status = child.wait().await.map_err(|e| wait_error(e, working_dir))?;
         Ok::<_, Error>((stdout, stderr, status))
     };
 
@@ -922,16 +935,32 @@ async fn run_internal_inner(
             // A stdin or pipe failure can happen while the child continues
             // running. Treat it as a stop request and settle ownership before
             // exposing the I/O error.
-            terminate_and_reap(&mut child, &mut group, grace, working_dir).await?;
+            let _ = terminate_and_reap_draining(
+                &mut child,
+                &mut group,
+                grace,
+                working_dir,
+                &mut child_stdout,
+                &mut child_stderr,
+            )
+            .await;
             return Err(error);
         }
         Err(reason) => {
             // The run future is gone before this branch executes, returning
             // ownership of `child` so cleanup can explicitly reap it.
-            // `GroupKillGuard::terminate` reaches descendants on Unix. The
+            // `GroupKillGuard::terminate` reaches same-group descendants. The
             // direct-child kill below is the portable fallback and makes the
             // wait authoritative on every platform.
-            terminate_and_reap(&mut child, &mut group, grace, working_dir).await?;
+            let _ = terminate_and_reap_draining(
+                &mut child,
+                &mut group,
+                grace,
+                working_dir,
+                &mut child_stdout,
+                &mut child_stderr,
+            )
+            .await;
             return Err(reason.into_error());
         }
     };
@@ -959,6 +988,41 @@ async fn run_internal_inner(
         exit_code,
         success: true,
     })
+}
+
+/// Keep both pipes open and flowing while shutdown runs. Shutdown output is
+/// discarded in fixed-size chunks, never parsed or sent to event handlers.
+/// The drain is dropped when cleanup finishes even if an escaped descendant
+/// still holds a pipe open. No child wait is polled before group signaling ends.
+pub(crate) async fn terminate_and_reap_draining<O, E>(
+    child: &mut tokio::process::Child,
+    group: &mut GroupKillGuard,
+    grace: Duration,
+    working_dir: Option<&std::path::Path>,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> Result<()>
+where
+    O: tokio::io::AsyncRead + Unpin,
+    E: tokio::io::AsyncRead + Unpin,
+{
+    let drain = async {
+        let mut stdout_sink = tokio::io::sink();
+        let mut stderr_sink = tokio::io::sink();
+        let _ = tokio::join!(
+            tokio::io::copy(stdout, &mut stdout_sink),
+            tokio::io::copy(stderr, &mut stderr_sink),
+        );
+        std::future::pending::<()>().await;
+    };
+    let result = tokio::select! {
+        result = terminate_and_reap(child, group, grace, working_dir) => result,
+        () = drain => unreachable!("the drain waits until shutdown finishes"),
+    };
+    if result.is_err() {
+        tracing::warn!("codex cleanup failed while preserving the original stop reason");
+    }
+    result
 }
 
 pub(crate) async fn terminate_and_reap(
@@ -1832,7 +1896,148 @@ mod tests {
             .await;
     }
 
-    /// Buffered timeout uses the same settled process-tree cleanup as an
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_shutdown_still_sends_term_and_drains_both_pipes() {
+        let fixture = crate::test_support::InterruptFixture::new("default-term-drain");
+        let codex = fixture.builder().build().unwrap();
+        let result =
+            run_codex_cancellable(&codex, vec!["exec".into()], fixture.detached_ready()).await;
+        assert!(matches!(result, Err(Error::Cancelled { .. })), "{result:?}");
+        assert!(fixture.marker(".term").exists());
+        assert!(!fixture.marker(".int").exists());
+        assert!(
+            fixture.marker(".cleaned").exists(),
+            "shutdown output blocked cleanup"
+        );
+        fixture.assert_stopped().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_cancellation_drains_large_shutdown_output_and_cleans_detached_tool() {
+        let fixture = crate::test_support::InterruptFixture::new("buffered-interrupt-drain");
+        let codex = fixture
+            .builder()
+            .termination_signal(crate::TerminationSignal::Interrupt)
+            // The shutdown output must not be captured against this limit.
+            .output_limit(64)
+            .build()
+            .unwrap();
+        let result = run_codex_with_stdin_prompt_cancellable(
+            &codex,
+            vec!["exec".into(), "-".into()],
+            "prompt",
+            fixture.detached_ready(),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Cancelled { .. })), "{result:?}");
+        assert!(fixture.marker(".int").exists());
+        assert!(!fixture.marker(".term").exists());
+        assert!(
+            fixture.marker(".cleaned").exists(),
+            "shutdown output blocked cleanup"
+        );
+        fixture.assert_stopped().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_timeout_keeps_timeout_error_after_cooperative_exit() {
+        let fixture = crate::test_support::InterruptFixture::new("buffered-interrupt-timeout");
+        let codex = fixture
+            .builder()
+            .termination_signal(crate::TerminationSignal::Interrupt)
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let run = run_codex(&codex, vec!["exec".into()]);
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("run ended before readiness: {result:?}"),
+            () = fixture.detached_ready() => {}
+        }
+        let result = run.await;
+        assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
+        assert!(fixture.marker(".int").exists());
+        assert!(fixture.marker(".cleaned").exists());
+        fixture.assert_stopped().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_ignored_uses_bounded_hard_fallback() {
+        let fixture = crate::test_support::InterruptFixture::new("buffered-interrupt-ignored");
+        let codex = fixture
+            .builder()
+            .env("CODEX_WRAPPER_TEST_SHUTDOWN_MODE", "ignore")
+            .termination_signal(crate::TerminationSignal::Interrupt)
+            .termination_grace(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_codex_cancellable(&codex, vec!["exec".into()], fixture.ready()),
+        )
+        .await
+        .expect("hard fallback exceeded the grace budget");
+        assert!(matches!(result, Err(Error::Cancelled { .. })), "{result:?}");
+        assert!(fixture.marker(".int").exists());
+        assert!(!fixture.marker(".cleaned").exists());
+        fixture.assert_stopped().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_during_interrupt_grace_kills_immediately() {
+        let fixture = crate::test_support::InterruptFixture::new("buffered-interrupt-drop");
+        let codex = fixture
+            .builder()
+            .env("CODEX_WRAPPER_TEST_SHUTDOWN_MODE", "ignore")
+            .termination_signal(crate::TerminationSignal::Interrupt)
+            .termination_grace(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let mut run = Box::pin(run_codex_cancellable(
+            &codex,
+            vec!["exec".into()],
+            fixture.ready(),
+        ));
+        tokio::select! {
+            result = &mut run => panic!("run ended before its grace period: {result:?}"),
+            () = fixture.wait_for(".int") => {}
+        }
+        drop(run);
+        fixture.assert_stopped().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_optout_skips_interrupt_and_grace() {
+        let fixture = crate::test_support::InterruptFixture::new("buffered-interrupt-optout");
+        let codex = fixture
+            .builder()
+            .process_group(false)
+            .termination_signal(crate::TerminationSignal::Interrupt)
+            .termination_grace(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_codex_cancellable(&codex, vec!["exec".into()], fixture.detached_ready()),
+        )
+        .await
+        .expect("optout must not wait through the grace period");
+        assert!(matches!(result, Err(Error::Cancelled { .. })), "{result:?}");
+        assert!(!fixture.marker(".int").exists());
+        assert!(!fixture.marker(".term").exists());
+        let (parent, child) = fixture.pids().unwrap();
+        assert!(crate::test_support::wait_until_gone(parent).await);
+        assert!(crate::test_support::is_running_for_test(child));
+        // Fixture Drop cleans the deliberately surviving detached child.
+    }
+
+    /// Buffered timeout uses the same settled process-group cleanup as an
     /// explicit cancellation signal.
     #[cfg(unix)]
     #[tokio::test]
@@ -1869,7 +2074,7 @@ mod tests {
         );
     }
 
-    /// A broken stdin pipe is terminal only after the process tree has been
+    /// A broken stdin pipe is terminal only after the owned process group has been
     /// stopped. Returning the write error first would release the caller while
     /// the provider could still mutate the workspace.
     #[cfg(unix)]
