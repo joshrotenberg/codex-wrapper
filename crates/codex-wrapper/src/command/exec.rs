@@ -96,6 +96,7 @@ pub struct ExecCommand {
     color: Option<Color>,
     json: bool,
     output_last_message: Option<String>,
+    extra_args: Vec<String>,
     retry_policy: Option<crate::retry::RetryPolicy>,
 }
 
@@ -133,6 +134,7 @@ impl ExecCommand {
             color: None,
             json: false,
             output_last_message: None,
+            extra_args: Vec::new(),
             retry_policy: None,
         }
     }
@@ -461,6 +463,28 @@ impl ExecCommand {
         self
     }
 
+    /// Append one native exec argument without shell parsing.
+    ///
+    /// Arguments retain call order and follow generated options, before the
+    /// prompt or stdin marker. Unlike [`crate::CodexBuilder::arg`], they are
+    /// passed after the subcommand. The caller and CLI are responsible for
+    /// validity and conflicts, including options that change output format.
+    #[must_use]
+    pub fn extra_arg(mut self, arg: impl Into<String>) -> Self {
+        self.extra_args.push(arg.into());
+        self
+    }
+
+    /// Append several native exec arguments in order.
+    ///
+    /// Each value is one argv element. See [`Self::extra_arg`] for placement
+    /// and validation semantics.
+    #[must_use]
+    pub fn extra_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.extra_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
     /// Override the retry policy for this command.
     ///
     /// Takes precedence over the client-level policy set on [`Codex`].
@@ -542,10 +566,7 @@ impl ExecCommand {
     /// feature.
     #[cfg(feature = "json")]
     pub async fn execute_json_lines(&self, codex: &Codex) -> Result<Vec<JsonLineEvent>> {
-        let mut args = self.args();
-        if !self.json {
-            args.push("--json".into());
-        }
+        let args = self.clone().json().args();
 
         let output = if self.prompt_via_stdin {
             let prompt = self.prompt.as_deref().unwrap_or_default();
@@ -569,10 +590,7 @@ impl ExecCommand {
     where
         C: std::future::Future<Output = ()> + Send,
     {
-        let mut args = self.args();
-        if !self.json {
-            args.push("--json".into());
-        }
+        let args = self.clone().json().args();
 
         let output = if self.prompt_via_stdin {
             let prompt = self.prompt.as_deref().unwrap_or_default();
@@ -691,6 +709,7 @@ impl CodexCommand for ExecCommand {
             args.push("--output-last-message".into());
             args.push(path.clone());
         }
+        args.extend(self.extra_args.iter().cloned());
         if self.prompt_via_stdin {
             // The prompt travels on stdin; `-` is how the CLI is told to read
             // it from there.
@@ -741,6 +760,7 @@ pub struct ExecResumeCommand {
     ephemeral: bool,
     json: bool,
     output_last_message: Option<String>,
+    extra_args: Vec<String>,
     retry_policy: Option<crate::retry::RetryPolicy>,
 }
 
@@ -773,6 +793,7 @@ impl ExecResumeCommand {
             ephemeral: false,
             json: false,
             output_last_message: None,
+            extra_args: Vec::new(),
             retry_policy: None,
         }
     }
@@ -865,6 +886,29 @@ impl ExecResumeCommand {
     #[must_use]
     pub fn output_last_message(mut self, path: impl Into<String>) -> Self {
         self.output_last_message = Some(path.into());
+        self
+    }
+
+    /// Append one native resume argument without shell parsing.
+    ///
+    /// Arguments retain call order and follow generated options, before the
+    /// session ID and prompt or stdin marker. Unlike
+    /// [`crate::CodexBuilder::arg`], they are passed after the subcommand.
+    /// The caller and CLI are responsible for validity and conflicts,
+    /// including options that change output format.
+    #[must_use]
+    pub fn extra_arg(mut self, arg: impl Into<String>) -> Self {
+        self.extra_args.push(arg.into());
+        self
+    }
+
+    /// Append several native resume arguments in order.
+    ///
+    /// Each value is one argv element. See [`Self::extra_arg`] for placement
+    /// and validation semantics.
+    #[must_use]
+    pub fn extra_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.extra_args.extend(args.into_iter().map(Into::into));
         self
     }
 
@@ -1051,10 +1095,7 @@ impl ExecResumeCommand {
     /// feature.
     #[cfg(feature = "json")]
     pub async fn execute_json_lines(&self, codex: &Codex) -> Result<Vec<JsonLineEvent>> {
-        let mut args = self.args();
-        if !self.json {
-            args.push("--json".into());
-        }
+        let args = self.clone().json().args();
 
         let output = if self.prompt_via_stdin {
             let prompt = self.prompt.as_deref().unwrap_or_default();
@@ -1078,10 +1119,7 @@ impl ExecResumeCommand {
     where
         C: std::future::Future<Output = ()> + Send,
     {
-        let mut args = self.args();
-        if !self.json {
-            args.push("--json".into());
-        }
+        let args = self.clone().json().args();
 
         let output = if self.prompt_via_stdin {
             let prompt = self.prompt.as_deref().unwrap_or_default();
@@ -1217,6 +1255,7 @@ impl CodexCommand for ExecResumeCommand {
             args.push("--output-last-message".into());
             args.push(path.clone());
         }
+        args.extend(self.extra_args.iter().cloned());
         if let Some(session_id) = &self.session_id {
             args.push(session_id.clone());
         }
@@ -1279,6 +1318,80 @@ fn parse_json_lines(stdout: &str) -> Result<Vec<JsonLineEvent>> {
 mod tests {
     use super::*;
     use crate::types::ApprovalPolicy;
+
+    #[test]
+    fn exec_extra_args_follow_options_and_precede_the_prompt() {
+        for stdin in [false, true] {
+            let mut cmd = ExecCommand::new("prompt");
+            if stdin {
+                cmd = cmd.prompt_via_stdin();
+            }
+            let args = cmd
+                .extra_arg("--native")
+                .model("gpt-5")
+                .extra_args(["value with spaces", "", "--json"])
+                .extra_arg("literal $HOME; echo nope")
+                .json()
+                .args();
+            assert_eq!(
+                args,
+                [
+                    "exec",
+                    "--model",
+                    "gpt-5",
+                    "--json",
+                    "--native",
+                    "value with spaces",
+                    "",
+                    "--json",
+                    "literal $HOME; echo nope",
+                    if stdin { "-" } else { "prompt" },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn resume_extra_args_precede_session_id_and_prompt() {
+        for stdin in [false, true] {
+            let mut cmd = ExecResumeCommand::new()
+                .session_id("thread-1")
+                .prompt("prompt");
+            if stdin {
+                cmd = cmd.prompt_via_stdin();
+            }
+            let args = cmd
+                .extra_arg("--native")
+                .model("gpt-5")
+                .extra_args(["value with spaces", ""])
+                .extra_arg("literal $HOME; echo nope")
+                .json()
+                .args();
+            assert_eq!(
+                args,
+                [
+                    "exec",
+                    "resume",
+                    "--model",
+                    "gpt-5",
+                    "--json",
+                    "--native",
+                    "value with spaces",
+                    "",
+                    "literal $HOME; echo nope",
+                    "thread-1",
+                    if stdin { "-" } else { "prompt" },
+                ]
+            );
+        }
+        assert_eq!(
+            ExecResumeCommand::new()
+                .last()
+                .extra_args(["--native", "value"])
+                .args(),
+            ["exec", "resume", "--last", "--native", "value"]
+        );
+    }
 
     #[test]
     fn exec_args() {
