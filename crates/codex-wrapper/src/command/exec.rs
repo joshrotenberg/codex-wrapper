@@ -497,7 +497,7 @@ impl ExecCommand {
     /// Stream JSONL events from the command, invoking `handler` for each
     /// parsed [`JsonLineEvent`] as it arrives.
     ///
-    /// Automatically appends `--json` if not already set. Requires the `json`
+    /// Automatically enables JSON output before extra arguments. Requires the `json`
     /// feature.
     ///
     /// # Example
@@ -562,7 +562,7 @@ impl ExecCommand {
 
     /// Execute the command and parse the output as JSON Lines events.
     ///
-    /// Automatically appends `--json` if not already set. Requires the `json`
+    /// Automatically enables JSON output before extra arguments. Requires the `json`
     /// feature.
     #[cfg(feature = "json")]
     pub async fn execute_json_lines(&self, codex: &Codex) -> Result<Vec<JsonLineEvent>> {
@@ -579,7 +579,7 @@ impl ExecCommand {
 
     /// Execute cancellably and parse the output as JSON Lines events.
     ///
-    /// Automatically appends `--json` if not already set. Process cleanup is
+    /// Automatically enables JSON output before extra arguments. Process cleanup is
     /// complete before a cancellation or timeout error is returned.
     #[cfg(feature = "json")]
     pub async fn execute_json_lines_cancellable<C>(
@@ -1091,7 +1091,7 @@ impl ExecResumeCommand {
 
     /// Execute the command and parse the output as JSON Lines events.
     ///
-    /// Automatically appends `--json` if not already set. Requires the `json`
+    /// Automatically enables JSON output before extra arguments. Requires the `json`
     /// feature.
     #[cfg(feature = "json")]
     pub async fn execute_json_lines(&self, codex: &Codex) -> Result<Vec<JsonLineEvent>> {
@@ -1108,7 +1108,7 @@ impl ExecResumeCommand {
 
     /// Execute this resumed turn cancellably and parse JSON Lines events.
     ///
-    /// Automatically appends `--json` if not already set. Process cleanup is
+    /// Automatically enables JSON output before extra arguments. Process cleanup is
     /// complete before a cancellation or timeout error is returned.
     #[cfg(feature = "json")]
     pub async fn execute_json_lines_cancellable<C>(
@@ -1156,7 +1156,7 @@ impl ExecResumeCommand {
     /// Stream JSONL events from the resume command, invoking `handler` for
     /// each parsed [`JsonLineEvent`] as it arrives.
     ///
-    /// Automatically appends `--json` if not already set. Requires the `json`
+    /// Automatically enables JSON output before extra arguments. Requires the `json`
     /// feature.
     #[cfg(feature = "json")]
     pub async fn stream<F>(&self, codex: &Codex, handler: F) -> Result<()>
@@ -1318,6 +1318,147 @@ fn parse_json_lines(stdout: &str) -> Result<Vec<JsonLineEvent>> {
 mod tests {
     use super::*;
     use crate::types::ApprovalPolicy;
+
+    #[cfg(unix)]
+    const NATIVE_ARGS: &[&str] = &["--native", "value with spaces\nand a newline", "", "--"];
+
+    #[cfg(unix)]
+    struct ArgvCapture(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl ArgvCapture {
+        fn client() -> (Self, Codex) {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let capture = Self(std::env::temp_dir().join(format!(
+                "codex-wrapper-{}-extra-args-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            )));
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fake-codex-capture-args.sh");
+            let client = Codex::builder()
+                .binary("/bin/bash")
+                .arg(fixture.to_str().unwrap())
+                .env("CODEX_WRAPPER_ARGS_CAPTURE", capture.0.to_str().unwrap())
+                .timeout_secs(5)
+                .build()
+                .unwrap();
+            (capture, client)
+        }
+
+        fn assert_received(&self, resume: bool, stdin: bool, json: bool) {
+            let contents = std::fs::read_to_string(&self.0).unwrap();
+            let received: Vec<_> = contents.split_terminator('\0').collect();
+            let mut expected = vec!["exec"];
+            if resume {
+                expected.push("resume");
+            }
+            expected.extend(["--model", "gpt-5"]);
+            if json {
+                expected.push("--json");
+            }
+            expected.extend_from_slice(NATIVE_ARGS);
+            if resume {
+                expected.push("thread-1");
+            }
+            expected.push(if stdin { "-" } else { "prompt\nsecond line" });
+            assert_eq!(received, expected);
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ArgvCapture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn fresh_with_extra_args(stdin: bool) -> ExecCommand {
+        let cmd = ExecCommand::new("prompt\nsecond line")
+            .model("gpt-5")
+            .extra_arg(NATIVE_ARGS[0])
+            .extra_args(NATIVE_ARGS[1..].iter().copied());
+        if stdin { cmd.prompt_via_stdin() } else { cmd }
+    }
+
+    #[cfg(unix)]
+    fn resumed_with_extra_args(stdin: bool) -> ExecResumeCommand {
+        let cmd = ExecResumeCommand::new()
+            .session_id("thread-1")
+            .prompt("prompt\nsecond line")
+            .model("gpt-5")
+            .extra_arg(NATIVE_ARGS[0])
+            .extra_args(NATIVE_ARGS[1..].iter().copied());
+        if stdin { cmd.prompt_via_stdin() } else { cmd }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extra_args_reach_buffered_fresh_and_resumed_children() {
+        for resume in [false, true] {
+            for stdin in [false, true] {
+                let (capture, codex) = ArgvCapture::client();
+                let output = if resume {
+                    resumed_with_extra_args(stdin)
+                        .execute_cancellable(&codex, std::future::pending())
+                        .await
+                } else {
+                    fresh_with_extra_args(stdin).execute(&codex).await
+                }
+                .unwrap();
+                assert!(output.success);
+                capture.assert_received(resume, stdin, false);
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn extra_args_preserve_json_and_streaming_prompt_transport() {
+        for resume in [false, true] {
+            for stdin in [false, true] {
+                for streaming in [false, true] {
+                    let (capture, codex) = ArgvCapture::client();
+                    let events = if streaming {
+                        let mut events = Vec::new();
+                        if resume {
+                            resumed_with_extra_args(stdin)
+                                .stream_cancellable(&codex, std::future::pending(), |event| {
+                                    events.push(event)
+                                })
+                                .await
+                                .unwrap();
+                        } else {
+                            fresh_with_extra_args(stdin)
+                                .stream(&codex, |event| events.push(event))
+                                .await
+                                .unwrap();
+                        }
+                        events
+                    } else if resume {
+                        resumed_with_extra_args(stdin)
+                            .execute_json_lines_cancellable(&codex, std::future::pending())
+                            .await
+                            .unwrap()
+                    } else {
+                        fresh_with_extra_args(stdin)
+                            .execute_json_lines(&codex)
+                            .await
+                            .unwrap()
+                    };
+                    capture.assert_received(resume, stdin, true);
+                    let result = QueryResult::from_events(events);
+                    assert_eq!(result.thread_id.as_deref(), Some("thread_stdin"));
+                    assert_eq!(
+                        result.result,
+                        if stdin { "prompt\nsecond line" } else { "" }
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn exec_extra_args_follow_options_and_precede_the_prompt() {
