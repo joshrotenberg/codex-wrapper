@@ -59,7 +59,9 @@ where
 ///
 /// Cancellation terminates the owned process group, waits through the
 /// client's configured grace period, and reaps the direct child before
-/// returning [`Error::Cancelled`].
+/// returning [`Error::Cancelled`]. Shutdown output is drained and discarded;
+/// handlers stop receiving events after cancellation. Detached tools require
+/// the CLI's cooperation; see [`crate::CodexBuilder::termination_signal`].
 pub async fn stream_exec_cancellable<C, F>(
     codex: &Codex,
     cmd: &crate::command::exec::ExecCommand,
@@ -167,13 +169,17 @@ where
     })?;
 
     // Armed for the whole stream. Dropping this future signals the group,
-    // which reaches the subprocesses codex started for tool use; kill_on_drop
-    // alone would leave those running (#78).
-    let mut group =
-        crate::exec::arm_and_notify(codex.process_group, child.id(), codex.on_spawn.as_ref());
+    // which reaches descendants still in that group; kill_on_drop alone only
+    // stops the direct child. Detached tools require cooperative cleanup.
+    let mut group = crate::exec::arm_and_notify(
+        codex.process_group,
+        codex.termination_signal,
+        child.id(),
+        codex.on_spawn.as_ref(),
+    );
 
-    let stdout = child.stdout.take().expect("stdout was configured as piped");
-    let stderr = child.stderr.take().expect("stderr was configured as piped");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout was configured as piped"));
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr was configured as piped"));
     // Taken up front so the write does not borrow `child`, which the wait
     // below needs.
     let child_stdin = child.stdin.take();
@@ -202,10 +208,9 @@ where
     };
 
     let stdout_task = async {
-        let mut reader = BufReader::new(stdout);
         let mut captured_bytes = 0usize;
         while let Some(line) = read_bounded_line(
-            &mut reader,
+            &mut stdout,
             &mut captured_bytes,
             codex.output_limit,
             crate::OutputStream::Stdout,
@@ -229,11 +234,10 @@ where
     };
 
     let stderr_task = async {
-        let mut reader = BufReader::new(stderr);
         let mut collected = String::new();
         let mut captured_bytes = 0usize;
         while let Some(line) = read_bounded_line(
-            &mut reader,
+            &mut stderr,
             &mut captured_bytes,
             codex.output_limit,
             crate::OutputStream::Stderr,
@@ -249,16 +253,15 @@ where
         Ok::<String, Error>(collected)
     };
 
-    let wait_task = async {
-        child.wait().await.map_err(|e| Error::Io {
+    let stream_future = async {
+        let ((), (), stderr_output) = tokio::try_join!(stdin_task, stdout_task, stderr_task)?;
+        // Keep the leader unreaped until all readers finish so a cancellation
+        // never signals a group whose leader PID could already be reused.
+        let status = child.wait().await.map_err(|e| Error::Io {
             message: format!("failed to wait on codex process: {e}"),
             source: e,
             working_dir: codex.working_dir.clone(),
-        })
-    };
-    let stream_future = async {
-        let ((), (), stderr_output, status) =
-            tokio::try_join!(stdin_task, stdout_task, stderr_task, wait_task)?;
+        })?;
         Ok::<_, Error>((stderr_output, status))
     };
 
@@ -287,24 +290,28 @@ where
     let (stderr_output, status) = match finished {
         Ok(Ok(finished)) => finished,
         Ok(Err(error)) => {
-            crate::exec::terminate_and_reap(
+            let _ = crate::exec::terminate_and_reap_draining(
                 &mut child,
                 &mut group,
                 codex.termination_grace,
                 codex.working_dir.as_deref(),
+                &mut stdout,
+                &mut stderr,
             )
-            .await?;
+            .await;
             outcome.settle("failed", None);
             return Err(error);
         }
         Err(reason) => {
-            crate::exec::terminate_and_reap(
+            let _ = crate::exec::terminate_and_reap_draining(
                 &mut child,
                 &mut group,
                 codex.termination_grace,
                 codex.working_dir.as_deref(),
+                &mut stdout,
+                &mut stderr,
             )
-            .await?;
+            .await;
             let error = match reason {
                 StreamStop::Cancelled => {
                     outcome.settle("cancelled", None);
@@ -323,6 +330,8 @@ where
         }
     };
 
+    // A nonzero exit is also a completed, reaped run, not a drop cleanup.
+    group.disarm();
     let exit_code = status.code().unwrap_or(-1);
     if !status.success() {
         outcome.settle("failed", Some(exit_code));
@@ -336,7 +345,6 @@ where
     }
 
     outcome.settle("ok", Some(exit_code));
-    group.disarm();
     Ok(())
 }
 
@@ -478,6 +486,54 @@ mod tests {
             still_running,
             "the fixture must still be running when the callback fires"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_interrupt_drains_without_parsing_or_delivering_shutdown_bytes() {
+        let fixture = crate::test_support::InterruptFixture::new("stream-interrupt-drain");
+        let codex = fixture
+            .builder()
+            .termination_signal(crate::TerminationSignal::Interrupt)
+            .output_limit(64)
+            .build()
+            .unwrap();
+        let command = crate::ExecCommand::from_stdin("prompt");
+        let mut calls = 0;
+        let result =
+            stream_exec_cancellable(&codex, &command, fixture.detached_ready(), |_| calls += 1)
+                .await;
+        assert!(matches!(result, Err(Error::Cancelled { .. })), "{result:?}");
+        assert_eq!(calls, 0, "shutdown bytes must not reach the event handler");
+        assert!(fixture.marker(".int").exists());
+        assert!(
+            fixture.marker(".cleaned").exists(),
+            "shutdown output blocked cleanup"
+        );
+        fixture.assert_stopped().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_resume_interrupt_ignored_uses_hard_fallback() {
+        let fixture = crate::test_support::InterruptFixture::new("stream-resume-interrupt-ignored");
+        let codex = fixture
+            .builder()
+            .env("CODEX_WRAPPER_TEST_SHUTDOWN_MODE", "ignore")
+            .termination_signal(crate::TerminationSignal::Interrupt)
+            .termination_grace(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let command = crate::ExecResumeCommand::new().last();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream_exec_resume_cancellable(&codex, &command, fixture.ready(), |_| {}),
+        )
+        .await
+        .expect("hard fallback exceeded the grace budget");
+        assert!(matches!(result, Err(Error::Cancelled { .. })), "{result:?}");
+        assert!(fixture.marker(".int").exists());
+        fixture.assert_stopped().await;
     }
 
     #[tokio::test]

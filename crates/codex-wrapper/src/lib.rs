@@ -157,7 +157,10 @@
 //! [`ExecResumeCommand::execute_cancellable`] accept an explicit cancellation
 //! future. They terminate the owned process group and await the direct child
 //! before returning. Buffered client timeouts use the same settled cleanup
-//! path.
+//! path. [`CodexBuilder::termination_signal`] optionally selects SIGINT instead
+//! of SIGTERM so the CLI can handle an interrupt. Descendants in separate
+//! process groups require the CLI's cooperation; the hard-kill fallback cannot
+//! reach them.
 //!
 //! Dropping an ordinary command future is an abrupt fallback. It kills the
 //! direct child and, on Unix, the owned process group, but `Drop` cannot await
@@ -283,6 +286,35 @@ pub struct SpawnInfo {
 /// child's output.
 pub type SpawnObserver = std::sync::Arc<dyn Fn(SpawnInfo) + Send + Sync>;
 
+/// Unix signal sent before the hard-kill fallback during awaited shutdown.
+///
+/// The default is [`Terminate`](Self::Terminate). [`Interrupt`](Self::Interrupt)
+/// lets a CLI handle cancellation as Ctrl-C, including cleaning up tools it
+/// started in separate process groups. Such cleanup depends on the CLI; the
+/// wrapper's fallback only reaches its own process group.
+///
+/// Ignored on non-Unix platforms and with
+/// [`process_group(false)`](CodexBuilder::process_group). Dropping a running
+/// future always kills immediately without sending this signal first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TerminationSignal {
+    /// Send SIGTERM, preserving the default shutdown behavior.
+    #[default]
+    Terminate,
+    /// Send SIGINT so the CLI can run its interrupt handler.
+    Interrupt,
+}
+
+impl TerminationSignal {
+    #[cfg(unix)]
+    pub(crate) fn as_raw(self) -> i32 {
+        match self {
+            Self::Terminate => libc::SIGTERM,
+            Self::Interrupt => libc::SIGINT,
+        }
+    }
+}
+
 /// Shared Codex CLI client configuration.
 ///
 /// Holds the binary path, working directory, environment variables, global
@@ -309,6 +341,7 @@ pub struct Codex {
     pub(crate) global_args: Vec<String>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) termination_grace: Duration,
+    pub(crate) termination_signal: TerminationSignal,
     pub(crate) process_group: bool,
     pub(crate) output_limit: Option<usize>,
     pub(crate) die_with_parent: bool,
@@ -486,6 +519,7 @@ impl fmt::Debug for Codex {
             .field("global_args", &self.global_args)
             .field("timeout", &self.timeout)
             .field("termination_grace", &self.termination_grace)
+            .field("termination_signal", &self.termination_signal)
             .field("process_group", &self.process_group)
             .field("die_with_parent", &self.die_with_parent)
             .field("has_spawn_observer", &self.on_spawn.is_some())
@@ -530,6 +564,7 @@ pub struct CodexBuilder {
     global_args: Vec<String>,
     timeout: Option<Duration>,
     termination_grace: Option<Duration>,
+    termination_signal: TerminationSignal,
     process_group: Option<bool>,
     output_limit: Option<usize>,
     die_with_parent: bool,
@@ -616,8 +651,10 @@ impl CodexBuilder {
     /// How long a cancelled run's process group gets to exit before it is
     /// killed. Defaults to five seconds.
     ///
-    /// Applies to cancellable exec methods and buffered client timeouts. They
-    /// send SIGTERM, wait this long, send SIGKILL, and await the direct child.
+    /// Applies to awaited exec cancellation and timeouts, buffered or streaming.
+    /// These send the configured [`termination_signal`](Self::termination_signal),
+    /// wait this long, send SIGKILL, and await the direct child. Output received
+    /// during shutdown is drained and discarded without extending this budget.
     /// A dropped future does not use it: `Drop` cannot wait, so it kills
     /// immediately.
     #[must_use]
@@ -626,16 +663,30 @@ impl CodexBuilder {
         self
     }
 
+    /// Select the Unix signal used before the hard-kill fallback.
+    ///
+    /// Defaults to [`TerminationSignal::Terminate`]. Use
+    /// [`TerminationSignal::Interrupt`] to let the CLI handle Ctrl-C and clean
+    /// up its tools. This does not guarantee cleanup of detached descendants.
+    /// The existing [`termination_grace`](Self::termination_grace) is the total
+    /// grace budget. Ignored with process groups disabled or on non-Unix.
+    /// Dropping a future remains an immediate hard kill.
+    #[must_use]
+    pub fn termination_signal(mut self, signal: TerminationSignal) -> Self {
+        self.termination_signal = signal;
+        self
+    }
+
     /// Whether each run gets its own process group. On by default.
     ///
-    /// With a group of its own, cancelling a run reaches the subprocesses
-    /// codex spawned for tool use, not just codex itself (#78). That is the
-    /// right contract for a supervisor that cancels programmatically.
+    /// With a group of its own, cancellation reaches the CLI and descendants
+    /// that remain in that group. Tools that create a new group or session need
+    /// cooperative cleanup by the CLI; group signaling cannot reach them.
     ///
     /// Opting out puts the child in the parent's group, so a terminal Ctrl-C
-    /// reaches the whole run directly. Then a wrapper-side kill reaches only
-    /// the direct child, and its subprocesses survive. That is the right
-    /// contract for a terminal-attached host that shells out synchronously and
+    /// reaches processes in the terminal's foreground group. A wrapper-side
+    /// kill reaches only the direct child, skipping the soft signal and grace.
+    /// This suits a terminal-attached host that shells out synchronously and
     /// treats the terminal as the supervisor.
     ///
     /// Matches `claude-wrapper`'s option of the same name. No effect on
@@ -769,6 +820,7 @@ impl CodexBuilder {
             termination_grace: self
                 .termination_grace
                 .unwrap_or_else(|| Duration::from_secs(5)),
+            termination_signal: self.termination_signal,
             process_group: self.process_group.unwrap_or(true),
             output_limit: self.output_limit,
             die_with_parent: self.die_with_parent,
@@ -796,6 +848,7 @@ impl fmt::Debug for CodexBuilder {
             .field("global_args", &self.global_args)
             .field("timeout", &self.timeout)
             .field("termination_grace", &self.termination_grace)
+            .field("termination_signal", &self.termination_signal)
             .field("process_group", &self.process_group)
             .field("die_with_parent", &self.die_with_parent)
             .field("has_spawn_observer", &self.on_spawn.is_some())
@@ -822,6 +875,8 @@ mod tests {
         assert_eq!(codex.env.get("FOO").unwrap(), "bar");
         assert!(!codex.clear_env);
         assert_eq!(codex.timeout, Some(Duration::from_secs(60)));
+        assert_eq!(codex.termination_signal, TerminationSignal::Terminate);
+        assert_eq!(codex.termination_grace, Duration::from_secs(5));
     }
 
     #[test]

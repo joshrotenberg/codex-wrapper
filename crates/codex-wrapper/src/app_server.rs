@@ -1187,8 +1187,12 @@ impl<'a> AppServerBuilder<'a> {
                 });
             }
         };
-        let group =
-            crate::exec::arm_and_notify(codex.process_group, child.id(), codex.on_spawn.as_ref());
+        let group = crate::exec::arm_and_notify(
+            codex.process_group,
+            codex.termination_signal,
+            child.id(),
+            codex.on_spawn.as_ref(),
+        );
         let pid = child.id();
 
         let stdin = child.stdin.take().expect("stdin was configured as piped");
@@ -1652,11 +1656,13 @@ impl AppServer {
 
     /// Stop the server and its process group, and wait until it is gone.
     ///
-    /// Asks the group to stop, waits through the client's termination grace,
+    /// Sends the client's configured termination signal to the group,
+    /// waits through the client's termination grace,
     /// kills what remains, and reaps the child. Requests still waiting fail.
     ///
     /// Shell commands the server started run in groups of their own and are
-    /// not stopped by this; see the [module documentation](self#lifecycle-and-cancellation).
+    /// not reached by group signaling. Cooperative cleanup depends on the
+    /// server; see the [module documentation](self#lifecycle-and-cancellation).
     /// [`shutdown`](Self::shutdown) is the way to stop those.
     ///
     /// # Errors
