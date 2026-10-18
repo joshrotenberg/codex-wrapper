@@ -898,17 +898,20 @@ the full argv, prompt included, as a debugging aid at that level.
 Use the cancellable exec methods when terminal settlement matters. They accept a future that
 resolves when cancellation is requested. The wrapper sends SIGTERM to the Unix process group,
 waits for `termination_grace`, sends SIGKILL, and awaits the direct child before returning
-`Error::Cancelled`. Buffered client timeouts use the same cleanup path.
+`Error::Cancelled`. Buffered and streaming client timeouts use the same cleanup path.
+SIGTERM and a five-second grace remain the defaults. Select SIGINT when the CLI should handle
+cancellation as Ctrl-C:
 
 ```rust
-use codex_wrapper::{Codex, ExecCommand};
+use codex_wrapper::{Codex, ExecCommand, TerminationSignal};
 use std::time::Duration;
 
 let codex = Codex::builder()
-    .termination_grace(Duration::from_secs(5))
+    .termination_signal(TerminationSignal::Interrupt)
+    .termination_grace(Duration::from_secs(2))
     .build()?;
 
-// SIGTERM to the group, then five seconds, then SIGKILL.
+// SIGINT to the group, then two seconds, then SIGKILL.
 // The direct child has been reaped when this future returns.
 let result = ExecCommand::new("long task")
     .execute_json_cancellable(&codex, async { shutdown.await })
@@ -918,7 +921,17 @@ let result = ExecCommand::new("long task")
 `ExecCommand` and `ExecResumeCommand` both provide `execute_cancellable()`,
 `execute_json_lines_cancellable()`, and `execute_json_cancellable()`. Stdin prompts use the same
 path. Retry does not apply because a cancelled attempt is a caller decision, not a transient
-failure.
+failure. Once cancellation or timeout wins, a successful exit during shutdown does not replace
+that error. Cleanup I/O failures are logged without replacing the original reason.
+
+Buffered and streaming exec keep stdout and stderr open and drain shutdown output into bounded
+scratch buffers until cleanup finishes. Those bytes are discarded, and streaming callbacks stop
+receiving events. The drain adds no grace period and does not wait for detached descendants to
+close inherited pipes.
+
+Group signals reach only processes in the wrapper's owned group. Tools that start another process
+group or session need the CLI to stop them cooperatively. SIGINT gives its interrupt handler that
+opportunity; the fallback cannot guarantee cleanup of arbitrary detached descendants.
 
 Dropping an ordinary command future remains an abrupt safety net. `kill_on_drop` stops the direct
 child and a drop guard kills the Unix process group, but `Drop` cannot await reaping. A supervisor
@@ -930,14 +943,14 @@ Groups are on by default, and can be turned off:
 let codex = Codex::builder().process_group(false).build()?;
 ```
 
-Off, the child shares the parent's group, so a terminal Ctrl-C reaches the whole run directly and
-a wrapper-side cancel reaches only the direct child. That is the right contract for a
+Off, the child shares the parent's group, so a terminal Ctrl-C reaches the foreground group and
+a wrapper-side cancel reaches only the direct child, skipping the selected signal and grace. That is the right contract for a
 terminal-attached host that shells out synchronously and treats the terminal as the supervisor;
 the default suits a supervisor that cancels programmatically. `claude-wrapper` has the same
 option under the same name.
 
 Process groups are Unix-only. Elsewhere explicit cancellation kills and awaits the direct child,
-but the wrapper cannot make the same descendant-process guarantee. Reaping also needs the Tokio
+and `termination_signal` has no effect. Reaping also needs the Tokio
 runtime to remain alive; the abrupt dropped-future fallback cannot settle during runtime teardown.
 
 ## Steering a Running Turn
