@@ -758,8 +758,8 @@ fn mcp_config_overrides_contract() {
 // ---------------------------------------------------------------------------
 // --approve-for-me (0.147.0)
 //
-// This flag arrived in 0.147.0, which is the tested range's upper bound but
-// not its lower one. It cannot go in the maximal builders above, because the
+// This flag arrived in 0.147.0, inside the tested range but above its lower
+// bound. It cannot go in the maximal builders above, because the
 // contract job also runs against 0.145.0 where it does not exist.
 // ---------------------------------------------------------------------------
 
