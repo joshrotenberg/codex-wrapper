@@ -44,10 +44,7 @@ pub async fn stream_exec<F>(
 where
     F: FnMut(JsonLineEvent),
 {
-    let mut args = cmd.args();
-    if !args.contains(&"--json".to_string()) {
-        args.push("--json".into());
-    }
+    let args = cmd.clone().json().args();
     run_streaming(
         codex,
         args,
@@ -73,10 +70,7 @@ where
     C: std::future::Future<Output = ()> + Send,
     F: FnMut(JsonLineEvent),
 {
-    let mut args = cmd.args();
-    if !args.contains(&"--json".to_string()) {
-        args.push("--json".into());
-    }
+    let args = cmd.clone().json().args();
     run_streaming(codex, args, cmd.stdin_prompt(), handler, cancel).await
 }
 
@@ -90,10 +84,7 @@ pub async fn stream_exec_resume<F>(
 where
     F: FnMut(JsonLineEvent),
 {
-    let mut args = cmd.args();
-    if !args.contains(&"--json".to_string()) {
-        args.push("--json".into());
-    }
+    let args = cmd.clone().json().args();
     run_streaming(
         codex,
         args,
@@ -118,10 +109,7 @@ where
     C: std::future::Future<Output = ()> + Send,
     F: FnMut(JsonLineEvent),
 {
-    let mut args = cmd.args();
-    if !args.contains(&"--json".to_string()) {
-        args.push("--json".into());
-    }
+    let args = cmd.clone().json().args();
     run_streaming(codex, args, cmd.stdin_prompt(), handler, cancel).await
 }
 
