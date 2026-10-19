@@ -877,7 +877,7 @@ want metrics bridge it themselves.
 | `codex.stream` | a streaming run, closing when the stream ends |
 | `codex.retry` | a retried run, parent to each attempt's span |
 
-Fields on open: `subcommand`, `binary`, `working_dir`. On close: `outcome`, `duration_ms`, and
+Fields on open: a fixed `subcommand` label, `arg_count`, `working_dir_set`. On close: `outcome`, `duration_ms`, and
 `exit_code` where the process produced one.
 
 `outcome` distinguishes four endings, including the two that are easy to miss:
@@ -890,9 +890,11 @@ Fields on open: `subcommand`, `binary`, `working_dir`. On close: `outcome`, `dur
 | `cancelled` | explicit cancellation settled, or the future was dropped and the run abandoned |
 | `cleanup_failed` | stopping or reaping failed; direct-child settlement is unconfirmed |
 
-**The prompt is never recorded.** It travels in argv, so recording the arguments would put it in
-the host's logs; the same goes for the environment. Note that the existing `debug!` line does log
-the full argv, prompt included, as a debugging aid at that level.
+Spans and events at every level omit argv values, binary/working-directory paths,
+prompts, configuration, environment values, captured output and rendered errors.
+Unknown raw-command labels become `other`. Retrying and capture-limit events keep
+counts, limits and exit codes. Explicit command previews, returned output/error
+values and native CLI logs remain caller-controlled and may contain sensitive data.
 
 ## Cancellation
 
