@@ -76,6 +76,9 @@ impl SpanOutcome {
         match result {
             Ok(output) => self.settle("ok", Some(output.exit_code)),
             Err(Error::Timeout { .. }) => self.settle("timeout", None),
+            // Its own outcome so the span never reads as a settled timeout or
+            // cancellation when the child may not have been reaped.
+            Err(Error::CleanupFailed { .. }) => self.settle("cleanup_failed", None),
             // Covers the classified failures too, which are no longer
             // CommandFailed but did still come from a process exit.
             Err(e) => match e.exit_code() {
@@ -459,8 +462,9 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
 /// CLI's cooperation; [`TerminationSignal::Interrupt`](crate::TerminationSignal::Interrupt)
 /// lets its interrupt handler run before the hard fallback. Output during
 /// shutdown is drained and discarded, and the cancellation reason stays latched
-/// even if the CLI exits successfully. A cleanup I/O failure is logged without
-/// replacing the original stop reason.
+/// even if the CLI exits successfully. If stopping or reaping the child fails,
+/// the stop reason is returned inside [`Error::CleanupFailed`] rather than as a
+/// bare [`Error::Cancelled`] or [`Error::Timeout`].
 ///
 /// Dropping the future instead kills the owned group abruptly: `Drop` cannot
 /// wait out a grace period or allow cooperative cleanup of detached tools.
@@ -935,7 +939,7 @@ async fn run_internal_inner(
             // A stdin or pipe failure can happen while the child continues
             // running. Treat it as a stop request and settle ownership before
             // exposing the I/O error.
-            let _ = terminate_and_reap_draining(
+            let cleanup = terminate_and_reap_draining(
                 &mut child,
                 &mut group,
                 grace,
@@ -944,7 +948,7 @@ async fn run_internal_inner(
                 &mut child_stderr,
             )
             .await;
-            return Err(error);
+            return Err(Error::after_cleanup(error, cleanup));
         }
         Err(reason) => {
             // The run future is gone before this branch executes, returning
@@ -952,7 +956,7 @@ async fn run_internal_inner(
             // `GroupKillGuard::terminate` reaches same-group descendants. The
             // direct-child kill below is the portable fallback and makes the
             // wait authoritative on every platform.
-            let _ = terminate_and_reap_draining(
+            let cleanup = terminate_and_reap_draining(
                 &mut child,
                 &mut group,
                 grace,
@@ -961,7 +965,7 @@ async fn run_internal_inner(
                 &mut child_stderr,
             )
             .await;
-            return Err(reason.into_error());
+            return Err(Error::after_cleanup(reason.into_error(), cleanup));
         }
     };
 
@@ -1019,10 +1023,58 @@ where
         result = terminate_and_reap(child, group, grace, working_dir) => result,
         () = drain => unreachable!("the drain waits until shutdown finishes"),
     };
-    if result.is_err() {
-        tracing::warn!("codex cleanup failed while preserving the original stop reason");
+    #[cfg(test)]
+    let result = result.and_then(|()| injected_cleanup_failure(working_dir));
+    if let Err(error) = &result {
+        tracing::warn!(%error, "codex cleanup failed; the child may not have been reaped");
     }
     result
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECT_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only fault injection for [`terminate_and_reap_draining`].
+///
+/// While armed, a cleanup on this thread that actually succeeded reports a
+/// synthetic I/O error instead. The real termination and wait still run first,
+/// so the fixture child is reaped either way. This exercises how callers
+/// report a failed cleanup; it does not show that any syscall can fail.
+/// Thread-local because `#[tokio::test]` runs each test on its own
+/// current-thread runtime, which keeps concurrent tests isolated. Every caller
+/// is a unix-only test, hence the `dead_code` allowance elsewhere.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct CleanupFailureInjection(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+impl CleanupFailureInjection {
+    pub(crate) fn arm() -> Self {
+        INJECT_CLEANUP_FAILURE.with(|armed| armed.set(true));
+        // The thread-local guard must stay on its originating test thread.
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for CleanupFailureInjection {
+    fn drop(&mut self) {
+        INJECT_CLEANUP_FAILURE.with(|armed| armed.set(false));
+    }
+}
+
+#[cfg(test)]
+fn injected_cleanup_failure(working_dir: Option<&std::path::Path>) -> Result<()> {
+    if INJECT_CLEANUP_FAILURE.with(std::cell::Cell::get) {
+        return Err(wait_error(
+            std::io::Error::other("injected cleanup failure"),
+            working_dir,
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) async fn terminate_and_reap(
@@ -2114,6 +2166,119 @@ mod tests {
         assert!(
             !is_running_for_test(child),
             "the subprocess ({child}) survived the stdin failure"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Failed cleanup is not reported as a settled stop
+    //
+    // These inject the cleanup result after the real termination and wait
+    // have run, so they cover how a failure is reported, not that one occurs.
+    // The real-child tests above remain the evidence for normal reaping.
+    // -----------------------------------------------------------------
+
+    /// The stop reason inside a [`Error::CleanupFailed`] whose cleanup half
+    /// is the injected failure, not some other error.
+    #[cfg(unix)]
+    fn injected_cleanup_reason(result: Result<CommandOutput>) -> Error {
+        match result {
+            Err(Error::CleanupFailed { reason, cleanup }) => {
+                assert!(
+                    cleanup.to_string().contains("injected cleanup failure"),
+                    "{cleanup:?}"
+                );
+                *reason
+            }
+            other => panic!("expected CleanupFailed, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_cleanup_after_cancellation_is_not_a_bare_cancel() {
+        let pid_file = crate::test_support::PidFile::new("cleanup-failed-cancel");
+        let codex = crate::test_support::blocking_codex(&pid_file)
+            .termination_grace(Duration::from_millis(10))
+            .build()
+            .unwrap();
+        let cancel_soon = || tokio::time::sleep(Duration::from_millis(100));
+
+        let injection = CleanupFailureInjection::arm();
+        let result = run_codex_cancellable(&codex, vec!["exec".into()], cancel_soon()).await;
+        let reason = injected_cleanup_reason(result);
+        assert!(matches!(reason, Error::Cancelled { .. }), "{reason:?}");
+
+        // The same run with cleanup succeeding keeps the bare typed reason.
+        drop(injection);
+        let result = run_codex_cancellable(&codex, vec!["exec".into()], cancel_soon()).await;
+        assert!(matches!(result, Err(Error::Cancelled { .. })), "{result:?}");
+    }
+
+    /// The timeout stays readable as the reason, the span does not record a
+    /// settled timeout, and a policy that retries timeouts does not start a
+    /// second process while the first is not known to be gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_cleanup_after_timeout_is_recorded_and_not_retried() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let recorder = recorder::Recorder::install();
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&spawns);
+        let pid_file = crate::test_support::PidFile::new("cleanup-failed-timeout");
+        let codex = crate::test_support::blocking_codex(&pid_file)
+            .timeout(Duration::from_millis(200))
+            .termination_grace(Duration::from_millis(10))
+            .on_spawn(Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }))
+            .build()
+            .unwrap();
+        let policy = crate::retry::RetryPolicy::new()
+            .max_attempts(3)
+            .initial_backoff(Duration::from_millis(1))
+            .retry_on_timeout(true);
+
+        let _injection = CleanupFailureInjection::arm();
+        let result = run_codex_with_retry(&codex, vec!["exec".into()], Some(&policy)).await;
+        let reason = injected_cleanup_reason(result);
+        assert!(matches!(reason, Error::Timeout { .. }), "{reason:?}");
+        assert_eq!(spawns.load(Ordering::SeqCst), 1, "a timeout was retried");
+        assert_eq!(
+            recorder.value("outcome").as_deref(),
+            Some("cleanup_failed"),
+            "recorded: {}",
+            recorder.dump()
+        );
+    }
+
+    /// The run's own error branch, as opposed to a stop signal, goes through
+    /// the same construction.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_cleanup_after_an_output_limit_keeps_the_limit_as_reason() {
+        let codex = flooding_codex("stdout", Some(64 * 1024));
+
+        let injection = CleanupFailureInjection::arm();
+        let result = run_codex(&codex, vec!["exec".into()]).await;
+        let reason = injected_cleanup_reason(result);
+        assert!(
+            matches!(
+                reason,
+                Error::OutputLimitExceeded {
+                    stream: OutputStream::Stdout,
+                    limit_bytes: 65_536,
+                }
+            ),
+            "{reason:?}"
+        );
+
+        drop(injection);
+        let result = run_codex(&codex, vec!["exec".into()]).await;
+        assert!(
+            matches!(result, Err(Error::OutputLimitExceeded { .. })),
+            "{result:?}"
         );
     }
 

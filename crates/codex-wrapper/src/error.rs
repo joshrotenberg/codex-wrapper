@@ -244,6 +244,31 @@ pub enum Error {
         /// What went wrong.
         message: String,
     },
+
+    /// A run was being stopped, and stopping or reaping its process failed.
+    ///
+    /// Cancellation, a timeout, an exceeded output limit, a parse error, or an
+    /// I/O error on the child's pipes each end a run by terminating the owned
+    /// process group and waiting on the direct child. When that cleanup
+    /// succeeds the original error is returned unchanged. When it fails, this
+    /// is returned instead, so a caller is never told [`Error::Cancelled`] or
+    /// [`Error::Timeout`] about a child that may not have been reaped and could
+    /// still be running.
+    ///
+    /// Match on `reason` for why the run was stopped. `cleanup` is the
+    /// [`source`](std::error::Error::source) of this error, so a reporter
+    /// walking the chain reaches the underlying I/O failure.
+    ///
+    /// Not retried by [`RetryPolicy`](crate::RetryPolicy), even when `reason`
+    /// is a timeout: the previous attempt's process is not known to be gone.
+    #[error("{reason}; cleanup of the codex process then failed, so it may not have been reaped")]
+    CleanupFailed {
+        /// The error the run would have returned had cleanup succeeded.
+        reason: Box<Error>,
+        /// The failure from stopping or waiting on the child.
+        #[source]
+        cleanup: Box<Error>,
+    },
 }
 
 impl From<std::io::Error> for Error {
@@ -309,6 +334,21 @@ const SIGNATURES: &[(&str, FailureKind)] = &[
 ];
 
 impl Error {
+    /// The error to return for a run stopped with `reason`, given how cleanup
+    /// of its process went.
+    ///
+    /// Every path that stops a child before returning goes through here, so
+    /// a failed cleanup cannot be reported as the bare stop reason.
+    pub(crate) fn after_cleanup(reason: Error, cleanup: Result<()>) -> Self {
+        match cleanup {
+            Ok(()) => reason,
+            Err(cleanup) => Error::CleanupFailed {
+                reason: Box::new(reason),
+                cleanup: Box::new(cleanup),
+            },
+        }
+    }
+
     /// Build an error from a failed command, classifying it by stderr.
     ///
     /// Every non-zero exit in this crate goes through here, so a caller can
@@ -606,6 +646,46 @@ mod tests {
             err.to_string(),
             "codex authentication failed: ERROR: Reconnecting... 5/5"
         );
+    }
+
+    #[test]
+    fn successful_cleanup_returns_the_stop_reason_unchanged() {
+        let err = Error::after_cleanup(Error::Timeout { timeout_seconds: 7 }, Ok(()));
+        assert!(
+            matches!(err, Error::Timeout { timeout_seconds: 7 }),
+            "{err:?}"
+        );
+    }
+
+    /// The reason stays matchable and readable, and the cleanup failure is
+    /// the source, so walking the chain reaches the I/O error beneath it.
+    #[test]
+    fn failed_cleanup_carries_the_reason_and_chains_to_the_cleanup_error() {
+        let cleanup = Error::from(std::io::Error::other("wait failed"));
+        let err = Error::after_cleanup(Error::Cancelled { grace_seconds: 2 }, Err(cleanup));
+
+        assert_eq!(
+            err.to_string(),
+            "codex run cancelled (after a 2s grace period); cleanup of the codex process \
+             then failed, so it may not have been reaped"
+        );
+        let Error::CleanupFailed { reason, .. } = &err else {
+            panic!("expected CleanupFailed, got {err:?}");
+        };
+        assert!(
+            matches!(**reason, Error::Cancelled { grace_seconds: 2 }),
+            "{reason:?}"
+        );
+
+        let source = std::error::Error::source(&err).expect("cleanup is the source");
+        assert_eq!(source.to_string(), "io error: wait failed");
+        let io = source.source().expect("the I/O error is reachable");
+        assert_eq!(io.to_string(), "wait failed");
+
+        // The child did not exit on its own terms, so no exit code is
+        // reported even if the wrapped reason were to carry one.
+        assert_eq!(err.failure_kind(), None);
+        assert_eq!(err.exit_code(), None);
     }
 
     #[test]

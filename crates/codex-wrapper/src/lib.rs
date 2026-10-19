@@ -161,6 +161,9 @@
 //! of SIGTERM so the CLI can handle an interrupt. Descendants in separate
 //! process groups require the CLI's cooperation; the hard-kill fallback cannot
 //! reach them.
+//! A failed stop or wait returns [`Error::CleanupFailed`], retaining both the
+//! original operation error and cleanup failure. This means direct-child
+//! settlement is unconfirmed; do not retry or resume as if cleanup succeeded.
 //!
 //! Dropping an ordinary command future is an abrupt fallback. It kills the
 //! direct child and, on Unix, the owned process group, but `Drop` cannot await

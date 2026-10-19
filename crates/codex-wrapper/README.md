@@ -888,6 +888,7 @@ Fields on open: `subcommand`, `binary`, `working_dir`. On close: `outcome`, `dur
 | `failed` | exited non-zero |
 | `timeout` | hit the client's timeout |
 | `cancelled` | explicit cancellation settled, or the future was dropped and the run abandoned |
+| `cleanup_failed` | stopping or reaping failed; direct-child settlement is unconfirmed |
 
 **The prompt is never recorded.** It travels in argv, so recording the arguments would put it in
 the host's logs; the same goes for the environment. Note that the existing `debug!` line does log
@@ -912,7 +913,7 @@ let codex = Codex::builder()
     .build()?;
 
 // SIGINT to the group, then two seconds, then SIGKILL.
-// The direct child has been reaped when this future returns.
+// A bare Cancelled confirms reaping; CleanupFailed retains an unconfirmed stop.
 let result = ExecCommand::new("long task")
     .execute_json_cancellable(&codex, async { shutdown.await })
     .await;
@@ -922,7 +923,9 @@ let result = ExecCommand::new("long task")
 `execute_json_lines_cancellable()`, and `execute_json_cancellable()`. Stdin prompts use the same
 path. Retry does not apply because a cancelled attempt is a caller decision, not a transient
 failure. Once cancellation or timeout wins, a successful exit during shutdown does not replace
-that error. Cleanup I/O failures are logged without replacing the original reason.
+that error. If stopping or reaping fails, `Error::CleanupFailed` carries both the original
+`reason` and the `cleanup` failure. Treat settlement as unconfirmed in that case. A timeout
+wrapped in this error is not retried, even when timeout retry is enabled.
 
 Buffered and streaming exec keep stdout and stderr open and drain shutdown output into bounded
 scratch buffers until cleanup finishes. Those bytes are discarded, and streaming callbacks stop
