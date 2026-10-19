@@ -27,7 +27,7 @@ pub const TESTED_CLI_VERSION_MIN: CliVersion = CliVersion {
 /// Highest `codex-cli` version this wrapper is tested against.
 pub const TESTED_CLI_VERSION_MAX: CliVersion = CliVersion {
     major: 0,
-    minor: 147,
+    minor: 163,
     patch: 0,
 };
 
