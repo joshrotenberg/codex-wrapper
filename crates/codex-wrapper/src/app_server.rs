@@ -1155,8 +1155,9 @@ impl<'a> AppServerBuilder<'a> {
     /// [`Error::Config`]. Otherwise the handshake's own error.
     pub async fn start(self) -> Result<AppServer> {
         let codex = self.codex;
-        let args = crate::exec::assemble_args(codex, self.args());
-        let span = crate::exec::command_span("codex.app_server", codex, &args);
+        let operation_args = self.args();
+        let span = crate::exec::command_span("codex.app_server", codex, &operation_args);
+        let args = crate::exec::assemble_args(codex, operation_args);
         let command_text = format!("{} {}", codex.binary.display(), args.join(" "));
         debug!(arg_count = args.len(), "starting codex app-server");
 

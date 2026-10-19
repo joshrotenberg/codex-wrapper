@@ -896,6 +896,16 @@ Unknown raw-command labels become `other`. Retrying and capture-limit events kee
 counts, limits and exit codes. Explicit command previews, returned output/error
 values and native CLI logs remain caller-controlled and may contain sensitive data.
 
+### Execution diagnostics contract
+
+Normal wrapper tracing is intended to report operation, argument counts, byte
+counts, timing and outcome metadata. Prompts, argument values, native identifiers,
+paths, configuration values, process output and rendered errors belong in
+caller-controlled command previews, result/error values or explicit native logs.
+The wrapper does not install a subscriber. Hosts choose their subscriber and
+correlation spans; enabling wrapper tracing must not opt them into content logs.
+
+
 ## Cancellation
 
 Use the cancellable exec methods when terminal settlement matters. They accept a future that
@@ -1118,12 +1128,3 @@ audits, changelog automation, and `release-plz`-driven crates.io releases.
 ## License
 
 MIT OR Apache-2.0
-
-### Execution diagnostics contract
-
-Normal wrapper tracing is intended to report operation, argument counts, byte
-counts, timing and outcome metadata. Prompts, argument values, native identifiers,
-paths, configuration values, process output and rendered errors belong in
-caller-controlled command previews, result/error values or explicit native logs.
-The wrapper does not install a subscriber. Hosts choose their subscriber and
-correlation spans; enabling wrapper tracing must not opt them into content logs.

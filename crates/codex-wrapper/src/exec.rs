@@ -35,6 +35,10 @@ fn trace_subcommand(args: &[String]) -> &'static str {
     match args.first().map(String::as_str) {
         None => "(none)",
         Some("exec") => "exec",
+        Some("archive") => "archive",
+        Some("delete") => "delete",
+        Some("unarchive") => "unarchive",
+        Some("--version" | "-V") => "version",
         Some("review") => "review",
         Some("login") => "login",
         Some("logout") => "logout",
@@ -1572,15 +1576,9 @@ mod tests {
             .await
             .unwrap();
 
-        let recorded = format!("{:?}", recorder.value("subcommand"));
-        assert!(!recorded.contains("secret"));
-        for field in ["binary", "working_dir", "outcome", "exit_code"] {
-            let value = recorder.value(field).unwrap_or_default();
-            assert!(
-                !value.contains("secret"),
-                "{field} leaked the prompt: {value}"
-            );
-        }
+        assert!(!recorder.dump().contains("secret"), "{}", recorder.dump());
+        assert!(recorder.value("binary").is_none());
+        assert!(recorder.value("working_dir").is_none());
     }
 
     /// A dropped future records an outcome rather than leaving the span open,
