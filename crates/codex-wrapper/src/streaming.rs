@@ -135,7 +135,7 @@ where
     let command_args = crate::exec::assemble_args(codex, args);
     let _span_guard = span.clone().entered();
 
-    debug!(binary = %codex.binary.display(), args = ?command_args, "streaming codex command");
+    debug!(arg_count = command_args.len(), "streaming codex command");
 
     // Settles on every exit below, and on drop for the one that has no exit:
     // a cancelled stream, which is the outcome most easily missed.

@@ -1155,10 +1155,11 @@ impl<'a> AppServerBuilder<'a> {
     /// [`Error::Config`]. Otherwise the handshake's own error.
     pub async fn start(self) -> Result<AppServer> {
         let codex = self.codex;
-        let args = crate::exec::assemble_args(codex, self.args());
-        let span = crate::exec::command_span("codex.app_server", codex, &args);
+        let operation_args = self.args();
+        let span = crate::exec::command_span("codex.app_server", codex, &operation_args);
+        let args = crate::exec::assemble_args(codex, operation_args);
         let command_text = format!("{} {}", codex.binary.display(), args.join(" "));
-        debug!(binary = %codex.binary.display(), args = ?args, "starting codex app-server");
+        debug!(arg_count = args.len(), "starting codex app-server");
 
         let mut outcome = SpanOutcome::start(span.clone());
         let mut command = Command::new(&codex.binary);
@@ -1366,7 +1367,10 @@ fn route(line: &str, shared: &Shared) -> std::result::Result<(), Closed> {
     match (method, id) {
         (Some(method), Some(id)) => {
             let Ok(id) = serde_json::from_value::<RequestId>(id.clone()) else {
-                warn!(method, "ignoring a server request with an unusable id");
+                warn!(
+                    method_bytes = method.len(),
+                    "ignoring a server request with an unusable id"
+                );
                 return Ok(());
             };
             let request = ServerRequest {

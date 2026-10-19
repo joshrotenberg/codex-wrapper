@@ -16,22 +16,46 @@ use crate::error::{Error, OutputStream, Result};
 /// and no environment. Both routinely hold content a host would not want in
 /// its logs, and a span is recorded whenever any subscriber is installed.
 pub(crate) fn command_span(name: &'static str, codex: &Codex, args: &[String]) -> Span {
-    let working_dir = codex
-        .working_dir
-        .as_ref()
-        .map_or_else(|| "(inherited)".to_string(), |p| p.display().to_string());
-
     info_span!(
         parent: Span::current(),
         "codex",
         otel.name = name,
-        subcommand = args.first().map_or("(none)", String::as_str),
-        binary = %codex.binary.display(),
-        working_dir = %working_dir,
+        subcommand = trace_subcommand(args),
+        arg_count = args.len(),
+        working_dir_set = codex.working_dir.is_some(),
         outcome = field::Empty,
         exit_code = field::Empty,
         duration_ms = field::Empty,
     )
+}
+
+/// RawCommand permits arbitrary first tokens; only fixed operation labels may
+/// enter diagnostics. Counts retain observability for future/unknown commands.
+fn trace_subcommand(args: &[String]) -> &'static str {
+    match args.first().map(String::as_str) {
+        None => "(none)",
+        Some("exec") => "exec",
+        Some("archive") => "archive",
+        Some("delete") => "delete",
+        Some("unarchive") => "unarchive",
+        Some("--version" | "-V") => "version",
+        Some("review") => "review",
+        Some("login") => "login",
+        Some("logout") => "logout",
+        Some("mcp") => "mcp",
+        Some("mcp-server") => "mcp-server",
+        Some("app-server") => "app-server",
+        Some("completion") => "completion",
+        Some("sandbox") => "sandbox",
+        Some("apply") => "apply",
+        Some("resume") => "resume",
+        Some("fork") => "fork",
+        Some("features") => "features",
+        Some("plugin") => "plugin",
+        Some("doctor") => "doctor",
+        Some("update") => "update",
+        Some(_) => "other",
+    }
 }
 
 /// Records how a run ended on its span, including when it does not end at all.
@@ -322,7 +346,7 @@ pub async fn run_codex_with_retry(
             // nest under one run rather than arriving as unrelated lines.
             let span = info_span!(
                 "codex.retry",
-                subcommand = args.first().map_or("(none)", String::as_str),
+                subcommand = trace_subcommand(&args),
                 max_attempts = policy.max_attempts,
             );
             crate::retry::with_retry(policy, || run_codex_once(codex, args.clone()))
@@ -401,7 +425,7 @@ async fn run_codex_once(codex: &Codex, args: Vec<String>) -> Result<CommandOutpu
     let command_args = assemble_args(codex, args);
 
     async move {
-        debug!(binary = %codex.binary.display(), args = ?command_args, "executing codex command");
+        debug!(arg_count = command_args.len(), "executing codex command");
 
         let mut outcome = SpanOutcome::start(outcome_span);
         let result = match codex.timeout {
@@ -486,7 +510,10 @@ where
     let command_args = assemble_args(codex, args);
 
     async move {
-        debug!(binary = %codex.binary.display(), args = ?command_args, "executing cancellable codex command");
+        debug!(
+            arg_count = command_args.len(),
+            "executing cancellable codex command"
+        );
 
         let mut outcome = SpanOutcome::start(outcome_span);
         let stop = cancellation_or_timeout(cancel, codex.timeout, codex.termination_grace);
@@ -577,8 +604,7 @@ pub async fn run_codex_with_stdin_prompt(
 
     async move {
         debug!(
-            binary = %codex.binary.display(),
-            args = ?command_args,
+            arg_count = command_args.len(),
             prompt_bytes = prompt.len(),
             "executing codex command with a stdin prompt"
         );
@@ -629,8 +655,7 @@ where
 
     async move {
         debug!(
-            binary = %codex.binary.display(),
-            args = ?command_args,
+            arg_count = command_args.len(),
             prompt_bytes = prompt.len(),
             "executing cancellable codex command with a stdin prompt"
         );
@@ -782,11 +807,10 @@ where
             return Ok(bytes);
         }
         if bytes.len() + read > limit {
-            bytes.truncate(BREACH_LOG_BYTES.min(bytes.len()));
             tracing::warn!(
                 %stream,
                 limit_bytes = limit,
-                head = %String::from_utf8_lossy(&bytes),
+                captured_bytes = bytes.len(),
                 "codex output exceeded its capture limit; stopping the run"
             );
             return Err(Error::OutputLimitExceeded {
@@ -801,11 +825,6 @@ where
 /// Read size for a bounded capture. Large enough not to syscall per line,
 /// small enough that the overshoot before noticing stays trivial.
 const CAPTURE_CHUNK: usize = 8 * 1024;
-
-/// How much of the prefix to log when a stream breaches its ceiling. The
-/// whole point is not to hold the output, but the first few KiB usually name
-/// the runaway.
-const BREACH_LOG_BYTES: usize = 2 * 1024;
 
 async fn run_internal_inner(
     spec: SpawnSpec<'_>,
@@ -1025,8 +1044,8 @@ where
     };
     #[cfg(test)]
     let result = result.and_then(|()| injected_cleanup_failure(working_dir));
-    if let Err(error) = &result {
-        tracing::warn!(%error, "codex cleanup failed; the child may not have been reaped");
+    if result.is_err() {
+        tracing::warn!("codex cleanup failed; the child may not have been reaped");
     }
     result
 }
@@ -1465,7 +1484,9 @@ mod tests {
                 Self::collect(|fields| values.record(&mut Collect(fields)));
             }
             fn record_follows_from(&self, _: &Id, _: &Id) {}
-            fn event(&self, _: &Event<'_>) {}
+            fn event(&self, event: &Event<'_>) {
+                Self::collect(|fields| event.record(&mut Collect(fields)));
+            }
             fn enter(&self, _: &Id) {}
             fn exit(&self, _: &Id) {}
         }
@@ -1555,15 +1576,9 @@ mod tests {
             .await
             .unwrap();
 
-        let recorded = format!("{:?}", recorder.value("subcommand"));
-        assert!(!recorded.contains("secret"));
-        for field in ["binary", "working_dir", "outcome", "exit_code"] {
-            let value = recorder.value(field).unwrap_or_default();
-            assert!(
-                !value.contains("secret"),
-                "{field} leaked the prompt: {value}"
-            );
-        }
+        assert!(!recorder.dump().contains("secret"), "{}", recorder.dump());
+        assert!(recorder.value("binary").is_none());
+        assert!(recorder.value("working_dir").is_none());
     }
 
     /// A dropped future records an outcome rather than leaving the span open,
@@ -2469,5 +2484,236 @@ mod tests {
         // Do not leave it behind.
         signal_group(child, libc::SIGKILL);
         unsafe { libc::kill(i32::try_from(child).unwrap_or(0), libc::SIGKILL) };
+    }
+    #[cfg(unix)]
+    struct PrivateTraceDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for PrivateTraceDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn private_trace_client(body: &str) -> (PrivateTraceDir, Codex) {
+        use std::os::unix::fs::symlink;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "TRACE_PRIVATE_path-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let dir = PrivateTraceDir(std::env::temp_dir().join(name));
+        std::fs::create_dir(&dir.0).unwrap();
+        let binary = dir.0.join("TRACE_PRIVATE_binary");
+        symlink("/bin/bash", &binary).unwrap();
+        let script = dir.0.join("TRACE_PRIVATE_script");
+        std::fs::write(&script, body).unwrap();
+        let codex = Codex::builder()
+            .binary(binary)
+            .arg(script.to_string_lossy())
+            .arg("TRACE_PRIVATE_config")
+            .working_dir(&dir.0)
+            .termination_grace(Duration::ZERO)
+            .build()
+            .unwrap();
+        (dir, codex)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invocation_traces_exclude_private_content_at_every_level() {
+        let recorder = recorder::Recorder::install();
+        let body = concat!(
+            "cat >/dev/null\n",
+            "printf 'TRACE_PRIVATE_output'\n",
+            "printf 'TRACE_PRIVATE_stderr' >&2\n"
+        );
+        let (_dir, codex) = private_trace_client(body);
+        let args = vec![
+            "exec".into(),
+            "TRACE_PRIVATE_prompt".into(),
+            "--resume".into(),
+            "TRACE_PRIVATE_resume".into(),
+        ];
+        assert!(
+            run_codex(&codex, args.clone())
+                .await
+                .unwrap()
+                .stdout
+                .contains("TRACE_PRIVATE")
+        );
+        run_codex_cancellable(&codex, args.clone(), std::future::pending())
+            .await
+            .unwrap();
+        run_codex_with_stdin_prompt(&codex, args.clone(), "TRACE_PRIVATE_stdin")
+            .await
+            .unwrap();
+        run_codex_with_stdin_prompt_cancellable(
+            &codex,
+            args,
+            "TRACE_PRIVATE_stdin",
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        run_codex(&codex, vec!["TRACE_PRIVATE_unknown_command".into()])
+            .await
+            .unwrap();
+        assert!(
+            recorder.value("outcome").is_some(),
+            "subscriber must observe outcomes"
+        );
+        assert!(
+            !recorder.dump().contains("TRACE_PRIVATE"),
+            "{}",
+            recorder.dump()
+        );
+        assert!(
+            recorder.value("arg_count").is_some(),
+            "useful argument count remains available"
+        );
+    }
+
+    #[cfg(all(unix, feature = "json"))]
+    #[tokio::test]
+    async fn stream_and_resume_traces_exclude_private_content() {
+        use crate::{CodexCommand, ExecCommand, ExecResumeCommand};
+        let recorder = recorder::Recorder::install();
+        // Existing verified wire shapes, with synthetic content and identifiers.
+        let body = format!(
+            "cat >/dev/null\n{}",
+            include_str!("../tests/fake-codex.sh")
+                .replace("thread_test", "TRACE_PRIVATE_thread")
+                .replace("hello", "TRACE_PRIVATE_output")
+        );
+        let (_dir, codex) = private_trace_client(&body);
+        let cmd = ExecCommand::new("TRACE_PRIVATE_prompt");
+        let mut observed = 0;
+        crate::streaming::stream_exec(&codex, &cmd, |_| observed += 1)
+            .await
+            .unwrap();
+        crate::streaming::stream_exec_cancellable(&codex, &cmd, std::future::pending(), |_| {})
+            .await
+            .unwrap();
+        let stdin_cmd = ExecCommand::new("TRACE_PRIVATE_stdin").prompt_via_stdin();
+        crate::streaming::stream_exec(&codex, &stdin_cmd, |_| {})
+            .await
+            .unwrap();
+        let resume = ExecResumeCommand::new()
+            .session_id("TRACE_PRIVATE_resume")
+            .prompt("TRACE_PRIVATE_prompt");
+        crate::streaming::stream_exec_resume(&codex, &resume, |_| {})
+            .await
+            .unwrap();
+        crate::streaming::stream_exec_resume_cancellable(
+            &codex,
+            &resume,
+            std::future::pending(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(observed > 0, "protocol delivery remains intact");
+        assert!(
+            cmd.to_command_string(&codex).contains("TRACE_PRIVATE"),
+            "explicit preview stays caller-controlled"
+        );
+        assert!(
+            !recorder.dump().contains("TRACE_PRIVATE"),
+            "{}",
+            recorder.dump()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_and_retry_traces_exclude_rendered_errors_and_output() {
+        let recorder = recorder::Recorder::install();
+        let (_dir, mut codex) = private_trace_client(
+            "printf 'TRACE_PRIVATE_output'; printf 'TRACE_PRIVATE_stderr' >&2; exit 7",
+        );
+        codex.retry_policy = Some(
+            crate::RetryPolicy::new()
+                .max_attempts(2)
+                .initial_backoff(Duration::ZERO)
+                .retry_on_exit_codes([7]),
+        );
+        let error = run_codex(&codex, vec!["exec".into(), "TRACE_PRIVATE_prompt".into()])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("TRACE_PRIVATE"),
+            "explicit error retains diagnostics"
+        );
+        codex.retry_policy = None;
+        codex.output_limit = Some(8);
+        assert!(matches!(
+            run_codex(&codex, vec!["exec".into()]).await,
+            Err(Error::OutputLimitExceeded { .. })
+        ));
+        assert!(
+            !recorder.dump().contains("TRACE_PRIVATE"),
+            "{}",
+            recorder.dump()
+        );
+        assert!(
+            recorder.value("attempt").is_some(),
+            "retry event must be captured"
+        );
+    }
+
+    #[cfg(all(unix, feature = "app-server"))]
+    #[tokio::test]
+    async fn app_server_startup_trace_excludes_private_arguments() {
+        let recorder = recorder::Recorder::install();
+        let codex = Codex::builder()
+            .binary("/bin/false")
+            .arg("TRACE_PRIVATE_configuration")
+            .build()
+            .unwrap();
+        assert!(
+            crate::app_server::AppServer::builder(&codex)
+                .start()
+                .await
+                .is_err()
+        );
+        assert!(
+            !recorder.dump().contains("TRACE_PRIVATE"),
+            "{}",
+            recorder.dump()
+        );
+        assert!(
+            recorder.value("arg_count").is_some(),
+            "startup event must be captured"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_limit_trace_omits_captured_prefix() {
+        let recorder = recorder::Recorder::install();
+        // Separate writes let the reader retain a prefix before the breach.
+        let (_dir, mut codex) = private_trace_client(
+            "printf 'TRACE_PRIVATE_output'; sleep 0.05; head -c 4096 /dev/zero",
+        );
+        codex.output_limit = Some(64);
+        assert!(matches!(
+            run_codex(&codex, vec!["exec".into()]).await,
+            Err(Error::OutputLimitExceeded { .. })
+        ));
+        assert!(
+            recorder.value("captured_bytes").is_some(),
+            "capture warning was observed"
+        );
+        assert!(
+            !recorder.dump().contains("TRACE_PRIVATE"),
+            "{}",
+            recorder.dump()
+        );
     }
 }

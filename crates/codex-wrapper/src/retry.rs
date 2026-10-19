@@ -158,7 +158,7 @@ where
                         attempt = attempt + 1,
                         max_attempts = policy.max_attempts,
                         delay_ms = delay.as_millis() as u64,
-                        error = %e,
+                        exit_code = e.exit_code(),
                         "retrying after transient error"
                     );
                     tokio::time::sleep(delay).await;
