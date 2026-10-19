@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.5] - 2026-10-19
+
+### Bug Fixes
+
+- *(error)* Append the app-server variants so existing discriminants keep their values 
+- Make shutdown cancellation safe and prepare release workflows 
+- Support graceful native interruption before forced shutdown 
+- Extend tested Codex CLI range to 0.163.0 
+- Retain cleanup failures alongside operation errors 
+- Keep execution tracing free of invocation content 
+
+### Features
+
+- *(app-server)* JSON-RPC client for codex app-server  
+- Add exec argument passthrough 
+
+
+
 ## [0.4.4](https://github.com/joshrotenberg/codex-wrapper/compare/v0.4.3...v0.4.4) - 2026-09-22
 
 ### Added
