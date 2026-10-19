@@ -59,7 +59,8 @@ where
 ///
 /// Cancellation terminates the owned process group, waits through the
 /// client's configured grace period, and reaps the direct child before
-/// returning [`Error::Cancelled`]. Shutdown output is drained and discarded;
+/// returning [`Error::Cancelled`], or [`Error::CleanupFailed`] wrapping it if
+/// stopping or reaping the child failed. Shutdown output is drained and discarded;
 /// handlers stop receiving events after cancellation. Detached tools require
 /// the CLI's cooperation; see [`crate::CodexBuilder::termination_signal`].
 pub async fn stream_exec_cancellable<C, F>(
@@ -290,7 +291,7 @@ where
     let (stderr_output, status) = match finished {
         Ok(Ok(finished)) => finished,
         Ok(Err(error)) => {
-            let _ = crate::exec::terminate_and_reap_draining(
+            let cleanup = crate::exec::terminate_and_reap_draining(
                 &mut child,
                 &mut group,
                 codex.termination_grace,
@@ -299,11 +300,16 @@ where
                 &mut stderr,
             )
             .await;
-            outcome.settle("failed", None);
-            return Err(error);
+            let label = if cleanup.is_ok() {
+                "failed"
+            } else {
+                "cleanup_failed"
+            };
+            outcome.settle(label, None);
+            return Err(Error::after_cleanup(error, cleanup));
         }
         Err(reason) => {
-            let _ = crate::exec::terminate_and_reap_draining(
+            let cleanup = crate::exec::terminate_and_reap_draining(
                 &mut child,
                 &mut group,
                 codex.termination_grace,
@@ -312,21 +318,29 @@ where
                 &mut stderr,
             )
             .await;
-            let error = match reason {
-                StreamStop::Cancelled => {
-                    outcome.settle("cancelled", None);
+            let (label, error) = match reason {
+                StreamStop::Cancelled => (
+                    "cancelled",
                     Error::Cancelled {
                         grace_seconds: codex.termination_grace.as_secs(),
-                    }
-                }
-                StreamStop::Timeout(timeout) => {
-                    outcome.settle("timeout", None);
+                    },
+                ),
+                StreamStop::Timeout(timeout) => (
+                    "timeout",
                     Error::Timeout {
                         timeout_seconds: timeout.as_secs(),
-                    }
-                }
+                    },
+                ),
             };
-            return Err(error);
+            // Matches the buffered path, so a span never reads as a settled
+            // stop when the child may not have been reaped.
+            let label = if cleanup.is_ok() {
+                label
+            } else {
+                "cleanup_failed"
+            };
+            outcome.settle(label, None);
+            return Err(Error::after_cleanup(error, cleanup));
         }
     };
 
@@ -806,5 +820,107 @@ mod tests {
                 limit_bytes: 128,
             })
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Failed cleanup is not reported as a settled stop
+    //
+    // The injection replaces the cleanup result after the real termination
+    // and wait have run, so these cover reporting, not that a syscall fails.
+    // -----------------------------------------------------------------
+
+    /// The stop reason inside a [`Error::CleanupFailed`] whose cleanup half
+    /// is the injected failure, not some other error.
+    fn injected_cleanup_reason(result: Result<()>) -> Error {
+        match result {
+            Err(Error::CleanupFailed { reason, cleanup }) => {
+                assert!(
+                    cleanup.to_string().contains("injected cleanup failure"),
+                    "{cleanup:?}"
+                );
+                *reason
+            }
+            other => panic!("expected CleanupFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_stream_cleanup_after_cancellation_is_not_a_bare_cancel() {
+        let pid_file = crate::test_support::PidFile::new("stream-cleanup-failed-cancel");
+        let codex = crate::test_support::blocking_codex(&pid_file)
+            .termination_grace(std::time::Duration::from_millis(10))
+            .build()
+            .unwrap();
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+        let cancel_soon = || tokio::time::sleep(std::time::Duration::from_millis(100));
+
+        let injection = crate::exec::CleanupFailureInjection::arm();
+        let result = stream_exec_cancellable(&codex, &cmd, cancel_soon(), |_| {}).await;
+        let reason = injected_cleanup_reason(result);
+        assert!(matches!(reason, Error::Cancelled { .. }), "{reason:?}");
+
+        drop(injection);
+        let result = stream_exec_cancellable(&codex, &cmd, cancel_soon(), |_| {}).await;
+        assert!(matches!(result, Err(Error::Cancelled { .. })), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn failed_stream_cleanup_after_timeout_keeps_the_timeout_as_reason() {
+        let pid_file = crate::test_support::PidFile::new("stream-cleanup-failed-timeout");
+        let codex = crate::test_support::blocking_codex(&pid_file)
+            .timeout(std::time::Duration::from_millis(100))
+            .termination_grace(std::time::Duration::from_millis(10))
+            .build()
+            .unwrap();
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+
+        let _injection = crate::exec::CleanupFailureInjection::arm();
+        let result = stream_exec(&codex, &cmd, |_| {}).await;
+        let reason = injected_cleanup_reason(result);
+        assert!(matches!(reason, Error::Timeout { .. }), "{reason:?}");
+    }
+
+    /// A parse failure ends the stream through the error branch rather than a
+    /// stop signal, and must report a failed cleanup the same way.
+    #[tokio::test]
+    async fn failed_stream_cleanup_after_a_parse_error_keeps_the_json_error() {
+        let codex = fake_codex("fake-codex-bad-json.sh");
+        let cmd = crate::command::exec::ExecCommand::new("test").json();
+
+        let injection = crate::exec::CleanupFailureInjection::arm();
+        let result = stream_exec(&codex, &cmd, |_| {}).await;
+        let reason = injected_cleanup_reason(result);
+        assert!(matches!(reason, Error::Json { .. }), "{reason:?}");
+
+        drop(injection);
+        let result = stream_exec(&codex, &cmd, |_| {}).await;
+        assert!(matches!(result, Err(Error::Json { .. })), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn failed_stream_cleanup_after_an_output_limit_keeps_the_limit() {
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg("-c")
+            .arg("for ((i=0; i<4096; i++)); do printf x; done; sleep 3")
+            .output_limit(128)
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .expect("bash must exist");
+        let cmd = crate::command::exec::ExecCommand::new("probe").json();
+
+        let _injection = crate::exec::CleanupFailureInjection::arm();
+        let result = stream_exec(&codex, &cmd, |_| {}).await;
+        let reason = injected_cleanup_reason(result);
+        assert!(
+            matches!(
+                reason,
+                Error::OutputLimitExceeded {
+                    stream: crate::OutputStream::Stdout,
+                    limit_bytes: 128,
+                }
+            ),
+            "{reason:?}"
+        );
     }
 }
