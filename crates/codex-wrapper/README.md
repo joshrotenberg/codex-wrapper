@@ -770,6 +770,27 @@ line, and every `SessionMeta` field is optional because older files record no `c
 
 Unknown entry types are kept rather than dropped, with the payload available as raw JSON.
 
+**Current history modes.** Isolated captures from CLI 0.163.0 confirm that both
+materialized, persistent `legacy` and `paginated` threads write discoverable rollout
+files. Both use modern envelopes: the current `legacy` history mode is distinct
+from the old bare-line format. `SessionMeta::raw["history_mode"]` retains the mode,
+and paginated `item_completed` payloads retain their nested items.
+
+This reader enumerates files under `sessions`, not the provider's complete thread
+inventory. It does not discover archives, ephemeral or unmaterialized threads, query
+the state database, or follow another server's storage roots. It preserves payloads
+without reconstructing or deduplicating logical turns; extra envelope fields such
+as paginated `ordinal` are not exposed, and invalid JSON lines are skipped.
+
+For the provider's logical view, use the app-server feature's generic `request`
+with `thread/read`, `thread/turns/list`, or `thread/items/list`. Follow each method's
+opaque `nextCursor` until absent. On materialized 0.163.0 threads, `thread/read`
+and `thread/turns/list` worked in both modes; `thread/items/list` worked for
+paginated history and rejected legacy history. Availability depends on CLI
+version, history mode, and materialization. The versioned fixtures in
+`crates/codex-wrapper/tests/history/` record the observed shapes and limitations;
+they do not establish complete reconstruction of every item type.
+
 ## Auth Pre-flight
 
 Check which credential the CLI would use, synchronously, without spawning it:
@@ -1011,6 +1032,56 @@ commands the server started run in groups of their own, so they keep running. `t
 ends the turn but not the command it is running. `CodexBuilder::timeout` applies to each request,
 and `output_limit` to the total stdout read over the session. The module documentation lists
 what was verified against the CLI and on which versions.
+
+Configure capabilities before the automatic initialize handshake:
+
+```rust
+let server = AppServer::builder(&codex)
+    .experimental_api(true)
+    .capability("extensions", serde_json::json!({}))
+    .opt_out_notification("item/agentMessage/delta")
+    .max_frame_bytes(1024 * 1024)
+    .max_queued_messages(1024)
+    .max_queued_bytes(8 * 1024 * 1024)
+    .max_writer_queue_messages(128)
+    .max_writer_queue_bytes(2 * 1024 * 1024)
+    .start().await?;
+```
+
+All five limits are opt-in and unlimited by default. They are independent of the
+lifetime `output_limit`. RPC answers route directly to waiters even when events
+are unread. Overflow fails the connection and pending requests with
+`AppServerLimitExceeded`; approvals and terminal events are never silently
+dropped to make room. Writer limits include the message currently being written.
+Byte accounting measures serialized messages, not exact heap usage.
+`initialize_params()` previews the handshake. Arbitrary capability keys pass
+through; explicit opt-outs are combined with a capability's opt-out list.
+
+On Unix, attach to an existing server with an explicitly selected socket:
+
+```rust
+let server = AppServer::builder(&codex)
+    .connect_unix("/path/to/selected-app-server.sock")
+    .experimental_api(true)
+    .start().await?;
+assert_eq!(server.pid(), None);
+assert!(!server.transport().owns_server());
+```
+
+This uses WebSocket framing directly over the Unix socket and spawns no process.
+The client binary, environment and spawn policies do not apply. Shutdown,
+termination, drop and transport failures close only this connection; the shared
+server and its turns remain its owner's responsibility. Request timeouts also
+bound connect/upgrade. Byte limits count JSON payload bytes in attached mode and
+raw line bytes including delimiters in stdio mode.
+
+Attachment was qualified against experimental CLI 0.163.0 with two clients,
+running-thread rejoin, steering, pending approvals, disconnect/reconnect, and
+server loss. A fresh connection needs a fresh handshake and explicit reconciliation
+of threads and approvals. Requests are never automatically replayed, and empty
+unmaterialized threads may not yet be resumable by another client. See
+`crates/codex-wrapper/tests/app-server-qualification.md` for the native evidence
+and its limits. This does not adopt an unrelated private TUI process.
 
 ## Retry Policy
 
