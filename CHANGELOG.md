@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.6] - 2026-10-20
+
+### Features
+
+- Support bounded attached app-server sessions 
+
+
+
 ## [0.4.5] - 2026-10-19
 
 ### Bug Fixes
