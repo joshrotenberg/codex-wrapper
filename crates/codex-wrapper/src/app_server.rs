@@ -420,7 +420,7 @@ impl Budget {
         used.1 = used.1.saturating_sub(bytes);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn used(&self) -> (usize, usize) {
         *locked(&self.used)
     }
@@ -2138,7 +2138,7 @@ async fn read_frame<R: AsyncBufRead + Unpin>(
 }
 
 /// Classify one line from the server and deliver it.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn route(line: &str, shared: &Shared) -> std::result::Result<(), Closed> {
     route_bytes(line, line.len() + 1, shared)
 }
