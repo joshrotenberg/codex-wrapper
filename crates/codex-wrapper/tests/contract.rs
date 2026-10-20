@@ -890,3 +890,97 @@ fn app_server_protocol_methods_contract() {
         drift.join("\n  - ")
     );
 }
+
+/// Exercise the actual Unix WebSocket wire contract without starting a model
+/// turn. The lowest CLI pin predates this qualified transport.
+#[cfg(all(feature = "app-server", unix))]
+#[tokio::test]
+#[ignore]
+async fn app_server_unix_connection_contract() {
+    use codex_wrapper::{AppServer, CliVersion, Codex};
+    use std::time::Duration;
+
+    let installed = CliVersion::parse_version_output(&cli_version()).unwrap();
+    if installed < CliVersion::new(0, 163, 0) {
+        return;
+    }
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Directory(std::env::temp_dir().join(format!("cw-native-{}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    std::fs::create_dir_all(dir.0.join("home")).unwrap();
+    let socket = dir.0.join("s");
+    let stderr_path = dir.0.join("stderr.log");
+    let mut child = tokio::process::Command::new("codex")
+        .args([
+            "-c",
+            "cli_auth_credentials_store=\"file\"",
+            "app-server",
+            "--listen",
+        ])
+        .arg(format!("unix://{}", socket.display()))
+        .env("CODEX_HOME", dir.0.join("home"))
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .current_dir(&dir.0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !socket.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "native listener exited: {}",
+                std::fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("native Unix listener ready");
+    let codex = Codex::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let first = AppServer::builder(&codex)
+        .connect_unix(&socket)
+        .experimental_api(true)
+        .start()
+        .await
+        .unwrap();
+    let second = AppServer::builder(&codex)
+        .connect_unix(&socket)
+        .experimental_api(true)
+        .start()
+        .await
+        .unwrap();
+    assert_eq!(first.pid(), None);
+    assert!(!first.transport().owns_server());
+    assert!(
+        first.server_info().user_agent.contains("0.163") || installed > CliVersion::new(0, 163, 0)
+    );
+    first.shutdown().await.unwrap();
+    assert!(child.try_wait().unwrap().is_none());
+    let page = second
+        .request("thread/list", serde_json::json!({"limit":1}))
+        .await
+        .unwrap();
+    assert!(page["data"].is_array());
+    second.terminate().await.unwrap();
+    assert!(child.try_wait().unwrap().is_none());
+    let third = AppServer::builder(&codex)
+        .connect_unix(&socket)
+        .start()
+        .await
+        .unwrap();
+    drop(third);
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().await.unwrap();
+}

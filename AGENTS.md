@@ -109,9 +109,12 @@ The rules that follow from it:
 `default = ["json"]`. The `json` feature gates `session`, `streaming`, and the event types in
 `types.rs` (`JsonLineEvent`, `QueryResult`, `TokenUsage`).
 
-`app-server` (off by default, implies `json`) gates `app_server` and the two `Error` variants it
-returns. It also turns on tokio's `rt` and `sync`, which the client's reader tasks need and the
-rest of the crate does not. CI builds and unit-tests it without the other optional features.
+`app-server` (off by default, implies `json`) gates `app_server` and its protocol, configuration,
+and limit errors. It enables tokio's `rt`, `sync`, and `net`, Unix WebSocket dependencies, and
+Windows process-handle termination support. CI builds and unit-tests it without the other
+optional features. Owned stdio remains the default; Unix callers can attach to an explicitly
+selected server with `connect_unix`. Attachment owns only the connection, never the server.
+Capability and queue/frame policies are configured on `AppServerBuilder` before initialization.
 
 Test code needs the same gating as the code it tests. A test naming a json-only type compiles
 under `--all-features` and breaks the `--no-default-features` build, which is why both test

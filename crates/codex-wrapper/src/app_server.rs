@@ -96,8 +96,8 @@
 //! running.
 //! - A failure that leaves the stream unusable (the output limit, or a line
 //!   that starts with `{` but is not valid JSON) kills the child: on Unix as
-//!   soon as it is detected, elsewhere when [`AppServer::next_message`] returns
-//!   the error. The error also reaches any request still waiting.
+//!   soon as it is detected, and on Windows through its owned process handle.
+//!   The error also reaches any request still waiting.
 //!
 //! # Limits
 //!
@@ -108,11 +108,79 @@
 //! it a request waits until the server answers or exits. The server's stderr is
 //! drained continuously and the last 16 KiB is kept for error messages.
 //!
-//! Messages wait in an unbounded queue until [`AppServer::next_message`]
-//! returns them, so a caller that does not read them, or reads more slowly than
-//! the server writes, holds them in memory. `output_limit` bounds the total.
-//! Streaming deltas are most of the volume, and
-//! [`AppServerBuilder::opt_out_notification`] stops the server sending them.
+//! By default messages wait in an unbounded queue until
+//! [`AppServer::next_message`] returns them, so a caller that does not read
+//! them, or reads more slowly than the server writes, holds them in memory.
+//! `output_limit` bounds the total. Streaming deltas are most of the volume,
+//! and [`AppServerBuilder::opt_out_notification`] stops the server sending
+//! them.
+//!
+//! Five opt-in limits bound memory instead of the lifetime total, and each is
+//! off by default:
+//!
+//! - [`max_frame_bytes`](AppServerBuilder::max_frame_bytes): one line from
+//!   the server, newline included. A longer line is rejected before more than
+//!   the limit is buffered, whether or not it ever ends.
+//! - [`max_queued_messages`](AppServerBuilder::max_queued_messages) and
+//!   [`max_queued_bytes`](AppServerBuilder::max_queued_bytes): notifications
+//!   and server requests read but not yet returned by `next_message`. Answers
+//!   to the client's own requests do not pass through this queue, so they are
+//!   delivered while events wait, and the reader never blocks on it.
+//! - [`max_writer_queue_messages`](AppServerBuilder::max_writer_queue_messages)
+//!   and [`max_writer_queue_bytes`](AppServerBuilder::max_writer_queue_bytes):
+//!   lines queued for the server's stdin, including the one being written. A
+//!   server that stops reading its input fills this.
+//!
+//! Exceeding any of them ends the connection with
+//! [`Error::AppServerLimitExceeded`]. No message is dropped or merged to stay
+//! under a limit: an approval request or a `turn/completed` that does not fit
+//! is not delivered and the session fails instead, so a caller never mistakes
+//! a lossy stream for a complete one. Messages queued before the failure are
+//! still returned by `next_message`, then the error. Every waiting request
+//! fails with the same error, later sends fail at once, and the process the
+//! client owns is killed, as for the output limit.
+//!
+//! # Capabilities
+//!
+//! `initialize` is sent without `capabilities` unless something asks for one.
+//! [`AppServerBuilder::capability`] sets any field of it by its protocol name,
+//! for example `experimentalApi`, which
+//! [`experimental_api`](AppServerBuilder::experimental_api) also sets. The
+//! wrapper does not check other fields; what a field means and whether the
+//! server accepts it depends on the CLI version.
+//!
+//! `optOutNotificationMethods` can be set both ways. The two lists are
+//! combined: the entries set through `capability` first, then those from
+//! [`opt_out_notification`](AppServerBuilder::opt_out_notification), each
+//! method once. A value for it that is neither an array of strings nor `null`
+//! is rejected by [`AppServerBuilder::start`] before anything is spawned.
+//! [`AppServerBuilder::initialize_params`] shows the result.
+//!
+//! # Connecting to an existing server
+//!
+//! On Unix, `AppServerBuilder::connect_unix(path)` attaches over a WebSocket
+//! connection to an explicitly selected Unix socket. It spawns no process:
+//! [`AppServer::pid`] is `None`, and shutdown, terminate, drop, or a transport
+//! failure close only this connection. They never signal the shared server
+//! or promise to interrupt its turns. Client binary/env/global arguments,
+//! spawn observers, and process-group policies do not apply in this mode.
+//!
+//! The connection performs a fresh initialize handshake with the configured
+//! capabilities. Client timeout bounds connect/upgrade and each RPC wait.
+//! Frame and queue byte limits count UTF-8 JSON message payloads, without
+//! WebSocket headers; stdio counts raw line bytes including delimiters.
+//! These budgets are not exact heap measurements. WebSocket frame and
+//! aggregate-message limits prevent fragmentation from bypassing the cap.
+//!
+//! Attached transport support was qualified on CLI 0.163.0 and remains
+//! experimental. Nothing discovers or starts a daemon, adopts a private TUI
+//! process, reconnects automatically, or replays uncertain requests. A new
+//! connection must explicitly resume/reconcile threads, subscriptions and
+//! approvals. Empty, unmaterialized threads may not yet be resumable by a
+//! second client. Two-client rejoin, steering, pending approval delivery and
+//! cancellation, observer disconnect/reconnect, and server loss were probed
+//! with an isolated server and deterministic offline backend. See the shipped
+//! `tests/app-server-qualification.md` for versioned evidence and limits.
 //!
 //! # Verified against codex-cli 0.149.0
 //!
@@ -180,12 +248,18 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+#[cfg(unix)]
+use futures_util::{SinkExt, StreamExt};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
+#[cfg(unix)]
+use tokio_tungstenite::tungstenite::{Message as WsMessage, protocol::WebSocketConfig};
 use tracing::{Instrument, debug, warn};
 
 use crate::Codex;
@@ -203,6 +277,154 @@ const STARTUP_EXIT_WAIT: Duration = Duration::from_secs(2);
 /// How long to wait for the stderr reader to finish once the child has exited,
 /// so the last lines it wrote make it into an error message.
 const STDERR_SETTLE: Duration = Duration::from_millis(500);
+
+/// The `initialize` capability that [`AppServerBuilder::opt_out_notification`]
+/// also writes.
+const OPT_OUT_KEY: &str = "optOutNotificationMethods";
+
+/// One of the opt-in transport limits, as reported by
+/// [`Error::AppServerLimitExceeded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AppServerLimit {
+    /// The bytes in one line from the server, newline included. Set with
+    /// [`AppServerBuilder::max_frame_bytes`].
+    FrameBytes,
+    /// Messages waiting for [`AppServer::next_message`]. Set with
+    /// [`AppServerBuilder::max_queued_messages`].
+    QueuedMessages,
+    /// Bytes waiting for [`AppServer::next_message`]. Set with
+    /// [`AppServerBuilder::max_queued_bytes`].
+    QueuedBytes,
+    /// Lines waiting to be written to the server. Set with
+    /// [`AppServerBuilder::max_writer_queue_messages`].
+    WriterQueueMessages,
+    /// Bytes waiting to be written to the server. Set with
+    /// [`AppServerBuilder::max_writer_queue_bytes`].
+    WriterQueueBytes,
+}
+
+impl std::fmt::Display for AppServerLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FrameBytes => "frame byte",
+            Self::QueuedMessages => "queued message",
+            Self::QueuedBytes => "queued byte",
+            Self::WriterQueueMessages => "writer queue message",
+            Self::WriterQueueBytes => "writer queue byte",
+        })
+    }
+}
+
+/// How an [`AppServer`] reaches the server, and so what it owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AppServerTransport {
+    /// `app-server --listen stdio://`: the client started the server and owns
+    /// it.
+    Stdio,
+    /// An existing server reached by WebSocket over an explicitly selected
+    /// Unix socket. The client owns only its connection.
+    #[cfg(unix)]
+    UnixSocket {
+        /// The selected local socket path.
+        socket: PathBuf,
+    },
+}
+
+impl AppServerTransport {
+    /// Whether this client owns the server process. Attached connections never
+    /// signal the shared server.
+    #[must_use]
+    pub fn owns_server(&self) -> bool {
+        matches!(self, Self::Stdio)
+    }
+
+    /// How the owned process is named in error messages.
+    fn process_name(&self) -> &'static str {
+        match self {
+            Self::Stdio => "codex app-server",
+            #[cfg(unix)]
+            Self::UnixSocket { .. } => "codex app-server connection",
+        }
+    }
+}
+
+/// The opt-in transport limits. `None` is unlimited.
+#[derive(Debug, Clone, Copy, Default)]
+struct Limits {
+    frame_bytes: Option<usize>,
+    queued_messages: Option<usize>,
+    queued_bytes: Option<usize>,
+    writer_messages: Option<usize>,
+    writer_bytes: Option<usize>,
+}
+
+/// Counts what is in one queue against its limits.
+///
+/// A message is reserved before it is queued and released when it leaves the
+/// queue: returned to the caller, written, or discarded. The lock is never held
+/// while another is taken.
+struct Budget {
+    max_messages: Option<usize>,
+    max_bytes: Option<usize>,
+    messages_limit: AppServerLimit,
+    bytes_limit: AppServerLimit,
+    used: Mutex<(usize, usize)>,
+}
+
+impl Budget {
+    fn new(
+        max_messages: Option<usize>,
+        max_bytes: Option<usize>,
+        messages_limit: AppServerLimit,
+        bytes_limit: AppServerLimit,
+    ) -> Self {
+        Self {
+            max_messages,
+            max_bytes,
+            messages_limit,
+            bytes_limit,
+            used: Mutex::new((0, 0)),
+        }
+    }
+
+    /// Count one message of `bytes`, or say which limit it would pass.
+    fn reserve(&self, bytes: usize) -> std::result::Result<(), Closed> {
+        let mut used = locked(&self.used);
+        let messages = used.0.saturating_add(1);
+        let total = used.1.saturating_add(bytes);
+        if let Some(max) = self.max_messages
+            && messages > max
+        {
+            return Err(Closed::Limit {
+                limit: self.messages_limit,
+                max,
+            });
+        }
+        if let Some(max) = self.max_bytes
+            && total > max
+        {
+            return Err(Closed::Limit {
+                limit: self.bytes_limit,
+                max,
+            });
+        }
+        *used = (messages, total);
+        Ok(())
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut used = locked(&self.used);
+        used.0 = used.0.saturating_sub(1);
+        used.1 = used.1.saturating_sub(bytes);
+    }
+
+    #[cfg(all(test, unix))]
+    fn used(&self) -> (usize, usize) {
+        *locked(&self.used)
+    }
+}
 
 /// A JSON-RPC request id.
 ///
@@ -641,6 +863,8 @@ enum Closed {
     Broken(String),
     /// The client ended the session.
     Terminated,
+    /// One of the opt-in transport limits was passed.
+    Limit { limit: AppServerLimit, max: usize },
 }
 
 /// What a waiting request gets back.
@@ -654,15 +878,27 @@ enum Reply {
 
 /// What the reader hands to [`AppServer::next_message`].
 enum Event {
-    Message(ServerMessage),
+    /// A message and the bytes it holds in the inbound budget.
+    Message(ServerMessage, usize),
     Closed(Closed),
 }
 
 /// What the writer task is asked to do.
 enum Outgoing {
-    Line(Vec<u8>),
+    Line(ReservedLine),
     /// Stop writing and drop stdin, which the server sees as end of input.
     Close,
+}
+
+/// Owns the reservation through queued, in-flight, cancelled and aborted writes.
+struct ReservedLine {
+    bytes: Vec<u8>,
+    budget: Arc<Budget>,
+}
+impl Drop for ReservedLine {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes.len());
+    }
 }
 
 struct State {
@@ -684,6 +920,16 @@ struct Shared {
     /// signal a pid that has been released.
     kill: Mutex<Option<KillTarget>>,
     events: mpsc::UnboundedSender<Event>,
+    /// Messages routed to `events` and not yet returned by `next_message`.
+    inbound: Budget,
+    /// Lines handed to the writer and not yet written, the one being written
+    /// included.
+    outbound: Arc<Budget>,
+    closed: watch::Sender<bool>,
+    newline_delimited: bool,
+    frame_bytes: Option<usize>,
+    /// The owned process, as error messages name it.
+    process: &'static str,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -697,12 +943,29 @@ impl Shared {
     /// End the session: fail every waiting request and tell the reader side.
     /// The first reason wins.
     fn fail(&self, reason: Closed) {
+        self.end(reason, true);
+    }
+
+    fn end(&self, reason: Closed, stop_writer: bool) {
+        self.end_with_cleanup(reason, stop_writer, false);
+    }
+
+    fn end_with_cleanup(&self, reason: Closed, stop_writer: bool, kill: bool) {
         let pending = {
             let mut state = locked(&self.state);
             if state.closed.is_some() {
+                if stop_writer {
+                    self.closed.send_replace(true);
+                }
                 return;
             }
             state.closed = Some(reason.clone());
+            if kill {
+                self.fire_kill();
+            }
+            if stop_writer {
+                self.closed.send_replace(true);
+            }
             std::mem::take(&mut state.pending)
         };
         for (_, waiter) in pending {
@@ -711,7 +974,26 @@ impl Shared {
         let _ = self.events.send(Event::Closed(reason));
     }
 
-    fn new(events: mpsc::UnboundedSender<Event>, kill: Option<KillTarget>) -> Self {
+    /// Preserve the causal failure before cleanup can produce EOF.
+    fn fatal(&self, reason: Closed) {
+        // Hold admission closed while cleanup starts, then publish the error.
+        // EOF can neither replace the cause nor reach waiters before the kill.
+        self.end_with_cleanup(reason, true, true);
+    }
+
+    async fn wait_closed(&self) {
+        let mut closed = self.closed.subscribe();
+        if !*closed.borrow_and_update() {
+            let _ = closed.changed().await;
+        }
+    }
+
+    fn new(
+        events: mpsc::UnboundedSender<Event>,
+        kill: Option<KillTarget>,
+        limits: Limits,
+        process: &'static str,
+    ) -> Self {
         Self {
             state: Mutex::new(State {
                 pending: HashMap::new(),
@@ -723,7 +1005,49 @@ impl Shared {
             stderr_finished: Notify::new(),
             kill: Mutex::new(kill),
             events,
+            inbound: Budget::new(
+                limits.queued_messages,
+                limits.queued_bytes,
+                AppServerLimit::QueuedMessages,
+                AppServerLimit::QueuedBytes,
+            ),
+            outbound: Arc::new(Budget::new(
+                limits.writer_messages,
+                limits.writer_bytes,
+                AppServerLimit::WriterQueueMessages,
+                AppServerLimit::WriterQueueBytes,
+            )),
+            closed: watch::channel(false).0,
+            newline_delimited: true,
+            frame_bytes: limits.frame_bytes,
+            process,
         }
+    }
+
+    fn closed_reason(&self) -> Option<Closed> {
+        locked(&self.state).closed.clone()
+    }
+
+    /// Hand a message to `next_message`, counting it against the inbound
+    /// limits. Never waits: answers to requests are routed by the same task,
+    /// so blocking here would hold them behind events nobody is reading.
+    fn deliver(&self, message: ServerMessage, bytes: usize) -> std::result::Result<(), Closed> {
+        let state = locked(&self.state);
+        if let Some(reason) = &state.closed {
+            // Intentional shutdown has closed admission, but incoming traffic
+            // must not cancel the owned writer's graceful drain.
+            return if matches!(reason, Closed::Terminated) {
+                Ok(())
+            } else {
+                Err(reason.clone())
+            };
+        }
+        self.inbound.reserve(bytes)?;
+        if self.events.send(Event::Message(message, bytes)).is_err() {
+            // The receiver is gone with the `AppServer`.
+            self.inbound.release(bytes);
+        }
+        Ok(())
     }
 
     /// Kill the server, if the reader still has the authority to. Called when
@@ -779,17 +1103,22 @@ impl Shared {
                 stream: OutputStream::Stdout,
                 limit_bytes: *limit_bytes,
             },
+            Closed::Limit { limit, max } => Error::AppServerLimitExceeded {
+                limit: *limit,
+                max: *max,
+            },
             Closed::Terminated => protocol("the app-server session was ended by the client".into()),
             Closed::Broken(message) => protocol(message.clone()),
             Closed::Eof => {
+                let process = self.process;
                 let stderr = self.stderr_summary();
                 let while_waiting =
                     method.map_or_else(String::new, |m| format!(" before answering `{m}`"));
                 if stderr.is_empty() {
-                    protocol(format!("codex app-server closed its output{while_waiting}"))
+                    protocol(format!("{process} closed its output{while_waiting}"))
                 } else {
                     protocol(format!(
-                        "codex app-server closed its output{while_waiting}; stderr: {stderr}"
+                        "{process} closed its output{while_waiting}; stderr: {stderr}"
                     ))
                 }
             }
@@ -890,23 +1219,60 @@ impl std::fmt::Debug for AppServerHandle {
 
 impl AppServerHandle {
     fn closed_error(&self, method: Option<&str>) -> Error {
-        let reason = locked(&self.shared.state).closed.clone();
-        match reason {
+        match self.shared.closed_reason() {
             Some(reason) => self.shared.error_for(&reason, method),
             None => Error::AppServerProtocol {
-                message: "codex app-server is no longer accepting messages (its stdin is closed)"
-                    .into(),
+                message: format!(
+                    "{} is no longer accepting messages (its stdin is closed)",
+                    self.shared.process
+                ),
             },
         }
     }
 
-    fn enqueue(&self, line: Vec<u8>, method: Option<&str>) -> Result<()> {
-        if let Some(reason) = &locked(&self.shared.state).closed {
+    /// Count a line of `bytes` against the writer limits, or end the session
+    /// if it does not fit. A line that would pass a limit is never queued: the
+    /// server would see a gap in what the client sent.
+    fn admit(&self, bytes: usize, method: Option<&str>) -> Result<()> {
+        if let Some(reason) = self.shared.closed_reason() {
+            return Err(self.shared.error_for(&reason, method));
+        }
+        if let Err(reason) = self.shared.outbound.reserve(bytes) {
+            // No lock is held here: `fail` takes the state lock and wakes
+            // waiters, which may call back into this handle.
+            self.shared.fatal(reason);
+            return Err(self.closed_error(method));
+        }
+        Ok(())
+    }
+
+    /// Queue a reserved line for the writer, releasing the reservation if the
+    /// writer has gone.
+    fn send_line(&self, line: Vec<u8>, method: Option<&str>) -> Result<()> {
+        let line = ReservedLine {
+            bytes: line,
+            budget: Arc::clone(&self.shared.outbound),
+        };
+        let state = locked(&self.shared.state);
+        if let Some(reason) = &state.closed {
             return Err(self.shared.error_for(reason, method));
         }
-        self.writer
-            .send(Outgoing::Line(line))
-            .map_err(|_| self.closed_error(method))
+        let sent = self.writer.send(Outgoing::Line(line));
+        drop(state);
+        sent.map_err(|_| self.closed_error(method))
+    }
+
+    fn wire_line(&self, mut line: Vec<u8>) -> Vec<u8> {
+        if !self.shared.newline_delimited && line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        line
+    }
+
+    fn enqueue(&self, line: Vec<u8>, method: Option<&str>) -> Result<()> {
+        let line = self.wire_line(line);
+        self.admit(line.len(), method)?;
+        self.send_line(line, method)
     }
 
     /// Send a request and wait for its answer, returning the `result` value.
@@ -922,22 +1288,28 @@ impl AppServerHandle {
     /// session ends first.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let line = request_line(id, method, &params)?;
+        let line = self.wire_line(request_line(id, method, &params)?);
         let (waiter, answer) = oneshot::channel();
-        {
+        // Reserve the line's place before registering for its answer, so a
+        // request that does not fit fails without having been half accepted.
+        self.admit(line.len(), Some(method))?;
+        let closed = {
             let mut state = locked(&self.shared.state);
-            if let Some(reason) = &state.closed {
-                return Err(self.shared.error_for(reason, Some(method)));
+            let closed = state.closed.clone();
+            if closed.is_none() {
+                state.pending.insert(id, waiter);
             }
-            state.pending.insert(id, waiter);
+            closed
+        };
+        if let Some(reason) = closed {
+            self.shared.outbound.release(line.len());
+            return Err(self.shared.error_for(&reason, Some(method)));
         }
         let _slot = PendingSlot {
             shared: &self.shared,
             id,
         };
-        self.writer
-            .send(Outgoing::Line(line))
-            .map_err(|_| self.closed_error(Some(method)))?;
+        self.send_line(line, Some(method))?;
 
         let reply = match self.timeout {
             Some(limit) => {
@@ -1101,6 +1473,9 @@ pub struct AppServerBuilder<'a> {
     client_name: String,
     client_version: String,
     opt_out: Vec<String>,
+    capabilities: Map<String, Value>,
+    limits: Limits,
+    transport: AppServerTransport,
 }
 
 impl<'a> AppServerBuilder<'a> {
@@ -1123,43 +1498,199 @@ impl<'a> AppServerBuilder<'a> {
         self
     }
 
-    /// The arguments [`start`](Self::start) passes after the client's global
-    /// args: `app-server --listen stdio://`.
+    /// Set a field of the `initialize` request's `capabilities` by its
+    /// protocol name, replacing an earlier value for the same name. Sent as
+    /// given and not checked, except `optOutNotificationMethods`, which is
+    /// combined with [`opt_out_notification`](Self::opt_out_notification) as
+    /// the [module documentation](self#capabilities) describes.
+    #[must_use]
+    pub fn capability(mut self, name: impl Into<String>, value: Value) -> Self {
+        self.capabilities.insert(name.into(), value);
+        self
+    }
+
+    /// Set the `experimentalApi` capability, which asks the server to allow
+    /// methods and fields it marks experimental. Shorthand for
+    /// `capability("experimentalApi", Value::Bool(enabled))`.
+    #[must_use]
+    pub fn experimental_api(self, enabled: bool) -> Self {
+        self.capability("experimentalApi", Value::Bool(enabled))
+    }
+
+    /// The most bytes one line from the server may hold, newline included. A
+    /// longer line ends the session with [`Error::AppServerLimitExceeded`]
+    /// once the limit is reached, without buffering the rest. Unlimited by
+    /// default. Attached WebSocket mode counts JSON payload bytes instead.
+    #[must_use]
+    pub fn max_frame_bytes(mut self, bytes: usize) -> Self {
+        self.limits.frame_bytes = Some(bytes);
+        self
+    }
+
+    /// The most notifications and server requests that may wait for
+    /// [`AppServer::next_message`]. One more ends the session. Unlimited by
+    /// default.
+    #[must_use]
+    pub fn max_queued_messages(mut self, messages: usize) -> Self {
+        self.limits.queued_messages = Some(messages);
+        self
+    }
+
+    /// The most bytes, counted as each message's line plus its newline, that
+    /// may wait for [`AppServer::next_message`]. Attached mode counts JSON
+    /// payload bytes without WebSocket framing. Unlimited by default.
+    #[must_use]
+    pub fn max_queued_bytes(mut self, bytes: usize) -> Self {
+        self.limits.queued_bytes = Some(bytes);
+        self
+    }
+
+    /// The most lines that may wait to be written to the server, the one being
+    /// written included. Unlimited by default.
+    #[must_use]
+    pub fn max_writer_queue_messages(mut self, messages: usize) -> Self {
+        self.limits.writer_messages = Some(messages);
+        self
+    }
+
+    /// The most bytes, newlines included, that may wait to be written to the
+    /// server, the line being written included. Attached mode counts JSON
+    /// payload bytes without WebSocket framing. Unlimited by default.
+    #[must_use]
+    pub fn max_writer_queue_bytes(mut self, bytes: usize) -> Self {
+        self.limits.writer_bytes = Some(bytes);
+        self
+    }
+
+    /// Attach to an existing server over a Unix WebSocket connection.
+    ///
+    /// Spawns no process and never signals the shared server. The endpoint
+    /// must be selected explicitly. Verified with CLI 0.163.0; this provider
+    /// transport is experimental. Reconnect by creating a fresh connection
+    /// and explicitly reconciling threads and approvals; requests are not replayed.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn connect_unix(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.transport = AppServerTransport::UnixSocket {
+            socket: socket.into(),
+        };
+        self
+    }
+
+    /// The `params` of the `initialize` request [`start`](Self::start) sends.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AppServerConfig`] if `optOutNotificationMethods` was set
+    /// through [`capability`](Self::capability) to something other than an
+    /// array of strings or `null`.
+    pub fn initialize_params(&self) -> Result<Value> {
+        let mut params = json!({
+            "clientInfo": { "name": self.client_name, "version": self.client_version }
+        });
+        let mut capabilities = self.capabilities.clone();
+        if let Some(given) = capabilities.get(OPT_OUT_KEY) {
+            let valid = match given {
+                Value::Null => true,
+                Value::Array(items) => items.iter().all(Value::is_string),
+                _ => false,
+            };
+            if !valid {
+                return Err(Error::AppServerConfig {
+                    message: format!(
+                        "capabilities.{OPT_OUT_KEY} must be an array of method names or null"
+                    ),
+                });
+            }
+        }
+        if !self.opt_out.is_empty() {
+            let mut methods: Vec<String> = Vec::new();
+            let given = capabilities.get(OPT_OUT_KEY).and_then(Value::as_array);
+            let given = given.into_iter().flatten().filter_map(Value::as_str);
+            for method in given.chain(self.opt_out.iter().map(String::as_str)) {
+                if !methods.iter().any(|seen| seen == method) {
+                    methods.push(method.to_string());
+                }
+            }
+            capabilities.insert(OPT_OUT_KEY.into(), json!(methods));
+        }
+        if !capabilities.is_empty() {
+            params["capabilities"] = Value::Object(capabilities);
+        }
+        Ok(params)
+    }
+
+    /// The owned-server arguments: `app-server --listen stdio://`. Empty for
+    /// an attached connection, which spawns no command.
     ///
     /// `--listen stdio://` is the default transport. It is passed anyway so a
     /// change of default cannot move this client onto a socket.
     #[must_use]
     pub fn args(&self) -> Vec<String> {
-        vec!["app-server".into(), "--listen".into(), "stdio://".into()]
+        match &self.transport {
+            AppServerTransport::Stdio => {
+                vec!["app-server".into(), "--listen".into(), "stdio://".into()]
+            }
+            #[cfg(unix)]
+            AppServerTransport::UnixSocket { .. } => Vec::new(),
+        }
+    }
+
+    /// Reject a setting that cannot work, before anything is spawned.
+    fn validate(&self) -> Result<Value> {
+        #[cfg(unix)]
+        if let AppServerTransport::UnixSocket { socket } = &self.transport
+            && socket.as_os_str().is_empty()
+        {
+            return Err(Error::AppServerConfig {
+                message: "the socket path is empty".into(),
+            });
+        }
+        self.initialize_params()
     }
 
     /// The command [`start`](Self::start) will run, as a copy-pasteable shell
-    /// string, including the client's global args.
+    /// string, including the client's global args. Empty for an attached connection.
     #[must_use]
     pub fn to_command_string(&self) -> String {
+        if !self.transport.owns_server() {
+            return String::new();
+        }
         crate::exec::command_string(self.codex, self.args())
     }
 
     /// Spawn `codex app-server` and complete the handshake.
     ///
-    /// The command is `codex [global args] app-server --listen stdio://`. The
+    /// Owned mode runs `codex [global args] app-server --listen stdio://`. The
     /// client's binary, environment, working directory, process-group policy,
-    /// `die_with_parent`, and `on_spawn` observer apply. The handshake is
-    /// bounded by the client's timeout, when set.
+    /// `die_with_parent`, and `on_spawn` observer apply to that process. The
+    /// handshake is bounded by the client's timeout, when set.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the process cannot be spawned. If the server exits
-    /// before the handshake finishes, the failure is classified from its
+    /// [`Error::AppServerConfig`] for an invalid setting, before anything is
+    /// spawned. [`Error::Io`] if the process cannot be spawned. If the process
+    /// exits before the handshake finishes, the failure is classified from its
     /// stderr as any failed command is, so a rejected `-c` key is
     /// [`Error::Config`]. Otherwise the handshake's own error.
     pub async fn start(self) -> Result<AppServer> {
+        let initialize_params = self.validate()?;
+        #[cfg(unix)]
+        if let AppServerTransport::UnixSocket { socket } = &self.transport {
+            let socket = socket.clone();
+            return self.start_unix(socket, initialize_params).await;
+        }
         let codex = self.codex;
+        let process = self.transport.process_name();
         let operation_args = self.args();
         let span = crate::exec::command_span("codex.app_server", codex, &operation_args);
         let args = crate::exec::assemble_args(codex, operation_args);
         let command_text = format!("{} {}", codex.binary.display(), args.join(" "));
-        debug!(arg_count = args.len(), "starting codex app-server");
+        debug!(
+            arg_count = args.len(),
+            owns_server = self.transport.owns_server(),
+            "starting codex app-server"
+        );
 
         let mut outcome = SpanOutcome::start(span.clone());
         let mut command = Command::new(&codex.binary);
@@ -1182,7 +1713,7 @@ impl<'a> AppServerBuilder<'a> {
             Err(e) => {
                 outcome.settle("error", None);
                 return Err(Error::Io {
-                    message: format!("failed to spawn codex app-server: {e}"),
+                    message: format!("failed to spawn {process}: {e}"),
                     source: e,
                     working_dir: codex.working_dir.clone(),
                 });
@@ -1202,22 +1733,27 @@ impl<'a> AppServerBuilder<'a> {
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (writer_tx, writer_rx) = mpsc::unbounded_channel();
+        // Only owned mode creates a process kill target.
         let shared = Arc::new(Shared::new(
             events_tx,
             Some(KillTarget {
                 pid,
                 group: codex.process_group,
+                #[cfg(windows)]
+                handle: child.raw_handle().map(|handle| handle as usize),
             }),
+            self.limits,
+            process,
         ));
 
-        tokio::spawn(read_stdout(
+        let reader = tokio::spawn(read_stdout(
             stdout,
             Arc::clone(&shared),
             codex.output_limit,
             codex.working_dir.clone(),
         ));
-        tokio::spawn(drain_stderr(stderr, Arc::clone(&shared)));
-        tokio::spawn(write_stdin(stdin, writer_rx, Arc::clone(&shared)));
+        let stderr_reader = tokio::spawn(drain_stderr(stderr, Arc::clone(&shared)));
+        let writer = tokio::spawn(write_stdin(stdin, writer_rx, Arc::clone(&shared)));
 
         let handle = AppServerHandle {
             shared,
@@ -1228,23 +1764,24 @@ impl<'a> AppServerBuilder<'a> {
             handle,
             events: events_rx,
             finished: false,
-            child,
+            child: Some(child),
+            tasks: vec![
+                reader.abort_handle(),
+                stderr_reader.abort_handle(),
+                writer.abort_handle(),
+            ],
             group,
             outcome,
             termination_grace: codex.termination_grace,
             working_dir: codex.working_dir.clone(),
             command: command_text,
             info: ServerInfo::default(),
+            transport: self.transport,
         };
 
-        let handshake = initialize(
-            &server.handle,
-            &self.client_name,
-            &self.client_version,
-            &self.opt_out,
-        )
-        .instrument(span)
-        .await;
+        let handshake = initialize(&server.handle, initialize_params)
+            .instrument(span)
+            .await;
         match handshake {
             Ok(info) => {
                 server.info = info;
@@ -1255,16 +1792,192 @@ impl<'a> AppServerBuilder<'a> {
     }
 }
 
-async fn initialize(
-    handle: &AppServerHandle,
-    name: &str,
-    version: &str,
-    opt_out: &[String],
-) -> Result<ServerInfo> {
-    let mut params = json!({ "clientInfo": { "name": name, "version": version } });
-    if !opt_out.is_empty() {
-        params["capabilities"] = json!({ "optOutNotificationMethods": opt_out });
+#[cfg(unix)]
+impl AppServerBuilder<'_> {
+    async fn start_unix(self, socket: PathBuf, params: Value) -> Result<AppServer> {
+        let codex = self.codex;
+        let span = tracing::info_span!("codex.app_server", transport = "unix");
+        let outcome = SpanOutcome::start(span.clone());
+        let max = match (self.limits.frame_bytes, codex.output_limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        // Both aggregate-message and fragment limits are needed: a peer can
+        // split a large message across individually small WebSocket frames.
+        let config = WebSocketConfig::default()
+            .max_frame_size(max)
+            .max_message_size(max)
+            .write_buffer_size(0);
+        let connect = async {
+            let stream = tokio::net::UnixStream::connect(&socket)
+                .await
+                .map_err(|source| Error::Io {
+                    message: "failed to connect to app-server Unix socket".into(),
+                    source,
+                    working_dir: codex.working_dir.clone(),
+                })?;
+            let (stream, _) = tokio_tungstenite::client_async_with_config(
+                "ws://localhost/",
+                stream,
+                Some(config),
+            )
+            .await
+            .map_err(|error| Error::AppServerProtocol {
+                message: format!("app-server WebSocket handshake failed: {error}"),
+            })?;
+            Ok::<_, Error>(stream)
+        };
+        let stream = if let Some(limit) = codex.timeout {
+            tokio::time::timeout(limit, connect)
+                .await
+                .map_err(|_| Error::Timeout {
+                    timeout_seconds: limit.as_secs(),
+                })??
+        } else {
+            connect.await?
+        };
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel();
+        let mut state = Shared::new(events_tx, None, self.limits, self.transport.process_name());
+        state.newline_delimited = false;
+        state.stderr_done.store(true, Ordering::Release);
+        let shared = Arc::new(state);
+        let task = tokio::spawn(socket_io(
+            stream,
+            writer_rx,
+            Arc::clone(&shared),
+            codex.output_limit,
+            codex.termination_grace,
+        ));
+        // Construct the owner before awaiting initialize: cancelling start()
+        // must abort its I/O task even if cloned internal state survives.
+        let mut server = AppServer {
+            handle: AppServerHandle {
+                shared,
+                writer: writer_tx,
+                timeout: codex.timeout,
+            },
+            events: events_rx,
+            finished: false,
+            child: None,
+            tasks: vec![task.abort_handle()],
+            group: GroupKillGuard::new(None, codex.termination_signal),
+            outcome,
+            termination_grace: codex.termination_grace,
+            working_dir: codex.working_dir.clone(),
+            command: String::new(),
+            info: ServerInfo::default(),
+            transport: self.transport,
+        };
+        match initialize(&server.handle, params).instrument(span).await {
+            Ok(info) => {
+                server.info = info;
+                Ok(server)
+            }
+            Err(error) => Err(server.abandon(error).await),
+        }
     }
+}
+
+#[cfg(unix)]
+async fn socket_io(
+    stream: tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+    mut lines: mpsc::UnboundedReceiver<Outgoing>,
+    shared: Arc<Shared>,
+    output_limit: Option<usize>,
+    close_grace: Duration,
+) {
+    let (mut sink, mut source) = stream.split();
+    let acknowledge_close = AtomicBool::new(false);
+    let read = async {
+        let mut captured = 0usize;
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = shared.wait_closed() => return,
+                next = source.next() => next,
+            };
+            let reason = match next {
+                Some(Ok(WsMessage::Text(text))) => {
+                    captured = captured.saturating_add(text.len());
+                    if let Some(limit) = output_limit
+                        && captured > limit
+                    {
+                        Some(Closed::OutputLimit { limit_bytes: limit })
+                    } else {
+                        route_bytes(&text, text.len(), &shared).err()
+                    }
+                }
+                // Tungstenite handles pong and close replies; reading keeps
+                // those control frames progressing independently of events.
+                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => None,
+                Some(Ok(WsMessage::Close(_))) => {
+                    acknowledge_close.store(true, Ordering::Release);
+                    Some(Closed::Eof)
+                }
+                None => Some(Closed::Eof),
+                Some(Ok(_)) => Some(Closed::Broken(
+                    "app-server sent a non-text WebSocket message".into(),
+                )),
+                Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(_))) => {
+                    if let Some(limit) = output_limit
+                        && shared.frame_bytes.is_none_or(|frame| limit <= frame)
+                    {
+                        Some(Closed::OutputLimit { limit_bytes: limit })
+                    } else if let Some(max) = shared.frame_bytes {
+                        Some(Closed::Limit {
+                            limit: AppServerLimit::FrameBytes,
+                            max,
+                        })
+                    } else {
+                        Some(Closed::Broken("WebSocket capacity exceeded".into()))
+                    }
+                }
+                Some(Err(error)) => Some(Closed::Broken(format!(
+                    "app-server WebSocket failed: {error}"
+                ))),
+            };
+            if let Some(reason) = reason {
+                shared.fail(reason);
+                return;
+            }
+        }
+    };
+    let write = async {
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = shared.wait_closed() => break,
+                next = lines.recv() => next,
+            };
+            let Some(Outgoing::Line(line)) = next else {
+                break;
+            };
+            let text = String::from_utf8(line.bytes.clone()).expect("serialized JSON is UTF-8");
+            let result = tokio::select! {
+                biased;
+                () = shared.wait_closed() => break,
+                result = sink.send(WsMessage::Text(text.into())) => result,
+            };
+            if let Err(error) = result {
+                shared.fail(Closed::Broken(format!(
+                    "failed to write app-server WebSocket: {error}"
+                )));
+                break;
+            }
+        }
+        if acknowledge_close.load(Ordering::Acquire) {
+            // Reading Close queues the reply inside tungstenite. Waiters have
+            // already failed; bound the remaining protocol cleanup separately.
+            let _ = tokio::time::timeout(close_grace, sink.flush()).await;
+        }
+    };
+    // Neither half depends on the application draining the event queue. On
+    // failure or owner closure both futures wake and release the socket.
+    tokio::join!(read, write);
+}
+
+async fn initialize(handle: &AppServerHandle, params: Value) -> Result<ServerInfo> {
     let result = handle.request("initialize", params).await?;
     let info = serde_json::from_value(result).map_err(|e| Error::AppServerProtocol {
         message: format!("initialize returned an unexpected response: {e}"),
@@ -1278,14 +1991,16 @@ async fn initialize(
 struct KillTarget {
     pid: Option<u32>,
     group: bool,
+    #[cfg(windows)]
+    handle: Option<usize>,
 }
 
 impl KillTarget {
     /// Stop the server now. The stream is unusable and nothing will read what
     /// the server writes next, so leaving it running would only fill the pipe.
     ///
-    /// Unix only: there is nothing to signal elsewhere, where
-    /// [`AppServer::next_message`] kills the child when it returns the error.
+    /// Unix signals the owned group or child. Windows terminates the owned
+    /// process using its still-valid native handle.
     fn signal(self) {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
@@ -1300,8 +2015,15 @@ impl KillTarget {
                 }
             }
         }
-        // Read on every platform, so the fields are not dead code where there
-        // is no signal to send.
+        #[cfg(windows)]
+        if let Some(handle) = self.handle {
+            // SAFETY: this is the owned child's handle, not a reopened PID.
+            // The Shared kill lock is held across this call and revoked before
+            // reaping or dropping the child can invalidate the handle.
+            unsafe {
+                windows_sys::Win32::System::Threading::TerminateProcess(handle as _, 1);
+            }
+        }
         #[cfg(not(unix))]
         let _ = (self.pid, self.group);
     }
@@ -1318,11 +2040,11 @@ async fn read_stdout(
     let mut reader = BufReader::new(stdout);
     let mut captured = 0usize;
     let reason = loop {
-        let line = match crate::streaming::read_bounded_line(
+        let line = match read_frame(
             &mut reader,
             &mut captured,
             output_limit,
-            OutputStream::Stdout,
+            shared.frame_bytes,
             &working_dir,
         )
         .await
@@ -1332,15 +2054,12 @@ async fn read_stdout(
                 shared.stderr_settled().await;
                 break Closed::Eof;
             }
-            Err(Error::OutputLimitExceeded { limit_bytes, .. }) => {
-                shared.fire_kill();
-                break Closed::OutputLimit { limit_bytes };
-            }
-            Err(error) => {
-                shared.fire_kill();
-                break Closed::Broken(error.to_string());
+            Err(reason) => {
+                shared.fatal(reason.clone());
+                break reason;
             }
         };
+        let (line, wire_bytes) = line;
         if !line.trim_start().starts_with('{') {
             debug!(
                 bytes = line.len(),
@@ -1348,16 +2067,83 @@ async fn read_stdout(
             );
             continue;
         }
-        if let Err(reason) = route(&line, &shared) {
-            shared.fire_kill();
+        if let Err(reason) = route_bytes(&line, wire_bytes, &shared) {
+            shared.fatal(reason.clone());
             break reason;
         }
     };
     shared.fail(reason);
 }
 
+/// Read one line, as [`crate::streaming`] reads one, but also bounded by
+/// `frame_limit`. The check comes before each chunk is copied, so a line that
+/// never ends is rejected having buffered at most the limit.
+async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    captured: &mut usize,
+    output_limit: Option<usize>,
+    frame_limit: Option<usize>,
+    working_dir: &Option<PathBuf>,
+) -> std::result::Result<Option<(String, usize)>, Closed> {
+    let mut line = Vec::new();
+    let mut wire_bytes = 0;
+    loop {
+        let available = reader.fill_buf().await.map_err(|source| {
+            let error = Error::Io {
+                message: format!("failed to read stdout line: {source}"),
+                source,
+                working_dir: working_dir.clone(),
+            };
+            Closed::Broken(error.to_string())
+        })?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if let Some(limit) = output_limit
+            && captured.saturating_add(take) > limit
+        {
+            return Err(Closed::OutputLimit { limit_bytes: limit });
+        }
+        if let Some(max) = frame_limit
+            && line.len().saturating_add(take) > max
+        {
+            return Err(Closed::Limit {
+                limit: AppServerLimit::FrameBytes,
+                max,
+            });
+        }
+        line.extend_from_slice(&available[..take]);
+        wire_bytes += take;
+        *captured = captured.saturating_add(take);
+        let complete = line.last() == Some(&b'\n');
+        reader.consume(take);
+        if complete {
+            line.pop();
+            break;
+        }
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line)
+        .map(|line| Some((line, wire_bytes)))
+        .map_err(|_| Closed::Broken("io error: failed to decode stdout line".into()))
+}
+
 /// Classify one line from the server and deliver it.
+#[cfg(all(test, unix))]
 fn route(line: &str, shared: &Shared) -> std::result::Result<(), Closed> {
+    route_bytes(line, line.len() + 1, shared)
+}
+
+fn route_bytes(line: &str, bytes: usize, shared: &Shared) -> std::result::Result<(), Closed> {
     let value: Value = serde_json::from_str(line).map_err(|e| {
         let head: String = line.chars().take(120).collect();
         Closed::Broken(format!("codex app-server sent invalid JSON ({e}): {head}"))
@@ -1378,18 +2164,14 @@ fn route(line: &str, shared: &Shared) -> std::result::Result<(), Closed> {
                 method: method.to_string(),
                 params: value.get("params").cloned().unwrap_or(Value::Null),
             };
-            let _ = shared
-                .events
-                .send(Event::Message(ServerMessage::Request(request)));
+            shared.deliver(ServerMessage::Request(request), bytes)?;
         }
         (Some(method), None) => {
             let notification = Notification {
                 method: method.to_string(),
                 params: value.get("params").cloned().unwrap_or(Value::Null),
             };
-            let _ = shared
-                .events
-                .send(Event::Message(ServerMessage::Notification(notification)));
+            shared.deliver(ServerMessage::Notification(notification), bytes)?;
         }
         (None, Some(id)) if value.get("result").is_some() || value.get("error").is_some() => {
             deliver_answer(&value, id, shared);
@@ -1472,34 +2254,36 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
     mut lines: mpsc::UnboundedReceiver<Outgoing>,
     shared: Arc<Shared>,
 ) {
-    while let Some(outgoing) = lines.recv().await {
-        match outgoing {
-            Outgoing::Line(line) => {
-                let written = async {
-                    stdin.write_all(&line).await?;
-                    stdin.flush().await
-                }
-                .await;
-                if let Err(error) = written {
-                    if error.kind() == std::io::ErrorKind::BrokenPipe {
-                        // The server closed its input, which it does by
-                        // exiting. Its output closes with it, and the reader
-                        // reports that together with the server's stderr and,
-                        // at startup, its exit status. Failing the session
-                        // here first would hide all of that behind "broken
-                        // pipe", and which one wins is a race.
-                        debug!("codex app-server closed its stdin");
-                    } else {
-                        shared.fail(Closed::Broken(format!(
-                            "failed to write to codex app-server stdin: {error}"
-                        )));
-                    }
-                    break;
-                }
+    loop {
+        let outgoing = tokio::select! {
+            biased;
+            () = shared.wait_closed() => break,
+            outgoing = lines.recv() => outgoing,
+        };
+        let Some(Outgoing::Line(line)) = outgoing else {
+            break;
+        };
+        let written = tokio::select! {
+            biased;
+            () = shared.wait_closed() => break,
+            result = async { stdin.write_all(&line.bytes).await?; stdin.flush().await } => result,
+        };
+        if let Err(error) = written {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                // Preserve the reader's native startup-error classification.
+                debug!("codex app-server closed its stdin");
+            } else {
+                shared.fatal(Closed::Broken(format!(
+                    "failed to write to codex app-server stdin: {error}"
+                )));
             }
-            Outgoing::Close => break,
+            break;
         }
     }
+    // Dropping the receiver also drops each queued reservation.
+    lines.close();
+    while lines.try_recv().is_ok() {}
+
     // Dropping stdin closes the pipe, which the server treats as the end of
     // its input.
 }
@@ -1513,24 +2297,28 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
 ///
 /// Dropping the value kills the server's process group without waiting; use
 /// [`shutdown`](Self::shutdown) or [`terminate`](Self::terminate) to stop it
-/// and wait.
+/// and wait. An attached connection closes only its socket; the shared server
+/// and its turns remain the server owner's responsibility.
 pub struct AppServer {
     handle: AppServerHandle,
     events: mpsc::UnboundedReceiver<Event>,
     finished: bool,
-    child: Child,
+    child: Option<Child>,
+    tasks: Vec<tokio::task::AbortHandle>,
     group: GroupKillGuard,
     outcome: SpanOutcome,
     termination_grace: Duration,
     working_dir: Option<PathBuf>,
     command: String,
     info: ServerInfo,
+    transport: AppServerTransport,
 }
 
 impl std::fmt::Debug for AppServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppServer")
-            .field("pid", &self.child.id())
+            .field("pid", &self.pid())
+            .field("transport", &self.transport)
             .field("info", &self.info)
             .finish_non_exhaustive()
     }
@@ -1553,6 +2341,9 @@ impl AppServer {
             client_name: "codex-wrapper".to_string(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             opt_out: Vec::new(),
+            capabilities: Map::new(),
+            limits: Limits::default(),
+            transport: AppServerTransport::Stdio,
         }
     }
 
@@ -1562,10 +2353,17 @@ impl AppServer {
         &self.info
     }
 
-    /// The server process's id, while it is running.
+    /// How this client reaches the server, and whether it owns it.
+    #[must_use]
+    pub fn transport(&self) -> &AppServerTransport {
+        &self.transport
+    }
+
+    /// The owned server's process ID while running. `None` for an attached
+    /// connection, which neither starts nor owns a process.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.child.as_ref().and_then(Child::id)
     }
 
     /// A cloneable handle for sending requests from other tasks.
@@ -1584,15 +2382,19 @@ impl AppServer {
     ///
     /// # Errors
     ///
-    /// [`Error::OutputLimitExceeded`] or [`Error::AppServerProtocol`] when the
-    /// stream became unusable. The server has been killed by then. The error
+    /// [`Error::OutputLimitExceeded`], [`Error::AppServerLimitExceeded`], or
+    /// [`Error::AppServerProtocol`] when the stream became unusable. The owned
+    /// process has been killed by then. The error
     /// is returned once; later calls return `Ok(None)`.
     pub async fn next_message(&mut self) -> Result<Option<ServerMessage>> {
         if self.finished {
             return Ok(None);
         }
         match self.events.recv().await {
-            Some(Event::Message(message)) => Ok(Some(message)),
+            Some(Event::Message(message, bytes)) => {
+                self.handle.shared.inbound.release(bytes);
+                Ok(Some(message))
+            }
             Some(Event::Closed(reason)) => {
                 self.finished = true;
                 match reason {
@@ -1601,7 +2403,9 @@ impl AppServer {
                         // Already killed on Unix, where the reader signals
                         // the group as soon as the stream fails. This covers
                         // the platforms that cannot.
-                        let _ = self.child.start_kill();
+                        if let Some(child) = &mut self.child {
+                            let _ = child.start_kill();
+                        }
                         Err(self.handle.shared.error_for(&reason, None))
                     }
                 }
@@ -1618,7 +2422,8 @@ impl AppServer {
     /// Closes the server's stdin and waits up to the client's termination
     /// grace for it to exit on its own. If it does not, this falls back to
     /// [`terminate`](Self::terminate) and returns `Ok`, since the caller asked
-    /// for the end.
+    /// for the end. An attached connection closes its local socket immediately;
+    /// the shared server keeps running. Pending requests fail on both paths.
     ///
     /// # Errors
     ///
@@ -1629,8 +2434,17 @@ impl AppServer {
         // The child is about to be reaped, after which its pid is not ours to
         // signal.
         self.handle.shared.revoke_kill();
+        // Stop admission now, but let owned stdio flush already accepted
+        // messages before Close. The termination grace bounds a stalled writer.
+        self.handle
+            .shared
+            .end(Closed::Terminated, self.child.is_none());
+        let Some(child) = &mut self.child else {
+            self.outcome.settle("ok", None);
+            return Ok(());
+        };
         let _ = self.handle.writer.send(Outgoing::Close);
-        match tokio::time::timeout(self.termination_grace, self.child.wait()).await {
+        match tokio::time::timeout(self.termination_grace, child.wait()).await {
             Ok(Ok(status)) => {
                 self.group.disarm();
                 self.handle.shared.stderr_settled().await;
@@ -1675,8 +2489,12 @@ impl AppServer {
     pub async fn terminate(mut self) -> Result<()> {
         self.handle.shared.revoke_kill();
         self.handle.shared.fail(Closed::Terminated);
+        let Some(child) = &mut self.child else {
+            self.outcome.settle("cancelled", None);
+            return Ok(());
+        };
         let result = crate::exec::terminate_and_reap(
-            &mut self.child,
+            child,
             &mut self.group,
             self.termination_grace,
             self.working_dir.as_deref(),
@@ -1694,6 +2512,11 @@ impl AppServer {
         } else {
             "failed"
         };
+        let Some(child) = &mut self.child else {
+            self.handle.shared.fail(Closed::Terminated);
+            self.outcome.settle(outcome, None);
+            return error;
+        };
         // Only a server that closed its own output has failed by itself. When
         // the reader gave up on the stream it killed the child, so the exit
         // status says nothing and the error already says what happened.
@@ -1703,11 +2526,11 @@ impl AppServer {
         // moment to finish exiting. Otherwise only look, so a server that is
         // merely silent is not waited on.
         let ended = if by_server {
-            tokio::time::timeout(STARTUP_EXIT_WAIT, self.child.wait())
+            tokio::time::timeout(STARTUP_EXIT_WAIT, child.wait())
                 .await
                 .ok()
         } else {
-            self.child.try_wait().transpose()
+            child.try_wait().transpose()
         };
         if let Some(Ok(status)) = ended {
             // Reaped: nothing is left to terminate, and its pid is no longer
@@ -1733,7 +2556,7 @@ impl AppServer {
 
         self.handle.shared.fail(Closed::Terminated);
         let _ = crate::exec::terminate_and_reap(
-            &mut self.child,
+            child,
             &mut self.group,
             self.termination_grace,
             self.working_dir.as_deref(),
@@ -1749,6 +2572,16 @@ impl Drop for AppServer {
         // The fields that follow kill the group and let tokio reap the child.
         // After that the reader task must not signal the pid.
         self.handle.shared.revoke_kill();
+        self.handle.shared.fail(Closed::Terminated);
+        for task in &self.tasks {
+            task.abort();
+        }
+        self.events.close();
+        while let Ok(event) = self.events.try_recv() {
+            if let Event::Message(_, bytes) = event {
+                self.handle.shared.inbound.release(bytes);
+            }
+        }
     }
 }
 
@@ -2311,6 +3144,8 @@ mod tests {
                 pid: Some(live.id()),
                 group: false,
             }),
+            Limits::default(),
+            "test",
         );
         shared.fire_kill();
         assert!(
@@ -2325,6 +3160,8 @@ mod tests {
                 pid: Some(revoked.id()),
                 group: false,
             }),
+            Limits::default(),
+            "test",
         );
         shared.revoke_kill();
         shared.fire_kill();
@@ -2425,9 +3262,14 @@ mod tests {
         drop(server_end);
 
         let (events, _received) = mpsc::unbounded_channel();
-        let shared = Arc::new(Shared::new(events, None));
+        let shared = Arc::new(Shared::new(events, None, Limits::default(), "test"));
         let (lines, receiver) = mpsc::unbounded_channel();
-        lines.send(Outgoing::Line(b"{}\n".to_vec())).unwrap();
+        lines
+            .send(Outgoing::Line(ReservedLine {
+                bytes: b"{}\n".to_vec(),
+                budget: Arc::clone(&shared.outbound),
+            }))
+            .unwrap();
 
         // Ends by itself when the write fails. If it did not fail, `lines` is
         // still open and this would wait forever, so bound it.
@@ -2965,7 +3807,7 @@ mod tests {
     #[test]
     fn a_line_that_is_not_a_message_is_ignored_and_bad_json_is_fatal() {
         let (events, mut received) = mpsc::unbounded_channel();
-        let shared = Shared::new(events, None);
+        let shared = Shared::new(events, None, Limits::default(), "test");
         assert!(route(r#"{"unrelated":true}"#, &shared).is_ok());
         assert!(
             route(
@@ -2980,16 +3822,1071 @@ mod tests {
         assert!(route(r#"{"method":"a/b","params":{"k":1}}"#, &shared).is_ok());
         assert!(matches!(
             received.try_recv(),
-            Ok(Event::Message(ServerMessage::Notification(n))) if n.method == "a/b"
+            Ok(Event::Message(ServerMessage::Notification(n), _)) if n.method == "a/b"
         ));
         assert!(route(r#"{"method":"a/b","id":"s"}"#, &shared).is_ok());
         assert!(matches!(
             received.try_recv(),
-            Ok(Event::Message(ServerMessage::Request(r))) if r.id == RequestId::String("s".into())
+            Ok(Event::Message(ServerMessage::Request(r), _)) if r.id == RequestId::String("s".into())
         ));
         assert!(matches!(
             route(r#"{"method": oops"#, &shared),
             Err(Closed::Broken(_))
         ));
     }
+
+    fn temp_log(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "codex-wrapper-{}-app-server-{label}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn wire_lines(log: &std::path::Path) -> Vec<Value> {
+        let lines = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every client line is JSON"))
+            .collect();
+        let _ = std::fs::remove_file(log);
+        lines
+    }
+
+    fn offline() -> Codex {
+        // Never spawned: these settings are rejected first, and if one were
+        // not, spawning this path would fail with a different error.
+        Codex::builder()
+            .binary("/nonexistent/codex-wrapper-test-binary")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn initialize_carries_no_capabilities_unless_one_is_set() {
+        let codex = offline();
+        let params = AppServer::builder(&codex)
+            .client_info("probe", "1")
+            .initialize_params()
+            .unwrap();
+        assert_eq!(
+            params,
+            json!({ "clientInfo": { "name": "probe", "version": "1" } })
+        );
+    }
+
+    #[test]
+    fn capabilities_are_kept_and_both_opt_out_sources_are_combined_once_each() {
+        let codex = offline();
+        let params = AppServer::builder(&codex)
+            .client_info("probe", "1")
+            .opt_out_notification("item/agentMessage/delta")
+            .experimental_api(true)
+            .capability(
+                "optOutNotificationMethods",
+                json!(["thread/status/changed", "item/agentMessage/delta"]),
+            )
+            .capability("someFutureCapability", json!({ "k": [1, 2] }))
+            .opt_out_notification("mcpServer/startupStatus/updated")
+            .opt_out_notification("thread/status/changed")
+            .initialize_params()
+            .unwrap();
+        assert_eq!(
+            params["capabilities"],
+            json!({
+                "experimentalApi": true,
+                "someFutureCapability": { "k": [1, 2] },
+                "optOutNotificationMethods": [
+                    "thread/status/changed",
+                    "item/agentMessage/delta",
+                    "mcpServer/startupStatus/updated"
+                ]
+            })
+        );
+
+        // A null list is sent as given, or replaced by the builder's list.
+        let null = AppServer::builder(&codex).capability(OPT_OUT_KEY, Value::Null);
+        assert_eq!(
+            null.initialize_params().unwrap()["capabilities"],
+            json!({ "optOutNotificationMethods": null })
+        );
+        let merged = null.opt_out_notification("a/b");
+        assert_eq!(
+            merged.initialize_params().unwrap()["capabilities"],
+            json!({ "optOutNotificationMethods": ["a/b"] })
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_settings_are_rejected_before_anything_is_spawned() {
+        let codex = offline();
+        for value in [json!("item/agentMessage/delta"), json!([1]), json!({})] {
+            let error = AppServer::builder(&codex)
+                .capability(OPT_OUT_KEY, value.clone())
+                .start()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::AppServerConfig { message } if message.contains(OPT_OUT_KEY)),
+                "{value}: {error:?}"
+            );
+        }
+        let error = AppServer::builder(&codex)
+            .connect_unix("")
+            .start()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::AppServerConfig { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn the_first_handshake_sends_the_combined_capabilities() {
+        let log = temp_log("capabilities");
+        let codex = fake("turn")
+            .env("FAKE_APP_SERVER_LOG", log.to_str().unwrap())
+            .build()
+            .unwrap();
+        let server = AppServer::builder(&codex)
+            .client_info("probe", "1.2.3")
+            .experimental_api(true)
+            .capability(OPT_OUT_KEY, json!(["thread/status/changed"]))
+            .opt_out_notification("item/agentMessage/delta")
+            .start()
+            .await
+            .unwrap();
+        server.shutdown().await.unwrap();
+        let lines = wire_lines(&log);
+        assert_eq!(
+            lines[0],
+            json!({
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": { "name": "probe", "version": "1.2.3" },
+                    "capabilities": {
+                        "experimentalApi": true,
+                        "optOutNotificationMethods": [
+                            "thread/status/changed",
+                            "item/agentMessage/delta"
+                        ]
+                    }
+                }
+            })
+        );
+        assert_eq!(lines[1], json!({ "method": "initialized" }));
+    }
+
+    #[test]
+    fn a_budget_counts_messages_and_bytes_and_frees_them_on_release() {
+        let budget = Budget::new(
+            Some(2),
+            Some(10),
+            AppServerLimit::QueuedMessages,
+            AppServerLimit::QueuedBytes,
+        );
+        budget.reserve(4).unwrap();
+        budget.reserve(4).unwrap();
+        assert!(matches!(
+            budget.reserve(1),
+            Err(Closed::Limit {
+                limit: AppServerLimit::QueuedMessages,
+                max: 2
+            })
+        ));
+        budget.release(4);
+        assert!(matches!(
+            budget.reserve(7),
+            Err(Closed::Limit {
+                limit: AppServerLimit::QueuedBytes,
+                max: 10
+            })
+        ));
+        // A refused reservation counts nothing.
+        assert_eq!(budget.used(), (1, 4));
+        budget.reserve(6).unwrap();
+        assert_eq!(budget.used(), (2, 10));
+
+        let unlimited = Budget::new(
+            None,
+            None,
+            AppServerLimit::QueuedMessages,
+            AppServerLimit::QueuedBytes,
+        );
+        for _ in 0..1000 {
+            unlimited.reserve(usize::MAX / 2).unwrap();
+        }
+    }
+
+    #[test]
+    fn queued_events_count_until_read_and_answers_never_wait_behind_them() {
+        let line = r#"{"method":"a/b"}"#;
+        let cost = line.len() + 1;
+        let (events, mut received) = mpsc::unbounded_channel();
+        let limits = Limits {
+            queued_messages: Some(2),
+            ..Limits::default()
+        };
+        let shared = Shared::new(events, None, limits, "test");
+        route(line, &shared).unwrap();
+        route(line, &shared).unwrap();
+        assert_eq!(shared.inbound.used(), (2, 2 * cost));
+
+        // The queue is full, and an answer still reaches its request.
+        let (waiter, mut answer) = oneshot::channel();
+        locked(&shared.state).pending.insert(7, waiter);
+        route(r#"{"id":7,"result":{"ok":true}}"#, &shared).unwrap();
+        assert!(matches!(answer.try_recv(), Ok(Reply::Result(v)) if v["ok"] == true));
+
+        assert!(matches!(
+            route(line, &shared),
+            Err(Closed::Limit {
+                limit: AppServerLimit::QueuedMessages,
+                max: 2
+            })
+        ));
+        // Reading one, as `next_message` does, makes room for one more.
+        let Ok(Event::Message(_, bytes)) = received.try_recv() else {
+            panic!("a message was queued");
+        };
+        assert_eq!(bytes, cost);
+        shared.inbound.release(bytes);
+        route(line, &shared).unwrap();
+
+        let (events, _received) = mpsc::unbounded_channel();
+        let limits = Limits {
+            queued_bytes: Some(2 * cost),
+            ..Limits::default()
+        };
+        let shared = Shared::new(events, None, limits, "test");
+        route(line, &shared).unwrap();
+        route(line, &shared).unwrap();
+        assert!(matches!(
+            route(line, &shared),
+            Err(Closed::Limit {
+                limit: AppServerLimit::QueuedBytes,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_line_longer_than_the_frame_limit_is_rejected_without_buffering_it() {
+        let read = |input: &'static [u8], max: usize| async move {
+            let mut reader = BufReader::new(input);
+            read_frame(&mut reader, &mut 0, None, Some(max), &None).await
+        };
+        assert_eq!(
+            read(b"abc\n", 4)
+                .await
+                .unwrap()
+                .as_ref()
+                .map(|(line, _)| line.as_str()),
+            Some("abc")
+        );
+        assert!(matches!(
+            read(b"abc\n", 3).await,
+            Err(Closed::Limit {
+                limit: AppServerLimit::FrameBytes,
+                max: 3
+            })
+        ));
+
+        // A line that never ends: bounded by the limit, not the input.
+        let mut endless = BufReader::new(tokio::io::repeat(b'x'));
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_frame(&mut endless, &mut 0, None, Some(64 * 1024), &None),
+        )
+        .await
+        .expect("an unterminated line was read without bound");
+        assert!(matches!(
+            result,
+            Err(Closed::Limit {
+                limit: AppServerLimit::FrameBytes,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_frame_limit_ends_the_session_and_kills_the_server() {
+        let pid = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&pid);
+        let codex = fake("flood")
+            .on_spawn(Arc::new(move |info| {
+                *observed.lock().unwrap() = Some(info.pid);
+            }))
+            .build()
+            .unwrap();
+        let mut server = AppServer::builder(&codex)
+            .max_frame_bytes(1024)
+            .start()
+            .await
+            .unwrap();
+        let (_, error) = read_until_error(&mut server).await;
+        assert!(
+            matches!(
+                error,
+                Error::AppServerLimitExceeded {
+                    limit: AppServerLimit::FrameBytes,
+                    max: 1024
+                }
+            ),
+            "{error:?}"
+        );
+        let pid = pid.lock().unwrap().expect("the server was spawned");
+        assert!(wait_until_gone(pid).await, "the server ({pid}) survived");
+    }
+
+    async fn wait_until_closed(server: &AppServer) {
+        for _ in 0..2000 {
+            if server.handle.shared.closed_reason().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the session never failed");
+    }
+
+    async fn read_until_error(server: &mut AppServer) -> (Vec<ServerMessage>, Error) {
+        let mut seen = Vec::new();
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(10), server.next_message())
+                .await
+                .expect("the stream should end with an error");
+            match next {
+                Ok(Some(message)) => seen.push(message),
+                Ok(None) => panic!("the stream ended without an error: {:?}", methods(&seen)),
+                Err(error) => return (seen, error),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn answers_pass_a_burst_of_unread_events_and_reading_them_frees_the_queue() {
+        // remoteControl/status/changed, 30 status changes, thread/started.
+        let codex = fake("burst")
+            .env("FAKE_APP_SERVER_BURST", "30")
+            .build()
+            .unwrap();
+        let mut server = AppServer::builder(&codex)
+            .max_queued_messages(32)
+            .start()
+            .await
+            .unwrap();
+        // Answered while the burst sits unread in the queue.
+        server.thread_start(ThreadStartParams::new()).await.unwrap();
+        for _ in 0..32 {
+            tokio::time::timeout(Duration::from_secs(10), server.next_message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(server.handle.shared.inbound.used(), (0, 0));
+        // Another 31 fit only because the first 32 were read.
+        server.thread_start(ThreadStartParams::new()).await.unwrap();
+        for _ in 0..31 {
+            tokio::time::timeout(Duration::from_secs(10), server.next_message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_queue_overflow_fails_the_request_waiting_behind_it() {
+        let codex = fake("burst")
+            .env("FAKE_APP_SERVER_BURST", "30")
+            .build()
+            .unwrap();
+        let mut server = AppServer::builder(&codex)
+            .max_queued_messages(5)
+            .start()
+            .await
+            .unwrap();
+        let error = server
+            .thread_start(ThreadStartParams::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::AppServerLimitExceeded {
+                    limit: AppServerLimit::QueuedMessages,
+                    max: 5
+                }
+            ),
+            "{error:?}"
+        );
+        let (seen, error) = read_until_error(&mut server).await;
+        assert_eq!(seen.len(), 5);
+        assert!(matches!(error, Error::AppServerLimitExceeded { .. }));
+        server.terminate().await.unwrap();
+    }
+
+    /// Neither an approval request nor a turn's terminal event is dropped to
+    /// stay under the limit: the one that does not fit ends the session, and
+    /// the caller sees the error after the messages that did fit.
+    #[tokio::test]
+    async fn approvals_and_terminal_events_that_do_not_fit_fail_the_session() {
+        // Five messages precede the approval request, ten end the turn.
+        for (mode, max, last_fitting) in [
+            ("approval", 5, "item/started"),
+            ("turn", 9, "thread/status/changed"),
+        ] {
+            let codex = fake(mode).build().unwrap();
+            let mut server = AppServer::builder(&codex)
+                .max_queued_messages(max)
+                .start()
+                .await
+                .unwrap();
+            let thread = server.thread_start(ThreadStartParams::new()).await.unwrap();
+            server
+                .turn_start(TurnStartParams::text(&thread.id, "go"))
+                .await
+                .unwrap();
+            // Read nothing until the overflow, so it happens where expected.
+            wait_until_closed(&server).await;
+
+            let (seen, error) = read_until_error(&mut server).await;
+            assert!(
+                matches!(
+                    error,
+                    Error::AppServerLimitExceeded {
+                        limit: AppServerLimit::QueuedMessages,
+                        max: m
+                    } if m == max
+                ),
+                "{mode}: {error:?}"
+            );
+            assert_eq!(seen.len(), max, "{mode}");
+            assert_eq!(methods(&seen).last(), Some(&last_fitting), "{mode}");
+            assert!(
+                !seen.iter().any(|m| matches!(m, ServerMessage::Request(_))),
+                "{mode}"
+            );
+            assert!(server.next_message().await.unwrap().is_none());
+
+            // Nothing more is accepted.
+            let again = server.request("thread/start", json!({})).await.unwrap_err();
+            assert!(
+                matches!(again, Error::AppServerLimitExceeded { .. }),
+                "{again:?}"
+            );
+            assert!(server.respond(RequestId::Number(0), json!({})).is_err());
+            server.terminate().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_being_written_holds_its_place_until_the_write_finishes() {
+        let (stdin, mut server_end) = tokio::io::duplex(8);
+        let line = notification_line("a/b", &json!({ "pad": "x".repeat(10) })).unwrap();
+        let cost = line.len();
+        let limits = Limits {
+            // Room for one line, not two.
+            writer_bytes: Some(cost + cost / 2),
+            ..Limits::default()
+        };
+        let (events, _received) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared::new(events, None, limits, "test"));
+        let (writer, lines) = mpsc::unbounded_channel();
+        let task = tokio::spawn(write_stdin(stdin, lines, Arc::clone(&shared)));
+        let handle = AppServerHandle {
+            shared: Arc::clone(&shared),
+            writer,
+            timeout: None,
+        };
+
+        handle
+            .notify("a/b", json!({ "pad": "x".repeat(10) }))
+            .unwrap();
+        // The writer has taken the line and is stuck: the pipe holds 8 bytes.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(shared.outbound.used(), (1, cost));
+
+        let drained = |shared: Arc<Shared>| async move {
+            for _ in 0..500 {
+                if shared.outbound.used() == (0, 0) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!(
+                "a written line kept its place: {:?}",
+                shared.outbound.used()
+            );
+        };
+        let mut received = vec![0; cost];
+        server_end.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, line);
+        drained(Arc::clone(&shared)).await;
+        // Fits again now that the first line is written.
+        handle
+            .notify("a/b", json!({ "pad": "x".repeat(10) }))
+            .unwrap();
+        server_end.read_exact(&mut received).await.unwrap();
+        drained(Arc::clone(&shared)).await;
+
+        // Two at once do not fit while the writer is stuck on the first.
+        handle
+            .notify("a/b", json!({ "pad": "x".repeat(10) }))
+            .unwrap();
+        let error = handle
+            .notify("a/b", json!({ "pad": "x".repeat(10) }))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::AppServerLimitExceeded {
+                    limit: AppServerLimit::WriterQueueBytes,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        drop(handle);
+        drop(server_end);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the writer stopped")
+            .unwrap();
+        assert_eq!(shared.outbound.used(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_stops_reading_fails_the_session_at_the_writer_limit() {
+        let pid = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&pid);
+        let codex = fake("stops-reading")
+            .on_spawn(Arc::new(move |info| {
+                *observed.lock().unwrap() = Some(info.pid);
+            }))
+            .build()
+            .unwrap();
+        let limit = 256 * 1024;
+        let server = AppServer::builder(&codex)
+            .max_writer_queue_bytes(limit)
+            .start()
+            .await
+            .unwrap();
+        let handle = server.handle();
+        let waiting = tokio::spawn(async move { handle.request("thread/start", json!({})).await });
+
+        let pad = "x".repeat(4096);
+        let mut failure = None;
+        // Far more than a pipe and the limit hold together.
+        for _ in 0..4096 {
+            match server.notify("fixture/pad", json!({ "pad": pad })) {
+                // Let the writer fill the pipe, so the limit is reached with
+                // a write blocked rather than only by queueing.
+                Ok(()) => tokio::task::yield_now().await,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let error = failure.expect("the writer limit was never reached");
+        assert!(
+            matches!(
+                error,
+                Error::AppServerLimitExceeded {
+                    limit: AppServerLimit::WriterQueueBytes,
+                    max
+                } if max == limit
+            ),
+            "{error:?}"
+        );
+        let waited = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the waiting request was not settled")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(waited, Error::AppServerLimitExceeded { .. }),
+            "{waited:?}"
+        );
+        assert!(server.notify("fixture/pad", json!({})).is_err());
+
+        let pid = pid.lock().unwrap().expect("the server was spawned");
+        assert!(wait_until_gone(pid).await, "the server ({pid}) survived");
+        server.terminate().await.unwrap();
+    }
+    struct SocketFixture {
+        path: PathBuf,
+        listener: tokio::net::UnixListener,
+    }
+    impl SocketFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "cw-{}-{}.sock",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            Self { path, listener }
+        }
+        async fn accept(&self) -> tokio_tungstenite::WebSocketStream<tokio::net::UnixStream> {
+            let (stream, _) = self.listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let init: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(init["method"], "initialize");
+            assert_eq!(init["params"]["capabilities"]["experimentalApi"], true);
+            socket
+                .send(WsMessage::Text(
+                    json!({"id":init["id"],"result":{"userAgent":"fixture"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let initialized: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(initialized["method"], "initialized");
+            socket
+        }
+        fn builder<'a>(&self, codex: &'a Codex) -> AppServerBuilder<'a> {
+            AppServer::builder(codex)
+                .connect_unix(&self.path)
+                .experimental_api(true)
+        }
+    }
+    impl Drop for SocketFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_clients_own_no_process_and_teardown_is_connection_local() {
+        let fixture = SocketFixture::new();
+        let codex = Codex::builder()
+            .binary("/bin/echo")
+            .on_spawn(Arc::new(|_| panic!("attached mode must not spawn")))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let (client, peer) = tokio::join!(fixture.builder(&codex).start(), fixture.accept());
+        let client = client.unwrap();
+        let (other, mut other_peer) =
+            tokio::join!(fixture.builder(&codex).start(), fixture.accept());
+        let other = other.unwrap();
+        assert_eq!(client.pid(), None);
+        assert!(!client.transport().owns_server());
+        assert!(fixture.builder(&codex).args().is_empty());
+        assert!(fixture.builder(&codex).to_command_string().is_empty());
+        let handle = client.handle();
+        let pending = tokio::spawn(async move { handle.request("thread/list", Value::Null).await });
+        let mut peer = peer;
+        peer.next().await.unwrap().unwrap();
+        drop(client);
+        assert!(pending.await.unwrap().is_err());
+        tokio::time::timeout(Duration::from_secs(2), peer.next())
+            .await
+            .unwrap();
+        let answer = async {
+            let request: Value =
+                serde_json::from_str(other_peer.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            other_peer
+                .send(WsMessage::Text(
+                    json!({"id":request["id"],"result":{"data":[]}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(other.request("thread/list", Value::Null), answer);
+        assert_eq!(result.unwrap(), json!({"data":[]}));
+        other.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), other_peer.next())
+            .await
+            .unwrap();
+        // The listening endpoint is still usable after both owners disappear.
+        let (third, mut peer) = tokio::join!(fixture.builder(&codex).start(), fixture.accept());
+        third.unwrap().terminate().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), peer.next())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn attached_peer_loss_fails_pending_without_reading_events() {
+        let fixture = SocketFixture::new();
+        let codex = offline();
+        let (client, mut peer) = tokio::join!(fixture.builder(&codex).start(), fixture.accept());
+        let client = client.unwrap();
+        let handle = client.handle();
+        let pending = tokio::spawn(async move { handle.request("thread/list", Value::Null).await });
+        peer.next().await.unwrap().unwrap();
+        drop(peer);
+        let result = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(Error::AppServerProtocol { .. })));
+        assert!(client.notify("initialized", Value::Null).is_err());
+    }
+
+    #[tokio::test]
+    async fn attached_handshake_cancellation_closes_the_socket() {
+        let fixture = SocketFixture::new();
+        let socket = fixture.path.clone();
+        let task = tokio::spawn(async move {
+            let codex = offline();
+            AppServer::builder(&codex)
+                .connect_unix(socket)
+                .start()
+                .await
+        });
+        let (stream, _) = fixture.listener.accept().await.unwrap();
+        let mut peer = tokio_tungstenite::accept_async(stream).await.unwrap();
+        peer.next().await.unwrap().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), peer.next())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn attached_frames_queues_and_timeouts_fail_explicitly() {
+        for mode in ["frame", "queue", "timeout", "binary"] {
+            let fixture = SocketFixture::new();
+            let codex = Codex::builder()
+                .binary("/bin/echo")
+                .timeout(Duration::from_millis(500))
+                .build()
+                .unwrap();
+            let builder = fixture
+                .builder(&codex)
+                .max_frame_bytes(256)
+                .max_queued_messages(1);
+            let (client, mut peer) = tokio::join!(builder.start(), fixture.accept());
+            let mut client = client.unwrap();
+            let act = async {
+                let request: Value =
+                    serde_json::from_str(peer.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                match mode {
+                    "frame" => peer
+                        .send(WsMessage::Text("x".repeat(257).into()))
+                        .await
+                        .unwrap(),
+                    "binary" => peer
+                        .send(WsMessage::Binary(vec![0; 4].into()))
+                        .await
+                        .unwrap(),
+                    "queue" => {
+                        let event = WsMessage::Text(json!({"method":"thread/status/changed","params":{"threadId":"fixture","status":{"type":"idle"}}}).to_string().into());
+                        peer.send(event.clone()).await.unwrap();
+                        peer.send(event).await.unwrap();
+                    }
+                    _ => {
+                        let _ = request;
+                    }
+                }
+            };
+            let (result, ()) = tokio::join!(client.request("thread/list", Value::Null), act);
+            match mode {
+                "frame" => assert!(matches!(
+                    result,
+                    Err(Error::AppServerLimitExceeded {
+                        limit: AppServerLimit::FrameBytes,
+                        max: 256
+                    })
+                )),
+                "queue" => {
+                    assert!(matches!(
+                        result,
+                        Err(Error::AppServerLimitExceeded {
+                            limit: AppServerLimit::QueuedMessages,
+                            max: 1
+                        })
+                    ));
+                    assert!(client.next_message().await.unwrap().is_some());
+                    assert!(matches!(
+                        client.next_message().await,
+                        Err(Error::AppServerLimitExceeded { .. })
+                    ));
+                }
+                "timeout" => assert!(matches!(result, Err(Error::Timeout { .. }))),
+                _ => assert!(matches!(result, Err(Error::AppServerProtocol { .. }))),
+            }
+            client.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_response_routing_and_ping_progress_without_consuming_events() {
+        let fixture = SocketFixture::new();
+        let codex = offline();
+        let (client, mut peer) = tokio::join!(
+            fixture.builder(&codex).max_queued_messages(1).start(),
+            fixture.accept()
+        );
+        let mut client = client.unwrap();
+        let act = async {
+            let request: Value =
+                serde_json::from_str(peer.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            peer.send(WsMessage::Text(
+                json!({"method":"thread/status/changed","params":{}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            peer.send(WsMessage::Ping(b"fixture".to_vec().into()))
+                .await
+                .unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(2), peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(pong, WsMessage::Pong(_)));
+            peer.send(WsMessage::Text(
+                json!({"id":request["id"],"result":{"data":[]}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(client.request("thread/list", Value::Null), act);
+        assert!(result.is_ok());
+        assert!(client.next_message().await.unwrap().is_some());
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closure_wakes_idle_and_blocked_writers_with_surviving_handles() {
+        for blocked in [false, true] {
+            let (stdin, _peer) = tokio::io::duplex(1);
+            let (events, _received) = mpsc::unbounded_channel();
+            let shared = Arc::new(Shared::new(events, None, Limits::default(), "test"));
+            let (writer, receiver) = mpsc::unbounded_channel();
+            let handle = AppServerHandle {
+                shared: Arc::clone(&shared),
+                writer,
+                timeout: None,
+            };
+            let task = tokio::spawn(write_stdin(stdin, receiver, Arc::clone(&shared)));
+            if blocked {
+                handle.notify("initialized", Value::Null).unwrap();
+            }
+            tokio::task::yield_now().await;
+            shared.fail(Closed::Limit {
+                limit: AppServerLimit::QueuedMessages,
+                max: 0,
+            });
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(*locked(&shared.outbound.used), (0, 0));
+            assert!(handle.notify("initialized", Value::Null).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_bytes_use_actual_crlf_and_unterminated_wire_lengths() {
+        let line = r#"{"method":"thread/status/changed","params":{}}"#;
+        for delimiter in ["\r\n", "\n", ""] {
+            let input = format!("{line}{delimiter}");
+            let wire_bytes = input.len();
+            let mut reader = BufReader::new(input.as_bytes());
+            let (text, bytes) = read_frame(&mut reader, &mut 0, None, None, &None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(text, line);
+            assert_eq!(bytes, wire_bytes);
+            let (events, _received) = mpsc::unbounded_channel();
+            let shared = Shared::new(
+                events,
+                None,
+                Limits {
+                    queued_bytes: Some(wire_bytes),
+                    ..Limits::default()
+                },
+                "test",
+            );
+            route_bytes(&text, bytes, &shared).unwrap();
+            assert_eq!(*locked(&shared.inbound.used), (1, wire_bytes));
+            assert!(route_bytes(&text, bytes, &shared).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn attached_fragmented_messages_cannot_bypass_frame_budget() {
+        use tokio_tungstenite::tungstenite::protocol::frame::{
+            Frame,
+            coding::{Data, OpCode},
+        };
+        let fixture = SocketFixture::new();
+        let codex = offline();
+        let (client, mut peer) = tokio::join!(
+            fixture.builder(&codex).max_frame_bytes(256).start(),
+            fixture.accept()
+        );
+        let client = client.unwrap();
+        let send = async {
+            peer.next().await.unwrap().unwrap();
+            for (opcode, final_) in [
+                (Data::Text, false),
+                (Data::Continue, false),
+                (Data::Continue, true),
+            ] {
+                peer.send(WsMessage::Frame(Frame::message(
+                    vec![b'x'; 100],
+                    OpCode::Data(opcode),
+                    final_,
+                )))
+                .await
+                .unwrap();
+            }
+        };
+        let (result, ()) = tokio::join!(client.request("thread/list", Value::Null), send);
+        assert!(matches!(
+            result,
+            Err(Error::AppServerLimitExceeded {
+                limit: AppServerLimit::FrameBytes,
+                max: 256
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attached_blocked_writer_overflow_settles_and_releases_reservations() {
+        let fixture = SocketFixture::new();
+        let codex = offline();
+        let (client, _peer) = tokio::join!(
+            fixture.builder(&codex).max_writer_queue_messages(1).start(),
+            fixture.accept()
+        );
+        let client = client.unwrap();
+        let handle = client.handle();
+        let pending = tokio::spawn(async move {
+            handle
+                .request(
+                    "thread/start",
+                    json!({"fixture": "x".repeat(4 * 1024 * 1024)}),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while locked(&client.handle.shared.outbound.used).0 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            client.notify("initialized", Value::Null),
+            Err(Error::AppServerLimitExceeded {
+                limit: AppServerLimit::WriterQueueMessages,
+                max: 1
+            })
+        ));
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(Error::AppServerLimitExceeded { .. })
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *locked(&client.handle.shared.outbound.used) != (0, 0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        client.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn review_regression_shutdown_notifications_preserve_accepted_writes() {
+        let (stdin, mut peer) = tokio::io::duplex(4);
+        let (events, _received) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared::new(events, None, Limits::default(), "test"));
+        let (writer, receiver) = mpsc::unbounded_channel();
+        let handle = AppServerHandle {
+            shared: Arc::clone(&shared),
+            writer,
+            timeout: None,
+        };
+        let expected = notification_line("initialized", &Value::Null).unwrap();
+        handle.notify("initialized", Value::Null).unwrap();
+        let task = tokio::spawn(write_stdin(stdin, receiver, Arc::clone(&shared)));
+        tokio::task::yield_now().await;
+        shared.end(Closed::Terminated, false);
+        if let Err(reason) = route(r#"{"method":"thread/status/changed","params":{}}"#, &shared) {
+            shared.fatal(reason);
+        }
+        handle.writer.send(Outgoing::Close).unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut output))
+            .await
+            .unwrap()
+            .unwrap();
+        task.await.unwrap();
+        assert_eq!(output, expected, "shutdown truncated an accepted message");
+    }
+
+    #[tokio::test]
+    async fn review_regression_peer_close_is_acknowledged() {
+        let fixture = SocketFixture::new();
+        let codex = offline();
+        let (client, mut peer) = tokio::join!(fixture.builder(&codex).start(), fixture.accept());
+        let client = client.unwrap();
+        peer.close(None).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), peer.next())
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, Some(Ok(WsMessage::Close(_)))),
+            "missing close reply: {reply:?}"
+        );
+        assert!(client.request("thread/list", Value::Null).await.is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+#[tokio::test]
+async fn a_fatal_limit_terminates_the_windows_child_without_an_event_consumer() {
+    let mut child = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (events, _unread) = mpsc::unbounded_channel();
+    let shared = Shared::new(
+        events,
+        Some(KillTarget {
+            pid: child.id(),
+            group: false,
+            handle: child.raw_handle().map(|handle| handle as usize),
+        }),
+        Limits::default(),
+        "test",
+    );
+    shared.fatal(Closed::Limit {
+        limit: AppServerLimit::QueuedMessages,
+        max: 0,
+    });
+    shared.revoke_kill();
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!status.success());
+    assert!(matches!(shared.closed_reason(), Some(Closed::Limit { .. })));
 }

@@ -269,6 +269,33 @@ pub enum Error {
         #[source]
         cleanup: Box<Error>,
     },
+
+    /// An opt-in `codex app-server` transport limit was exceeded.
+    ///
+    /// Set with the `max_*` methods on
+    /// [`AppServerBuilder`](crate::app_server::AppServerBuilder). The
+    /// connection is ended rather than a message dropped: every waiting
+    /// request fails with this error, later sends fail at once, and the
+    /// process the client owns is killed. Distinct from
+    /// [`Error::OutputLimitExceeded`], which is the lifetime total of
+    /// [`CodexBuilder::output_limit`](crate::CodexBuilder::output_limit).
+    #[cfg(feature = "app-server")]
+    #[error("codex app-server {limit} limit of {max} exceeded")]
+    AppServerLimitExceeded {
+        /// Which limit was exceeded.
+        limit: crate::app_server::AppServerLimit,
+        /// The configured maximum.
+        max: usize,
+    },
+
+    /// An [`AppServerBuilder`](crate::app_server::AppServerBuilder) setting is
+    /// invalid. Reported by `start` before anything is spawned.
+    #[cfg(feature = "app-server")]
+    #[error("invalid codex app-server configuration: {message}")]
+    AppServerConfig {
+        /// What is wrong with the configuration.
+        message: String,
+    },
 }
 
 impl From<std::io::Error> for Error {

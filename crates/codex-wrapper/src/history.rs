@@ -44,6 +44,32 @@
 //! different `instructions` key. [`SessionMeta::raw`] keeps whatever this
 //! crate does not name.
 //!
+//! # Coverage of current history modes
+//!
+//! CLI 0.163.0 writes materialized, persistent `legacy` and `paginated` threads
+//! under the layout above. Both use the modern envelope; the current
+//! `history_mode: "legacy"` setting is distinct from the older bare-line format.
+//! [`SessionMeta::raw`] preserves `history_mode`. Paginated `item_completed`
+//! payloads are retained as written, including their nested item.
+//!
+//! This is a file reader, not the provider's logical thread-history view.
+//! Discovery does not include archived sessions, ephemeral or unmaterialized
+//! threads, or a server's other storage roots. It does not query the state
+//! database. Entries are not normalized into turns, replayed, or deduplicated.
+//! Envelope fields other than `timestamp`, `type`, and `payload` (including
+//! paginated `ordinal`) are not exposed. Invalid JSON lines are skipped.
+//!
+//! For the provider's view, enable `app-server` and use
+//! `AppServerHandle::request` with `thread/read`, `thread/turns/list`, or
+//! `thread/items/list`. In an isolated 0.163.0 capture, `thread/read` and
+//! cursor-paginated `thread/turns/list` worked for both materialized modes.
+//! `thread/items/list` worked for paginated history and rejected legacy history.
+//! Continue each method's opaque `nextCursor` until absent; do not derive a
+//! cursor from rollout ordinals or treat one page as complete history.
+//! Availability depends on CLI version, mode, and materialization. These probes
+//! used failed offline turns and do not qualify every item kind or history
+//! recovery scenario. Versioned fixture provenance ships in `tests/history/`.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -123,6 +149,8 @@ pub struct SessionEntry {
     /// `payload` is the whole line.
     pub entry_type: Option<String>,
     /// The payload, or the whole line for a legacy entry.
+    ///
+    /// Modern envelope extensions, such as paginated `ordinal`, are not retained.
     pub payload: serde_json::Value,
 }
 
@@ -439,6 +467,64 @@ mod tests {
         r#"{"record_type":"state"}"#,
         r#"{"id":"item_0","type":"message","role":"user","content":[]}"#,
     ];
+
+    #[test]
+    fn discovers_both_current_history_modes_and_preserves_their_payloads() {
+        let home = temp_home("current-history-modes");
+        for (mode, fixture, id, item_type) in [
+            (
+                "legacy",
+                include_str!("../tests/history/0.163.0-legacy.jsonl"),
+                "00000000-0000-4000-8000-000000000001",
+                "user_message",
+            ),
+            (
+                "paginated",
+                include_str!("../tests/history/0.163.0-paginated.jsonl"),
+                "00000000-0000-4000-8000-000000000002",
+                "item_completed",
+            ),
+        ] {
+            let path = write_session(
+                &home,
+                (2026, 10, 20),
+                &format!("rollout-2026-10-20T17-20-49-{id}.jsonl"),
+                &fixture.lines().collect::<Vec<_>>(),
+            );
+            let log = read(&path).unwrap();
+            let meta = log.meta.unwrap();
+            assert_eq!(meta.id.as_deref(), Some(id));
+            assert_eq!(meta.cli_version.as_deref(), Some("0.163.0"));
+            assert_eq!(meta.raw["history_mode"], mode);
+            assert_eq!(log.entries.len(), 4);
+            let captured: Vec<serde_json::Value> = fixture
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            for (entry, envelope) in log.entries.iter().zip(&captured[1..]) {
+                assert_eq!(entry.entry_type.as_deref(), Some("event_msg"));
+                assert_eq!(entry.payload, envelope["payload"]);
+            }
+            assert_eq!(log.entries[0].payload_type(), Some(item_type));
+            assert_eq!(log.entries[2].payload_type(), Some(item_type));
+            if mode == "paginated" {
+                assert_eq!(log.entries[0].payload["item"]["type"], "UserMessage");
+                assert_eq!(
+                    log.entries[0].payload["item"]["content"][0]["text"],
+                    "synthetic offline history fixture"
+                );
+            }
+        }
+        let sessions = list_in(
+            &home,
+            &SessionQuery::new()
+                .cwd("/fixture/workspace")
+                .after(2026, 10, 20),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 2);
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn a_missing_sessions_directory_is_empty_not_an_error() {

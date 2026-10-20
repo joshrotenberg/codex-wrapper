@@ -56,7 +56,7 @@ jobs:
       - name: Build the config feature alone
         run: cargo build --no-default-features --features config
 
-      # `app-server` implies `json` and adds tokio's `rt` and `sync`. Build it
+      # `app-server` implies `json` and adds the transport dependencies. Build it
       # without the other optional features, so nothing quietly depends on
       # `config`, and run the unit tests there too: the client's tests drive a
       # fake server and need no CLI.
@@ -168,8 +168,8 @@ jobs:
       - name: Record CLI version
         run: codex --version
 
-      # No auth is configured here, and none is needed: every check reads
-      # `--help` or fails during config load, before the CLI contacts anything.
+      # No auth or model inference is needed. Checks read help/schema, reject
+      # sentinel config, or initialize an isolated local Unix listener.
       #
       # CODEX_WRAPPER_ALLOW_DANGEROUS unlocks the two bypass flags gated in
       # #86, so they stay covered by the contract check. Nothing here runs a

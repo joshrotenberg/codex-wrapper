@@ -30,6 +30,11 @@
 #                  tell a graceful stop from a kill.
 #   ignores-eof    as `turn`, but keeps running after stdin closes, and
 #                  handles SIGTERM like `spawns-child`
+#   burst          as `turn`, but `thread/start` sends FAKE_APP_SERVER_BURST
+#                  (default 20) `thread/status/changed` notifications before
+#                  its answer
+#   stops-reading  answers `initialize`, then never reads its stdin again,
+#                  as a server stuck in a long operation would not
 #
 # FAKE_APP_SERVER_ITEMS=legacy makes `turn/completed` carry no items, as
 # codex-cli 0.145.0 does.
@@ -169,6 +174,7 @@ while IFS= read -r line; do
           notify noise '{"pad":"'"$pad"'"}'
           ;;
         bad-json) emit '{"method": oops' ;;
+        stops-reading) exec sleep 60 ;;
       esac
     fi
     continue
@@ -206,6 +212,11 @@ while IFS= read -r line; do
       if [ "$mode" = no-result ]; then
         emit '{"id":'"$id"'}'
         continue
+      fi
+      if [ "$mode" = burst ]; then
+        for _ in $(seq 1 "${FAKE_APP_SERVER_BURST:-20}"); do
+          status_changed '{"type":"idle"}'
+        done
       fi
       result "$id" '{"thread":'"$THREAD_JSON"',"model":"gpt-5.6-sol","modelProvider":"openai","serviceTier":"default","cwd":"'$CWD'","runtimeWorkspaceRoots":["'$CWD'"],"instructionSources":[],"approvalPolicy":"never","approvalsReviewer":"auto_review","sandbox":{"type":"readOnly","networkAccess":false},"activePermissionProfile":null,"reasoningEffort":"medium","multiAgentMode":"explicitRequestOnly"}'
       notify thread/started '{"thread":'"$THREAD_JSON"'}'
