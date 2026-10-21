@@ -5,6 +5,11 @@
 //! each [`JsonLineEvent`] to a caller-supplied callback as soon as it
 //! arrives.
 //!
+//! Lines use UTF-8 replacement decoding, as buffered execution does. Only
+//! trim-start object-prefixed lines are parsed as events; other lines are
+//! ignored. Malformed object-prefixed JSON is an error, even after a terminal
+//! event. Ignored lines are not delivered to callbacks.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -209,7 +214,7 @@ where
 
     let stdout_task = async {
         let mut captured_bytes = 0usize;
-        while let Some(line) = read_bounded_line(
+        while let Some(line) = read_exec_line(
             &mut stdout,
             &mut captured_bytes,
             codex.output_limit,
@@ -236,7 +241,7 @@ where
     let stderr_task = async {
         let mut collected = String::new();
         let mut captured_bytes = 0usize;
-        while let Some(line) = read_bounded_line(
+        while let Some(line) = read_exec_line(
             &mut stderr,
             &mut captured_bytes,
             codex.output_limit,
@@ -353,6 +358,8 @@ enum StreamStop {
     Timeout(std::time::Duration),
 }
 
+// App-server keeps strict UTF-8 decoding; only exec matches buffered capture.
+#[cfg(any(feature = "app-server", test))]
 pub(crate) async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     captured_bytes: &mut usize,
@@ -360,6 +367,42 @@ pub(crate) async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     stream: crate::OutputStream,
     working_dir: &Option<std::path::PathBuf>,
 ) -> Result<Option<String>> {
+    let Some(line) =
+        read_bounded_bytes(reader, captured_bytes, output_limit, stream, working_dir).await?
+    else {
+        return Ok(None);
+    };
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|source| Error::Io {
+            message: format!("failed to decode {stream} line"),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+            working_dir: working_dir.clone(),
+        })
+}
+
+async fn read_exec_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    captured_bytes: &mut usize,
+    output_limit: Option<usize>,
+    stream: crate::OutputStream,
+    working_dir: &Option<std::path::PathBuf>,
+) -> Result<Option<String>> {
+    // Decode only after assembling the line, so split UTF-8 sequences survive.
+    Ok(
+        read_bounded_bytes(reader, captured_bytes, output_limit, stream, working_dir)
+            .await?
+            .map(|line| String::from_utf8_lossy(&line).into_owned()),
+    )
+}
+
+async fn read_bounded_bytes<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    captured_bytes: &mut usize,
+    output_limit: Option<usize>,
+    stream: crate::OutputStream,
+    working_dir: &Option<std::path::PathBuf>,
+) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
         let available = reader.fill_buf().await.map_err(|source| Error::Io {
@@ -395,19 +438,145 @@ pub(crate) async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     if line.last() == Some(&b'\r') {
         line.pop();
     }
-    String::from_utf8(line)
-        .map(Some)
-        .map_err(|source| Error::Io {
-            message: format!("failed to decode {stream} line"),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
-            working_dir: working_dir.clone(),
-        })
+    Ok(Some(line))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn strict_line_decoding_rejects_invalid_utf8_and_keeps_framing_and_quotas() {
+        for stream in [crate::OutputStream::Stdout, crate::OutputStream::Stderr] {
+            for capacity in [1, 8192] {
+                let bytes = b"\xff\r\n\xef\xbf\xbd\r\nlast";
+                let mut reader = BufReader::with_capacity(capacity, &bytes[..]);
+                let mut captured = 0;
+                let working_dir = Some(std::path::PathBuf::from("strict-test"));
+                let error = read_bounded_line(
+                    &mut reader,
+                    &mut captured,
+                    Some(bytes.len()),
+                    stream,
+                    &working_dir,
+                )
+                .await
+                .unwrap_err();
+                match error {
+                    Error::Io {
+                        message,
+                        source,
+                        working_dir: observed,
+                    } => {
+                        assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                        assert_eq!(message, format!("failed to decode {stream} line"));
+                        assert_eq!(observed, working_dir);
+                    }
+                    other => panic!("expected strict UTF-8 error, got {other:?}"),
+                }
+                assert_eq!(captured, 3);
+                assert_eq!(
+                    read_bounded_line(
+                        &mut reader,
+                        &mut captured,
+                        Some(bytes.len()),
+                        stream,
+                        &working_dir
+                    )
+                    .await
+                    .unwrap(),
+                    Some("\u{fffd}".into())
+                );
+                assert_eq!(
+                    read_bounded_line(
+                        &mut reader,
+                        &mut captured,
+                        Some(bytes.len()),
+                        stream,
+                        &working_dir
+                    )
+                    .await
+                    .unwrap(),
+                    Some("last".into())
+                );
+                assert_eq!(captured, bytes.len());
+                assert_eq!(
+                    read_bounded_line(
+                        &mut reader,
+                        &mut captured,
+                        Some(bytes.len()),
+                        stream,
+                        &working_dir
+                    )
+                    .await
+                    .unwrap(),
+                    None
+                );
+
+                let mut reader = BufReader::with_capacity(capacity, &b"\xff\n"[..]);
+                assert!(matches!(
+                    read_bounded_line(&mut reader, &mut 0, Some(1), stream, &None).await,
+                    Err(Error::OutputLimitExceeded { limit_bytes: 1, .. })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn line_decoding_matches_buffered_capture_across_read_boundaries() {
+        // Synthetic byte faults, not new event shapes. A one-byte buffer splits
+        // both the invalid sequence and the explicit valid replacement glyph.
+        let bytes = b"{\"type\":\"turn.started\",\"unused\":\"\xf0\x28\x8c\x28\xef\xbf\xbd\"}\r\n\n{\"type\":\"turn.completed\"}";
+        for capacity in [1, 2, 8192] {
+            let mut reader = BufReader::with_capacity(capacity, &bytes[..]);
+            let mut captured = 0;
+            let mut lines = Vec::new();
+            while let Some(line) = read_exec_line(
+                &mut reader,
+                &mut captured,
+                None,
+                crate::OutputStream::Stdout,
+                &None,
+            )
+            .await
+            .unwrap()
+            {
+                lines.push(line);
+            }
+            assert_eq!(
+                lines,
+                String::from_utf8_lossy(bytes).lines().collect::<Vec<_>>()
+            );
+            assert_eq!(captured, bytes.len());
+            assert_eq!(
+                serde_json::from_str::<JsonLineEvent>(&lines[0])
+                    .unwrap()
+                    .event_type,
+                "turn.started"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_decoding_keeps_raw_byte_limits_and_stderr_policy() {
+        for stream in [crate::OutputStream::Stdout, crate::OutputStream::Stderr] {
+            let mut reader = BufReader::with_capacity(1, &b"\xff\n"[..]);
+            let mut captured = 0;
+            assert_eq!(
+                read_exec_line(&mut reader, &mut captured, Some(2), stream, &None)
+                    .await
+                    .unwrap(),
+                Some("\u{fffd}".into())
+            );
+            assert_eq!(captured, 2);
+            let mut reader = BufReader::with_capacity(1, &b"\xff\n"[..]);
+            assert!(matches!(
+                read_exec_line(&mut reader, &mut 0, Some(1), stream, &None).await,
+                Err(Error::OutputLimitExceeded { limit_bytes: 1, .. })
+            ));
+        }
+    }
 
     /// Build a [`Codex`] client that uses `bash` to run the fake-codex script.
     fn fake_codex(script_name: &str) -> Codex {
