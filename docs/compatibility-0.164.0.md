@@ -1,15 +1,25 @@
 # Native CLI compatibility audit
 
-Target: 0.164.0. Retained baseline: 0.145.0. Tracks #170.
+Verified on macOS arm64, 2026-10-24. Target: 0.164.0; retained floor: 0.145.0.
+Tracks #170. Native binaries came from exact npm package versions in isolated
+task directories, with install scripts disabled. No global binary upgrade was used.
 
-This draft records the plan before compatibility changes. Results are pending.
+## Native contract results
 
-- Select exact task-local native executables and record versions/source.
-- Check emitted flags/configuration with authentication-free probes.
-- Preserve the supported baseline; fix only demonstrated drift.
-- Run required local format, feature/build, lint, test and documentation checks.
-- Add or refresh pinned native CLI jobs and distinguish controlled process tests
-  from native semantic verification.
+- 0.145.0: test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+- 0.164.0: test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
 
-Help/configuration contracts do not prove model behavior or all CLI semantics.
-Fake executables test wrapper behavior, not native CLI compatibility.
+The complete existing contract suite passed at both endpoints. Pinned PR CI and
+the declared tested maximum now agree. Help/config/schema and local protocol
+contracts do not prove model behavior or every upstream semantic.
+
+## Local repository checks
+
+- unit-all: test result: ok. 368 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.71s
+- unit-minimal: test result: ok. 184 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.65s
+- doc: test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+Required format, feature/build and Clippy checks also passed. Existing controlled
+fixtures cover schema/results, sessions, interruption and process settlement.
+No new authenticated native smoke result is claimed. Historical native-capture
+versions elsewhere in the documentation remain unchanged.
