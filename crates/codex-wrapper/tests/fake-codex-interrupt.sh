@@ -32,6 +32,9 @@ else
     (trap '' INT TERM; exec sleep 60) &
     tool=$!
 fi
+# A shell cannot trap a signal that was ignored when it started. Record that
+# case so the test reports it instead of a missing .int marker.
+[ -n "$(trap -p INT)" ] || touch "$pidfile.int-ignored"
 printf 'parent=%s\nchild=%s\n' "$$" "$tool" > "$pidfile"
 touch "$pidfile.ready"
 while kill -0 "$tool" 2>/dev/null; do

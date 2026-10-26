@@ -242,7 +242,7 @@ impl InterruptFixture {
             pid_file: PidFile::new(label),
             cleanup_armed: AtomicBool::new(true),
         };
-        for suffix in [".ready", ".int", ".term", ".cleaned"] {
+        for suffix in [".ready", ".int", ".term", ".cleaned", ".int-ignored"] {
             let _ = std::fs::remove_file(fixture.marker(suffix));
         }
         fixture
@@ -280,6 +280,12 @@ impl InterruptFixture {
     pub(crate) async fn ready(&self) {
         self.wait_for(".ready").await;
         assert!(self.pids().is_some(), "ready requires recorded process IDs");
+        // Children inherit an ignored SIGINT from the test process (nohup, a
+        // background job), and the fixture's shell then cannot trap it.
+        assert!(
+            !self.marker(".int-ignored").exists(),
+            "SIGINT was ignored when the fixture started, so its trap could not be installed; run the tests with SIGINT at its default disposition"
+        );
     }
 
     pub(crate) async fn wait_for(&self, suffix: &str) {
@@ -332,7 +338,7 @@ impl Drop for InterruptFixture {
                 libc::kill(child as i32, libc::SIGKILL);
             }
         }
-        for suffix in [".ready", ".int", ".term", ".cleaned"] {
+        for suffix in [".ready", ".int", ".term", ".cleaned", ".int-ignored"] {
             let _ = std::fs::remove_file(self.marker(suffix));
         }
     }
