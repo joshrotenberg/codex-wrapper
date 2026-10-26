@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.7] - 2026-10-26
+
+### Bug Fixes
+
+- Extend tested Codex CLI range to 0.164.0 
+
+### Features
+
+- Add structured output schema files and decoding 
+
+### Testing
+
+- Report an ignored SIGINT in the interrupt fixture 
+
+
+
 ## [0.4.6] - 2026-10-20
 
 ### Features
