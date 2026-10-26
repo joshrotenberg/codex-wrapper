@@ -597,6 +597,28 @@ impl QueryResult {
             events,
         }
     }
+
+    /// The text of the final agent message: the last completed
+    /// `agent_message` item after the last `turn.started`.
+    ///
+    /// Unlike [`result`](Self::result), which concatenates every agent
+    /// message, this is the one a `--output-schema` run answers with.
+    #[must_use]
+    pub fn final_message(&self) -> Option<String> {
+        crate::structured::final_message(&self.events)
+    }
+
+    /// Decode the final agent message of a `--output-schema` run into `T`.
+    ///
+    /// A failed turn is
+    /// [`StructuredOutputError::TurnFailed`](crate::structured::StructuredOutputError::TurnFailed)
+    /// even when it produced a message first. See [`crate::structured`] for
+    /// the full rules. This never runs the CLI.
+    pub fn decode_structured<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> std::result::Result<T, crate::structured::StructuredOutputError> {
+        crate::structured::decode(&self.events)
+    }
 }
 
 /// A shell command the model ran, from a `command_execution` item.

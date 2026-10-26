@@ -209,6 +209,7 @@ pub mod rollout_budget;
 pub mod session;
 #[cfg(feature = "json")]
 pub mod streaming;
+pub mod structured;
 #[cfg(all(test, unix))]
 mod test_support;
 pub mod types;
