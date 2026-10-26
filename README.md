@@ -288,6 +288,40 @@ The CLI reports **token counts, not money**. There is no cost field to read.
 Converting tokens to dollars needs a per-model price table the CLI does not
 provide, so this crate does not guess at one.
 
+## Structured Output
+
+`structured::OutputSchema` writes a `serde_json::Value` schema to a private
+temporary file for `--output-schema` and removes it on drop. Keep it in scope
+until the run that uses it has finished. `QueryResult::decode_structured`
+decodes the final agent message into your own type without running the CLI
+again:
+
+```rust
+use codex_wrapper::structured::OutputSchema;
+use codex_wrapper::ExecCommand;
+
+#[derive(serde::Deserialize)]
+struct Person { name: String }
+
+let schema = OutputSchema::new(&serde_json::json!({
+    "type": "object",
+    "properties": {"name": {"type": "string"}},
+    "required": ["name"],
+    "additionalProperties": false
+}))?;
+let result = ExecCommand::new("Extract the name from: Hi, I'm Ada Lovelace.")
+    .output_schema(schema.path().to_string_lossy())
+    .execute_json(&codex)
+    .await?;
+let person: Person = result.decode_structured()?;
+```
+
+Codex enforces the schema; the crate does not re-validate the value. A
+`turn.failed` turn, a missing `turn.completed`, a missing or `null` message,
+invalid JSON, a non-object value and a type mismatch are separate
+`StructuredOutputError` variants. A non-zero exit is still `Error::CommandFailed`
+from the execution call.
+
 ## JSONL Output Parsing
 
 Use `execute_json_lines()` to parse the raw structured events from `--json`
