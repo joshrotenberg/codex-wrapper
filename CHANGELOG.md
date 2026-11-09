@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.8] - 2026-11-09
+
+### Bug Fixes
+
+- Extend tested Codex CLI range to 0.167.0 
+
+
+
 ## [0.4.7] - 2026-10-26
 
 ### Bug Fixes
