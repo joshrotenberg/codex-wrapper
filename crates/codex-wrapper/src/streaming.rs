@@ -4,6 +4,8 @@
 //! the streaming API pipes stdout from the child process and delivers
 //! each [`JsonLineEvent`] to a caller-supplied callback as soon as it
 //! arrives.
+//! Malformed UTF-8 in exec stdout and stderr is decoded with replacement
+//! characters, matching buffered exec.
 //!
 //! # Example
 //!
@@ -367,7 +369,7 @@ enum StreamStop {
     Timeout(std::time::Duration),
 }
 
-pub(crate) async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     captured_bytes: &mut usize,
     output_limit: Option<usize>,
@@ -409,13 +411,10 @@ pub(crate) async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     if line.last() == Some(&b'\r') {
         line.pop();
     }
-    String::from_utf8(line)
-        .map(Some)
-        .map_err(|source| Error::Io {
-            message: format!("failed to decode {stream} line"),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
-            working_dir: working_dir.clone(),
-        })
+    // Match buffered exec after accounting for the original wire bytes.
+    let line = String::from_utf8(line)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+    Ok(Some(line))
 }
 
 #[cfg(all(test, unix))]
@@ -785,6 +784,55 @@ mod tests {
                 |_| {},
             ))
             .await;
+    }
+
+    #[tokio::test]
+    async fn stream_exec_replaces_invalid_utf8_in_stdout_and_stderr() {
+        let codex = Codex::builder()
+            .binary("/bin/bash")
+            .arg("-c")
+            .arg(
+                r#"printf 'diagnostic \377\n{"type":"thread.started","thread_id":"thread_\377"}\n'
+printf 'stderr \377\n' >&2
+exit 7"#,
+            )
+            .build()
+            .unwrap();
+        let cmd = crate::ExecCommand::new("probe").json();
+        let mut events = Vec::new();
+
+        let error = stream_exec(&codex, &cmd, |event| events.push(event))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::CommandFailed { exit_code: 7, stderr, .. }
+                if stderr == "stderr \u{fffd}"),
+            "{error:?}"
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].thread_id(), Some("thread_\u{fffd}"));
+    }
+
+    #[tokio::test]
+    async fn bounded_line_counts_wire_bytes_before_replacement_decoding() {
+        let bytes = b"\xe2\x82\xac\xff\xff\r\n";
+        let mut reader = BufReader::with_capacity(1, &bytes[..]);
+        let mut captured = 0;
+        let stream = crate::OutputStream::Stdout;
+
+        let line = read_bounded_line(&mut reader, &mut captured, Some(bytes.len()), stream, &None)
+            .await
+            .unwrap();
+        assert_eq!(line.as_deref(), Some("\u{20ac}\u{fffd}\u{fffd}"));
+        assert_eq!(captured, bytes.len());
+
+        let mut reader = BufReader::with_capacity(1, &bytes[..]);
+        let limit = bytes.len() - 1;
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut 0, Some(limit), stream, &None).await,
+            Err(Error::OutputLimitExceeded { limit_bytes, .. }) if limit_bytes == limit
+        ));
     }
 
     #[tokio::test]
