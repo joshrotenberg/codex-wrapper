@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.9] - 2026-11-09
+
+### Bug Fixes
+
+- Match buffered exec UTF-8 decoding in streams 
+
+
+
 ## [0.4.8] - 2026-11-09
 
 ### Bug Fixes
